@@ -29,7 +29,8 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install uv + Python ${{ matrix.python-version }}
-        uses: astral-sh/setup-uv@v9
+        # v7+ declares node24; floating major tag is v7 (v9.0.0 exists but no v9 mover yet).
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -75,7 +76,8 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install uv + Python 3.12
-        uses: astral-sh/setup-uv@v9
+        # v7+ declares node24; floating major tag is v7 (v9.0.0 exists but no v9 mover yet).
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: "3.12"
