@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-remote-control"
+version = "0.1.0"
+description = "mcp-remote-control — remote host control via MCP (endpoint/exec/fs/screen/ps)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "Shiharu" },
+]
+keywords = [
+    "mcp",
+    "ssh",
+    "winrm",
+    "remote",
+    "agent",
+    "pty",
+    "serial",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
+dependencies = [
+    "asyncssh",
+    "pyte",
+    "pypsrp",
+    "mcp",
+    "pyserial",
+]
+
+[project.urls]
+Homepage = "https://github.com/shiharuharu/mcp-remote-control"
+Repository = "https://github.com/shiharuharu/mcp-remote-control"
+Issues = "https://github.com/shiharuharu/mcp-remote-control/issues"
+License = "https://www.apache.org/licenses/LICENSE-2.0"
+
+[project.scripts]
+# MCP stdio server (Host 部署入口；uvx 默认跑这个)
+mcp-remote-control = "mcp_remote_control.mcp_server:main"
+# 同构 CLI harness（doctor / 调试）
+mcp-remote-control-cli = "mcp_remote_control.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    # Pin: project gate is ruff 0.15.x; 0.16+ enables extra rules not yet adopted.
+    "ruff==0.15.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_remote_control"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.venv",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.mypy_cache",
+    "/dist",
+    "/build",
+    "/todo.md",
+    "/.agent-handoff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "integration: live host tests (require MRC_INTEGRATION=1)",
+]
+
+[tool.ruff]
+# Gate version is pinned in [project.optional-dependencies].dev (ruff==0.15.12).
+# Keep that version's default rule set; widen select only in a dedicated wave.
+target-version = "py311"
+src = ["src", "tests"]

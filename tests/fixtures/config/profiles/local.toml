@@ -1,0 +1,9 @@
+name = "local"
+transport = "local"
+label = "Fixture local overrides"
+
+[defaults]
+cwd = "~/work"
+shell = "/bin/zsh"
+screen_cols = 120
+screen_rows = 40

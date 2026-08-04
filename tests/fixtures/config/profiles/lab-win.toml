@@ -1,0 +1,20 @@
+name = "lab-win"
+transport = "winrm"
+host = "10.0.0.20"
+port = 5985
+username = "Administrator"
+label = "Lab WinRM fixture"
+
+[auth]
+method = "password"
+password_path = "secrets/lab_win_password"
+
+[winrm]
+scheme = "http"
+auth = "ntlm"
+server_cert_validation = "ignore"
+connect_timeout_ms = 5000
+message_encryption = "auto"
+
+[defaults]
+cwd = "C:\\Users\\Administrator"

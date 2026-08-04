@@ -1,0 +1,18 @@
+name = "lab-ssh"
+transport = "ssh"
+host = "10.0.0.5"
+port = 22
+username = "deploy"
+label = "Lab SSH fixture"
+
+[auth]
+method = "private_key_path"
+key_path = "secrets/lab_ssh_ed25519"
+# passphrase_path is intentionally omitted for this fixture
+
+[ssh]
+connect_timeout_ms = 15000
+keepalive_interval_s = 30
+
+[defaults]
+cwd = "/var/www"

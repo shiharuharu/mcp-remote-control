@@ -1,0 +1,26 @@
+{
+  "include": ["src", "tests"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Darwin",
+  "typeCheckingMode": "standard",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "none",
+  "extraPaths": ["src"],
+  "executionEnvironments": [
+    {
+      "root": "src",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Darwin",
+      "extraPaths": ["src"]
+    },
+    {
+      "root": "tests",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Darwin",
+      "extraPaths": ["src"]
+    }
+  ]
+}

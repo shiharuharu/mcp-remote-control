@@ -1,0 +1,11 @@
+{
+  "cols": 80,
+  "rows": 24,
+  "hash": "1073e680",
+  "expect_contains": [
+    "Save",
+    "Cancel",
+    "Type a message"
+  ],
+  "description": "Synthetic TUI menu for to_text / frame hash replay"
+}

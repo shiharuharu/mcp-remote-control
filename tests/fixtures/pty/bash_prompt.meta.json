@@ -1,0 +1,11 @@
+{
+  "cols": 80,
+  "rows": 24,
+  "hash": "2b1fdf98",
+  "expect_contains": [
+    "user@host",
+    "hello",
+    "~/project"
+  ],
+  "description": "Synthetic bash prompt + echo hello (no live TUI)"
+}

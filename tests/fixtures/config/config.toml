@@ -1,0 +1,21 @@
+# Fixture global config for unit / doctor / selftest.
+
+[defaults]
+verbosity = "normal"
+max_body_chars = 24000
+screen_cols = 120
+screen_rows = 40
+screen_term = "xterm-256color"
+default_shell = ""
+exec_timeout_ms = 60000
+
+[logging]
+level = "info"
+dir = "logs"
+max_bytes = 10485760
+backup_count = 5
+audit = false
+
+[security]
+redact_secrets_in_logs = true
+allow_secret_paths_in_output = true

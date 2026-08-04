@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.DS_Store
+*.swp
+*~
+
+# Internal AI / wave task log — not part of the published project surface
+todo.md
+
+# Local agent handoff (if ever created under code-root)
+.agent-handoff/
