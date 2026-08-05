@@ -97,6 +97,7 @@ def test_put_secret_and_ssh_profile(tmp_path: Path, monkeypatch) -> None:
         ssh={"known_hosts": "none", "connect_timeout_ms": 10000},
     )
     assert rp.is_ok(), rp.fields
+    assert rp.fields.get("path") == "profiles/edge.toml"
     p = load_profile(home, "edge")
     assert p.host == "10.1.2.3"
     assert p.auth is not None
@@ -109,6 +110,75 @@ def test_put_secret_and_ssh_profile(tmp_path: Path, monkeypatch) -> None:
     d = config_ops.run("delete_profile", name="edge")
     assert d.is_ok()
     assert "edge" not in list_profiles(home)
+
+
+def test_put_profile_password_secret_alias(tmp_path: Path, monkeypatch) -> None:
+    """Agent shorthand auth.password_secret= maps to password_path under secrets/."""
+    home = tmp_path / "mrc"
+    monkeypatch.setenv("MRC_HOME", str(home))
+    assert config_ops.run("ensure_home").is_ok()
+    assert config_ops.run(
+        "put_secret", name="win210-pass", content="c20051010"
+    ).is_ok()
+    r = config_ops.run(
+        "put_profile",
+        name="win210",
+        transport="ssh",
+        host="10.5.10.210",
+        username="shiharu",
+        auth={"password_secret": "win210-pass"},
+    )
+    assert r.is_ok(), r.fields
+    p = load_profile(home, "win210")
+    assert p.auth is not None
+    assert p.auth.method == "password"
+    assert p.auth.password_path is not None
+    assert p.auth.password_path.name == "win210-pass"
+
+
+def test_put_profile_inline_password_plain(tmp_path: Path, monkeypatch) -> None:
+    """Product rule: password may be written plain into the profile."""
+    home = tmp_path / "mrc"
+    monkeypatch.setenv("MRC_HOME", str(home))
+    assert config_ops.run("ensure_home").is_ok()
+    r = config_ops.run(
+        "put_profile",
+        name="win210",
+        transport="ssh",
+        host="10.5.10.210",
+        username="shiharu",
+        auth={"method": "password", "password": "c20051010"},
+        ssh={"known_hosts": "none"},
+    )
+    assert r.is_ok(), r.fields
+    text = (home / "profiles" / "win210.toml").read_text()
+    assert 'password = "c20051010"' in text
+    p = load_profile(home, "win210")
+    assert p.auth is not None
+    assert p.auth.password == "c20051010"
+    from mcp_remote_control.endpoint.registry import _resolve_password
+
+    assert _resolve_password(p) == "c20051010"
+
+
+def test_config_help_and_no_absolute_home_in_list(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "mrc"
+    monkeypatch.setenv("MRC_HOME", str(home))
+    assert config_ops.run("ensure_home").is_ok()
+    help_r = config_ops.run("help")
+    assert help_r.is_ok()
+    assert "password" in (help_r.body or "")
+    assert "put_profile" in (help_r.body or "")
+    lp = config_ops.run("list_profiles")
+    assert lp.is_ok()
+    assert "home=" not in (lp.fields or {})
+    # Agent meta must not push absolute MRC_HOME for list_profiles.
+    assert str(home) not in str(lp.fields)
+    eh = config_ops.run("ensure_home")
+    assert str(home) not in str(eh.fields)
+    assert eh.fields.get("ready") == 1
 
 
 def test_op_delete_profile_missing_returns_profile_not_found(
@@ -435,8 +505,8 @@ def test_put_profile_nested_winrm_dict_roundtrips(
     assert "[winrm.credssp]" in text
 
 
-def test_render_profile_toml_strips_auth_inline_secrets() -> None:
-    """auth inline secret bodies are stripped (tolerated-discouraged path)."""
+def test_render_profile_toml_keeps_password_strips_private_key() -> None:
+    """auth.password is kept; private_key_pem is still stripped."""
     from mcp_remote_control.config.store import render_profile_toml
 
     text = render_profile_toml(
@@ -446,10 +516,9 @@ def test_render_profile_toml_strips_auth_inline_secrets() -> None:
         username="u",
         auth={"method": "password", "password": "leak", "private_key_pem": "PEM"},
     )
-    assert "leak" not in text
+    assert 'password = "leak"' in text  # plain password allowed
     assert "PEM" not in text
     assert 'method = "password"' in text
-    assert "password =" not in text  # the inline body field is gone
     assert "private_key_pem" not in text
 
 
@@ -631,11 +700,10 @@ def test_put_profile_body_clean_roundtrips(tmp_path: Path, monkeypatch) -> None:
     assert p.ssh.get("connect_timeout_ms") == 15000
 
 
-def test_put_profile_body_auth_inline_secret_stripped(
+def test_put_profile_body_auth_inline_password_kept(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """HIGH: body= with an inline [auth] password has it stripped (parity with
-    the structured path); the profile still round-trips and the secret is not
+    """body= with [auth].password keeps the plain password (product rule).
     on disk."""
     home = tmp_path / "mrc"
     monkeypatch.setenv("MRC_HOME", str(home))
@@ -652,11 +720,11 @@ def test_put_profile_body_auth_inline_secret_stripped(
     r = config_ops.run("put_profile", name="stripped", body=body)
     assert r.is_ok(), r.fields
     on_disk = (home / "profiles" / "stripped.toml").read_text()
-    assert "INLINE_LEAK" not in on_disk
-    assert "password =" not in on_disk  # inline body removed
+    assert 'password = "INLINE_LEAK"' in on_disk
     p = load_profile(home, "stripped")
     assert p.auth is not None
     assert p.auth.method == "password"
+    assert p.auth.password == "INLINE_LEAK"
 
 
 def test_put_secret_rejects_trailing_newline_name(

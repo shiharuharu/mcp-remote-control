@@ -1,8 +1,12 @@
 """Config Core ops for agent self-configuration (MCP/CLI tool ``config``).
 
-Agents can manage ``MRC_HOME`` without hand-edited TOML: ensure layout,
-put/get/delete profiles, and put/list secrets. Secret *bodies* are written
-via ``put_secret`` and never returned by any read API.
+Agents can manage the config home without hand-edited TOML or shell access:
+ensure layout, put/get/delete profiles, put/list secrets. Secret *bodies* are
+written via ``put_secret`` and never returned by any read API.
+
+Agent-facing fields prefer logical relative names (``profiles/…``,
+``secrets/…``) over absolute filesystem paths so hosts do not steer agents
+into browsing ``~/.config`` with shell tools.
 """
 
 from __future__ import annotations
@@ -43,7 +47,28 @@ VALID_OPS: frozenset[str] = frozenset(
         "put_secret",
         "list_secrets",
         "get",
+        "help",
     }
+)
+
+# Shown on help / error hints — keep in sync with store auth + load methods.
+_AUTH_RECIPES = (
+    "SSH password (preferred — password is NOT private in this product): "
+    'put_profile name=<ep> transport=ssh host=… username=… '
+    'auth={"method":"password","password":"<plain>"} '
+    'ssh={"known_hosts":"none"}  # lab: skip host key file'
+    "\n"
+    "SSH key: put_secret name=<id> content=<pem>; "
+    'put_profile … auth={"method":"private_key_path","key_path":"secrets/<id>"} '
+    'ssh={"known_hosts":"none"}'
+    "\n"
+    "WinRM password: "
+    'put_profile name=<ep> transport=winrm host=… username=… '
+    'auth={"method":"password","password":"<plain>"} '
+    'winrm={"scheme":"http","auth":"ntlm"}'
+    "\n"
+    "Optional file-based password still works: password_path=secrets/<id> "
+    "after put_secret. Do not shell-edit profiles — use this tool only."
 )
 
 
@@ -55,6 +80,71 @@ def _home(home: Path | str | None) -> Path:
     return resolve_home(env={"MRC_HOME": str(home)})
 
 
+def _rel_under_home(home: Path, path: Path | str) -> str:
+    """Return path relative to *home* when possible (agent-facing)."""
+    try:
+        return Path(path).resolve().relative_to(Path(home).resolve()).as_posix()
+    except ValueError:
+        return Path(path).name
+
+
+def _normalize_auth(auth: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize agent auth dict for put_profile.
+
+    Preferred password form (no privacy):
+      ``{"method":"password","password":"<plain>"}``
+
+    File-based aliases still work:
+      ``password_secret`` / ``password_name`` → password_path=secrets/<id>
+      ``key_secret`` → key_path=secrets/<id>
+    """
+    if not auth:
+        return None
+    a: dict[str, Any] = {str(k): v for k, v in auth.items()}
+
+    def _secret_file_name(raw: object) -> str:
+        name = str(raw).strip().lstrip("/")
+        if name.startswith("secrets/"):
+            name = name[len("secrets/") :]
+        return name
+
+    # Plain password wins; do not force secrets/.
+    if a.get("password") is not None and str(a.get("password")).strip() != "":
+        if not a.get("method"):
+            a["method"] = "password"
+        return a
+
+    for alias in ("password_secret", "password_name"):
+        if alias in a and a[alias] is not None and str(a[alias]).strip():
+            sid = _secret_file_name(a.pop(alias))
+            a.setdefault("password_path", f"secrets/{sid}")
+            if not a.get("method"):
+                a["method"] = "password"
+            break
+
+    for alias in ("key_secret", "key_name", "private_key_secret"):
+        if alias in a and a[alias] is not None and str(a[alias]).strip():
+            sid = _secret_file_name(a.pop(alias))
+            a.setdefault("key_path", f"secrets/{sid}")
+            if not a.get("method"):
+                a["method"] = "private_key_path"
+            break
+
+    for path_key, method in (
+        ("password_path", "password"),
+        ("key_path", "private_key_path"),
+        ("passphrase_path", None),
+    ):
+        if path_key in a and a[path_key] is not None and str(a[path_key]).strip():
+            p = str(a[path_key]).strip().lstrip("/")
+            if not p.startswith("secrets/") and not Path(p).is_absolute():
+                a[path_key] = f"secrets/{p}"
+            if method and not a.get("method"):
+                a["method"] = method
+
+    return a
+
+
 def op_home(*, home: Path | str | None = None, **_kwargs: Any) -> OpResult:
     h = _home(home)
     return OpResult(
@@ -62,14 +152,15 @@ def op_home(*, home: Path | str | None = None, **_kwargs: Any) -> OpResult:
         status="ok",
         fields={
             "op": "home",
-            "home": str(h),
-            "profiles": str(profiles_dir(h)),
-            "secrets": str(secrets_dir(h)),
-            "config": str(config_toml_path(h)),
+            "ready": 1 if h.is_dir() else 0,
             "exists": 1 if h.is_dir() else 0,
+            "layout": "profiles,secrets,logs,state",
         },
-        body=f"home={h}",
-        hint="set env MRC_HOME to override; config ensure_home creates layout",
+        body=(
+            f"ready={1 if h.is_dir() else 0}\n"
+            "use ensure_home if ready=0; do not shell-browse the config tree"
+        ),
+        hint="ensure_home → put_secret → put_profile → endpoint open profile=",
     )
 
 
@@ -79,9 +170,17 @@ def op_ensure_home(*, home: Path | str | None = None, **_kwargs: Any) -> OpResul
     return OpResult(
         kind="config",
         status="ok",
-        fields={"op": "ensure_home", "home": paths["home"], "n": len(paths)},
-        body="\n".join(f"{k}={v}" for k, v in sorted(paths.items())),
-        hint="next: put_secret + put_profile, then endpoint open profile=",
+        fields={
+            "op": "ensure_home",
+            "ready": 1,
+            "n": len(paths),
+            "dirs": "profiles,secrets,logs,state",
+        },
+        body="ready=1 dirs=profiles,secrets,logs,state config=config.toml",
+        hint=(
+            "next: put_secret name=<id> content=<secret>; "
+            "put_profile … auth={…}; then endpoint open profile=<name>"
+        ),
     )
 
 
@@ -101,11 +200,11 @@ def op_list_profiles(*, home: Path | str | None = None, **_kwargs: Any) -> OpRes
         status="ok",
         fields={
             "op": "list_profiles",
-            "home": str(h),
             "n": len(names),
             "names": ",".join(names) if names else None,
         },
         body="\n".join(lines) if lines else None,
+        hint="empty list is ok — put_profile to add; get_profile name= for details",
     )
 
 
@@ -202,6 +301,7 @@ def op_put_profile(
 
     h = _home(home)
     try:
+        auth_norm = _normalize_auth(_obj(auth))
         path = put_profile(
             h,
             name=str(name).strip(),
@@ -210,7 +310,7 @@ def op_put_profile(
             port=int(port) if port is not None else None,
             username=username,
             label=label,
-            auth=_obj(auth),
+            auth=auth_norm,
             ssh=_obj(ssh),
             winrm=_obj(winrm),
             defaults=_obj(defaults),
@@ -223,6 +323,7 @@ def op_put_profile(
             status="error",
             code="PROFILE_INVALID",
             fields={"op": "put_profile", "name": name, "msg": str(exc)},
+            hint=_AUTH_RECIPES.split("\n", 1)[0],
         )
     except Exception as exc:  # noqa: BLE001
         return OpResult(
@@ -235,17 +336,18 @@ def op_put_profile(
                 "msg": f"{type(exc).__name__}: {exc}",
             },
         )
+    rel = _rel_under_home(h, path)
     return OpResult(
         kind="config",
         status="ok",
         fields={
             "op": "put_profile",
             "name": str(name).strip(),
-            "path": str(path),
+            "path": rel,
             "transport": transport,
         },
-        body=f"name={name} path={path}",
-        hint="endpoint open profile=<name> to connect",
+        body=f"name={name} path={rel}",
+        hint="endpoint open profile=<name> to connect (no shell/TOML edit needed)",
     )
 
 
@@ -291,7 +393,12 @@ def op_delete_profile(
     return OpResult(
         kind="config",
         status="ok",
-        fields={"op": "delete_profile", "name": name, "path": str(path), "deleted": 1},
+        fields={
+            "op": "delete_profile",
+            "name": name,
+            "path": _rel_under_home(h, path),
+            "deleted": 1,
+        },
     )
 
 
@@ -312,7 +419,12 @@ def op_put_secret(
                 "op": "put_secret",
                 "msg": "name and content required",
             },
-            hint="put_secret name=id_ed25519 content=<pem>; then auth.key_path=secrets/id_ed25519",
+            hint=(
+                "put_secret name=<id> content=<secret body>; "
+                "then put_profile auth="
+                '{"method":"password","password_path":"secrets/<id>"} '
+                "or key_path / password_secret aliases — see config op=help"
+            ),
         )
     h = _home(home)
     try:
@@ -342,7 +454,11 @@ def op_put_secret(
             "bytes": len(content.encode("utf-8")),
         },
         body=f"name={name} path={rel} bytes={len(content.encode('utf-8'))}",
-        hint="reference path in profile auth.key_path or auth.password_path",
+        hint=(
+            f'put_profile auth={{"method":"password","password_path":"{rel}"}} '
+            f'or auth={{"method":"private_key_path","key_path":"{rel}"}} '
+            f'or auth={{"password_secret":"{name}"}}'
+        ),
     )
 
 
@@ -363,13 +479,13 @@ def op_list_secrets(*, home: Path | str | None = None, **_kwargs: Any) -> OpResu
 
 
 def op_get(*, home: Path | str | None = None, **_kwargs: Any) -> OpResult:
-    """Summary of global config + layout (no secrets)."""
+    """Summary of global config + layout (no secrets, no absolute paths)."""
     h = _home(home)
     cfg = load_config(h)
     profiles = list_profiles(h)
     secrets = list_secret_names(h)
     lines = [
-        f"home={h}",
+        f"ready={1 if h.is_dir() else 0}",
         f"config_from_defaults={1 if cfg.from_defaults else 0}",
         f"verbosity={cfg.defaults.verbosity}",
         f"profiles_n={len(profiles)}",
@@ -380,12 +496,24 @@ def op_get(*, home: Path | str | None = None, **_kwargs: Any) -> OpResult:
         status="ok",
         fields={
             "op": "get",
-            "home": str(h),
+            "ready": 1 if h.is_dir() else 0,
             "from_defaults": 1 if cfg.from_defaults else 0,
             "profiles_n": len(profiles),
             "secrets_n": len(secrets),
         },
         body="\n".join(lines),
+        hint="list_profiles / list_secrets / get_profile for details; op=help for recipes",
+    )
+
+
+def op_help(**_kwargs: Any) -> OpResult:
+    """Auth / bootstrap recipes for agents (no filesystem access required)."""
+    return OpResult(
+        kind="config",
+        status="ok",
+        fields={"op": "help"},
+        body=_AUTH_RECIPES,
+        hint="use these recipes via config tool only — never cat/edit profile TOML",
     )
 
 
@@ -399,14 +527,14 @@ def run(op: str, **kwargs: Any) -> OpResult:
             fields={
                 "op": op_norm or op,
                 "msg": (
-                    "unknown config op (want home|ensure_home|list_profiles|"
+                    "unknown config op (want home|ensure_home|help|list_profiles|"
                     "get_profile|put_profile|delete_profile|put_secret|"
                     "list_secrets|get)"
                 ),
             },
             hint=(
-                "agent self-config: ensure_home → put_secret → put_profile → "
-                "endpoint open profile="
+                "ensure_home → put_secret → put_profile → endpoint open; "
+                "config op=help for auth recipes"
             ),
         )
     dispatch = {
@@ -419,5 +547,6 @@ def run(op: str, **kwargs: Any) -> OpResult:
         "put_secret": op_put_secret,
         "list_secrets": op_list_secrets,
         "get": op_get,
+        "help": op_help,
     }
     return dispatch[op_norm](**kwargs)

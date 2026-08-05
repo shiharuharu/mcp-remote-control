@@ -1,7 +1,8 @@
 """Config and Profile data models.
 
-Secret material is represented only as **paths** (or env var *names*), never as
-loaded file contents. ``repr`` / ``str`` intentionally omit any raw secret body.
+Passwords may be stored inline on the profile (product choice: not treated as
+sensitive for this tool). Private key *bodies* stay path/env based and are
+never kept on ``AuthConfig`` or shown in ``repr``.
 """
 
 from __future__ import annotations
@@ -31,9 +32,9 @@ AuthMethod = Literal[
 class AuthConfig:
     """Authentication recipe for a profile.
 
-    Paths point at secret files; contents are never loaded here.
-    Enterprise WinRM fields (cert paths, SPN, CredSSP options) are
-    configuration only — PEM bodies and passwords stay on disk / env.
+    Password may be inline (``password``) or referenced via path/env.
+    Private key *bodies* are not stored here — only ``key_path`` etc.
+    Enterprise WinRM cert fields are paths / non-secret options only.
     """
 
     method: str
@@ -41,10 +42,11 @@ class AuthConfig:
     passphrase_path: Path | None = None
     password_path: Path | None = None
     password_env: str | None = None
-    # True if profile TOML contained an inline password= (discouraged).
-    # Value is never stored so it cannot appear in repr.
+    # Plain password when profile stores it inline (allowed; not redacted).
+    password: str | None = None
+    # True if profile TOML contained password= (inline).
     has_inline_password: bool = False
-    # True if profile TOML contained inline private_key_pem= (discouraged).
+    # True if profile TOML contained inline private_key_pem= (still discouraged).
     has_inline_private_key: bool = False
     # --- WinRM enterprise (paths / non-secret strings only) ---
     # Client certificate PEM path (pypsrp: certificate_pem).
@@ -74,8 +76,9 @@ class AuthConfig:
             parts.append(f"password_path={self.password_path!r}")
         if self.password_env is not None:
             parts.append(f"password_env={self.password_env!r}")
-        if self.has_inline_password:
-            parts.append("has_inline_password=True")
+        if self.password is not None or self.has_inline_password:
+            # Never put the password body in repr/str.
+            parts.append("password=<set>")
         if self.has_inline_private_key:
             parts.append("has_inline_private_key=True")
         if self.cert_path is not None:

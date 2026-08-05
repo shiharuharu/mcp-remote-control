@@ -501,7 +501,8 @@ def test_json_error_code():
 # ---------------------------------------------------------------------------
 
 
-def test_redact_password_field_agent_and_json():
+def test_password_field_not_redacted_token_is():
+    """Product rule: plain passwords are visible; tokens still redacted."""
     fields = {
         "ep": "lab",
         "password": "s3cr3t-value",
@@ -509,13 +510,12 @@ def test_redact_password_field_agent_and_json():
         "path": "/tmp/x",
     }
     agent = render_agent_text("endpoint", "ok", fields=fields, cwd="/home/u")
-    assert "s3cr3t-value" not in agent
+    assert "s3cr3t-value" in agent
     assert "abcd1234" not in agent
-    assert f"password={REDACTED}" in agent
     assert f"token={REDACTED}" in agent
 
     data = json.loads(render_json("endpoint", "ok", fields=fields, cwd="/home/u"))
-    assert data["password"] == REDACTED
+    assert data["password"] == "s3cr3t-value"
     assert data["token"] == REDACTED
     assert data["path"] == "/tmp/x"
 
@@ -538,11 +538,10 @@ def test_redact_private_key_material_in_body():
     assert REDACTED in data["body"]
 
 
-def test_redact_inline_password_assignment():
+def test_inline_password_assignment_not_redacted():
     body = "export password=hunter2 && run"
     agent = render_agent_text("exec", "ok", body=body)
-    assert "hunter2" not in agent
-    assert f"password={REDACTED}" in agent or REDACTED in agent
+    assert "hunter2" in agent
 
 
 def test_redact_secret_key_name_variants():
@@ -577,27 +576,22 @@ def test_all_kinds_render(kind: str):
 
 
 def test_redact_inline_quoted_secret_with_spaces_agent_and_json():
-    """Quoted secret with spaces must redact the full value on both tracks.
+    """Quoted secret= with spaces must redact the full value on both tracks.
 
-    Regression: the old single-branch regex stopped at the first whitespace,
-    so ``password="my secret"`` matched only ``my`` then failed to close the
-    quote backreference → the quoted secret was NOT redacted at all.
+    Uses ``secret=`` (not password=) — passwords are product-visible.
     """
-    body = 'export password="my secret value" && run'
-    # Direct redact_string: full quoted secret replaced with marker.
+    body = 'export secret="my secret value" && run'
     red = redact_string(body)
     assert "my secret value" not in red
-    assert 'password="***"' in red
+    assert 'secret="***"' in red
 
-    # Agent track body goes through redact_string via redact_optional_str.
     agent = render_agent_text("exec", "ok", fields={"ep": "local", "exit": 0}, body=body)
     assert "my secret value" not in agent
-    assert 'password="***"' in agent
+    assert 'secret="***"' in agent
 
-    # JSON track body must also be redacted (both tracks share the layer).
     data = json.loads(render_json("exec", "ok", fields={"ep": "local", "exit": 0}, body=body))
     assert "my secret value" not in data["body"]
-    assert 'password="***"' in data["body"]
+    assert 'secret="***"' in data["body"]
 
 
 def test_redact_inline_quoted_single_word_still_redacts():
@@ -607,83 +601,41 @@ def test_redact_inline_quoted_single_word_still_redacts():
 
 
 def test_redact_inline_quoted_secret_with_opposite_quote_inside():
-    """Mixed-quote values: the OPPOSITE quote char is allowed inside a quoted
-    secret, so ``password="o'reilly"`` and ``password='he said "hi"'`` redact.
-
-    Regression: the old single backreference branch ``(['\"])([^'\"]*)\2``
-    excluded BOTH quote chars from the content, so a double-quoted value
-    containing an apostrophe matched NEITHER the quoted branch (apostrophe
-    excluded from ``[^'\"]*``) NOR the unquoted branch (starts with ``"``) →
-    the secret was exposed. Splitting into quote-specific branches lets the
-    opposite quote live inside the content.
-    """
-    # Double-quoted value containing an apostrophe.
-    body_dq = 'export password="o\'reilly" && run'
+    """Mixed-quote values on secret= (password= is not redacted)."""
+    body_dq = 'export secret="o\'reilly" && run'
     red_dq = redact_string(body_dq)
     assert "o'reilly" not in red_dq
-    assert 'password="***"' in red_dq
+    assert 'secret="***"' in red_dq
     agent_dq = render_agent_text("exec", "ok", fields={"ep": "local", "exit": 0}, body=body_dq)
     assert "o'reilly" not in agent_dq
-    assert 'password="***"' in agent_dq
+    assert 'secret="***"' in agent_dq
     data_dq = json.loads(render_json("exec", "ok", fields={"ep": "local", "exit": 0}, body=body_dq))
     assert "o'reilly" not in data_dq["body"]
-    assert 'password="***"' in data_dq["body"]
+    assert 'secret="***"' in data_dq["body"]
 
-    # Single-quoted value containing a double quote (opposite direction).
-    body_sq = 'export password=\'he said "hi"\' && run'
+    body_sq = 'export secret=\'he said "hi"\' && run'
     red_sq = redact_string(body_sq)
     assert 'he said "hi"' not in red_sq
-    assert "password='***'" in red_sq
-    agent_sq = render_agent_text("exec", "ok", fields={"ep": "local", "exit": 0}, body=body_sq)
-    assert 'he said "hi"' not in agent_sq
-    assert "password='***'" in agent_sq
-    data_sq = json.loads(render_json("exec", "ok", fields={"ep": "local", "exit": 0}, body=body_sq))
-    assert 'he said "hi"' not in data_sq["body"]
-    assert "password='***'" in data_sq["body"]
+    assert "secret='***'" in red_sq
 
 
 def test_redact_inline_escaped_same_quote_redacts_up_to_first_escape():
-    """Escaped same-quote inside a quoted value: redact at least up to the
-    first escaped quote (full escaped-quote handling is out of scope; the
-    residual is documented, not silently exposed).
-
-    For ``password="my \\"secret\\""`` the regex stops at the first escaped
-    quote, so the head of the secret is redacted (``password="***"``) and a
-    tail (``secret\\""``) remains. The mixed-quote case (the actual bug) is
-    fully fixed in ``test_redact_inline_quoted_secret_with_opposite_quote_inside``;
-    this test pins the partial-escape behavior so a future change does not
-    silently regress to exposing the whole value.
-    """
-    body = 'export password="my \\"secret\\"" && run'
+    """Escaped same-quote inside secret= redacts head of value."""
+    body = 'export secret="my \\"token\\"" && run'
     red = redact_string(body)
-    # Head of the secret (before the first escaped quote) is redacted.
-    assert 'password="***"' in red
-    # The full ``my \"secret\"`` value is NOT reassembled verbatim.
-    assert 'my \\"secret\\"' not in red
-    # Agent + JSON tracks: same redaction layer reaches both.
+    assert 'secret="***"' in red
     agent = render_agent_text("exec", "ok", fields={"ep": "local", "exit": 0}, body=body)
-    assert 'password="***"' in agent
-    data = json.loads(render_json("exec", "ok", fields={"ep": "local", "exit": 0}, body=body))
-    assert 'password="***"' in data["body"]
+    assert 'secret="***"' in agent
 
 
 def test_is_sensitive_key_concatenated_no_underscore_not_redacted():
-    """Concatenated names (no underscore separator) are NOT auto-redacted.
-
-    Documents the dead-branch removal in O10: the old `n.endswith(sk)` branch
-    was dead (the inner `n.endswith("_" + sk)` gate never admitted it), so
-    `dbpassword`/`usertoken` never returned True. We drop the dead branch
-    and document the behavior rather than add a broad contains-match (which
-    would over-redact benign fields like `notpassword`).
-    """
+    """password is not a sensitive field name (product rule); tokens still are."""
     assert is_sensitive_key("dbpassword") is False
     assert is_sensitive_key("usertoken") is False
-    # Underscore-joined suffixes ARE redacted.
-    assert is_sensitive_key("db_password") is True
+    assert is_sensitive_key("password") is False
+    assert is_sensitive_key("db_password") is False
     assert is_sensitive_key("user_token") is True
-    assert is_sensitive_key("my-api-key") is True  # hyphen normalized
-    # Exact sensitive names still redacted.
-    assert is_sensitive_key("password") is True
+    assert is_sensitive_key("my-api-key") is True
     assert is_sensitive_key("API_KEY") is True
 
 

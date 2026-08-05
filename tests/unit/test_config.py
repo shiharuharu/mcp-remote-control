@@ -295,7 +295,7 @@ def test_secret_path_stored_but_contents_not_in_repr() -> None:
     assert "lab_ssh_ed25519" in text or "key_path" in text
 
 
-def test_inline_password_not_stored_in_repr(tmp_path: Path) -> None:
+def test_inline_password_stored_but_hidden_in_repr(tmp_path: Path) -> None:
     pdir = tmp_path / "profiles"
     pdir.mkdir()
     (pdir / "with-pass.toml").write_text(
@@ -307,7 +307,7 @@ def test_inline_password_not_stored_in_repr(tmp_path: Path) -> None:
                 'username = "root"',
                 "[auth]",
                 'method = "password"',
-                'password = "s3cr3t-should-not-leak"',
+                'password = "s3cr3t-plain-ok"',
             ]
         )
         + "\n",
@@ -315,9 +315,12 @@ def test_inline_password_not_stored_in_repr(tmp_path: Path) -> None:
     )
     profile = load_profile(tmp_path, "with-pass")
     assert profile.auth is not None
+    assert profile.auth.password == "s3cr3t-plain-ok"
     assert profile.auth.has_inline_password is True
+    # repr still masks the body (debug dumps).
     blob = repr(profile) + str(profile)
-    assert "s3cr3t-should-not-leak" not in blob
+    assert "s3cr3t-plain-ok" not in blob
+    assert "password=<set>" in blob
 
 
 # ---------------------------------------------------------------------------

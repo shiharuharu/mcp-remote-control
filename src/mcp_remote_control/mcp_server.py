@@ -61,14 +61,14 @@ def create_server(*, name: str = "mcp-remote-control") -> MCPServer[Any]:
         instructions=(
             "mcp-remote-control tools: "
             "endpoint|exec|fs|screen|ps (hosts); "
-            "console (serial device debug, not PTY); "
-            "config (self-configure MRC_HOME — prefer this over asking humans "
-            "to edit TOML). "
-            "Typical bootstrap: config ensure_home → config put_secret → "
-            "config put_profile → endpoint open profile=. "
+            "console (serial, not PTY); "
+            "config (ONLY way to manage profiles/secrets — do NOT shell cat/ls/edit "
+            "~/.config or MRC_HOME files). "
+            "Bootstrap: config ensure_home → put_secret → put_profile → "
+            "endpoint open profile=. If unsure about auth JSON, config op=help. "
             "Hosts: endpoint open → exec/fs/screen/ps with ep=. "
             "Console: list → open path=<device> → send/views → close. "
-            "Secret bodies are written via put_secret and never returned."
+            "Secret bodies only via put_secret; never returned by reads."
         ),
     )
     register_tools(mcp)
@@ -253,14 +253,16 @@ def register_tools(mcp: MCPServer[Any]) -> None:
     @mcp.tool(
         name="config",
         description=(
-            "Self-configure MRC_HOME for the agent (no hand-edited files required). "
-            "op=home|ensure_home|get|list_profiles|get_profile|put_profile|"
+            "Complete self-config for profiles. Do NOT shell-edit config files. "
+            "ops: help|home|ensure_home|get|list_profiles|get_profile|put_profile|"
             "delete_profile|put_secret|list_secrets. "
-            "ensure_home creates profiles/secrets/logs/state + default config.toml. "
-            "put_secret name= content= writes secrets/<name> (body never returned). "
-            "put_profile name= transport=local|ssh|winrm with host/username/port/"
-            "auth(JSON object of paths only)/ssh/winrm/defaults/caps. "
-            "Then endpoint open profile=<name>."
+            "Password is NOT private — write it inline: "
+            'put_profile name=lab transport=ssh host=… username=… '
+            'auth={"method":"password","password":"<plain>"} '
+            'ssh={"known_hosts":"none"} then endpoint open profile=lab. '
+            "SSH key still uses put_secret + key_path=secrets/…. "
+            "WinRM: auth password=plain + winrm={scheme,auth}; optional defaults/caps. "
+            "op=help for recipes."
         ),
         structured_output=_STRUCTURED_OUTPUT_AGENT,
     )

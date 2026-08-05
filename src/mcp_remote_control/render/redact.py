@@ -16,11 +16,10 @@ from typing import Any
 REDACTED = "***"
 
 # Field names whose string values are always replaced (case-insensitive).
+# Passwords are product-visible (config may store plain password). Still redact
+# private keys, tokens, and other credential material.
 SENSITIVE_KEY_NAMES: frozenset[str] = frozenset(
     {
-        "password",
-        "passwd",
-        "pwd",
         "secret",
         "secrets",
         "private_key",
@@ -57,8 +56,9 @@ _BASIC_AUTH = re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/]+=*")
 #
 # Escaped same-quote inside a quoted value (``password="my \"secret\""``)
 # stops at the first inner quote; full escaped-quote parsing is out of scope.
+# Do not include password here — plain profile passwords are allowed in Agent text.
 _INLINE_ASSIGN = re.compile(
-    r"(?i)\b(password|passwd|pwd|secret|token|api_key|private_key|private_key_pem|passphrase)\s*[:=]\s*"
+    r"(?i)\b(secret|token|api_key|private_key|private_key_pem|passphrase)\s*[:=]\s*"
     r"(?:"
     r'"([^"]*)"'  # g2=double-quoted (single quotes allowed inside)
     r"|"

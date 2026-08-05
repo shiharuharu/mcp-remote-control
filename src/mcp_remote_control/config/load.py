@@ -299,8 +299,17 @@ def _parse_auth(
             f"profile {profile_name!r}: [auth].password_env must be a string ({path})"
         )
 
-    # Detect discouraged inline secrets without storing their values.
-    has_inline_password = "password" in table and table.get("password") is not None
+    # Inline password is allowed and stored for connect (product: not private).
+    password_inline: str | None = None
+    raw_pw = table.get("password")
+    if raw_pw is not None:
+        if not isinstance(raw_pw, str):
+            raise ProfileInvalid(
+                f"profile {profile_name!r}: [auth].password must be a string ({path})"
+            )
+        password_inline = raw_pw
+    has_inline_password = password_inline is not None
+    # Private key PEM bodies remain discouraged / not stored on AuthConfig.
     has_inline_private_key = (
         "private_key_pem" in table and table.get("private_key_pem") is not None
     )
@@ -404,6 +413,7 @@ def _parse_auth(
         passphrase_path=passphrase_path,
         password_path=password_path,
         password_env=password_env,
+        password=password_inline,
         has_inline_password=bool(has_inline_password),
         has_inline_private_key=bool(has_inline_private_key),
         cert_path=cert_path,
@@ -471,7 +481,10 @@ def _validate_auth_for_transport(
     protocol = _winrm_protocol_method(auth, winrm)
 
     has_password_material = bool(
-        auth.password_path or auth.password_env or auth.has_inline_password
+        auth.password_path
+        or auth.password_env
+        or auth.password
+        or auth.has_inline_password
     )
 
     if protocol == "certificate":

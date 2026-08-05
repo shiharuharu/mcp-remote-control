@@ -635,15 +635,19 @@ def _handle_ps(args: argparse.Namespace) -> int:
 def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     p = subparsers.add_parser(
         "config",
-        help="self-config MRC_HOME: home|ensure-home|get|list-profiles|get-profile|put-profile|delete-profile|put-secret|list-secrets",
+        help=(
+            "self-config (no shell/TOML edit): home|ensure-home|help|get|"
+            "list-profiles|get-profile|put-profile|delete-profile|put-secret|list-secrets"
+        ),
     )
     _add_json_flag(p)
     sub = p.add_subparsers(dest="config_op", metavar="OP")
 
     for op, help_t in (
-        ("home", "show resolved MRC_HOME paths"),
+        ("home", "config root readiness (no need to browse filesystem)"),
         ("ensure_home", "create layout + default config.toml"),
-        ("get", "summary of config home"),
+        ("help", "auth/bootstrap recipes for agents"),
+        ("get", "summary counts (profiles/secrets)"),
         ("list_profiles", "list profile names"),
         ("list_secrets", "list secret filenames (no bodies)"),
     ):

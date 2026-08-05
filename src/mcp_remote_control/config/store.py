@@ -1,21 +1,19 @@
 """Write config-home artifacts for agent self-configuration.
 
-Owns layout creation, profile TOML writes, and secret-file material under
-``MRC_HOME``. Security invariants:
+Owns layout creation, profile TOML writes, and optional secret-file material
+under ``MRC_HOME``.
 
-- Secret *bodies* are written only under ``secrets/`` (mode ``0o600``);
-  ``secrets/`` itself is ``0o700``. Profile TOML never persists secret
-  bodies outside ``[auth]``, and even there only ``*_path`` / env-name
-  fields are kept (inline bodies are stripped or rejected).
+- **Passwords** may be written inline in ``[auth].password`` (not treated as
+  private for this product). ``password_path`` / ``password_env`` remain
+  optional alternatives.
+- **Private key bodies** are not written into profiles; use ``secrets/`` +
+  ``key_path`` (or strip on write).
 - Profile and secret names are validated before path join so values like
   ``../config`` cannot escape ``profiles/`` or ``secrets/``.
-- Writes are atomic (same-dir temp + ``os.replace``). Secret writes open
-  the temp file at ``0o600`` so there is no world-readable window.
+- Writes are atomic (same-dir temp + ``os.replace``). Secret-file writes
+  open the temp file at ``0o600``.
 - When ``[security].strict_perms`` is true, profile files are also
-  ``0o600`` and ``profiles/`` is ``0o700``. Secret modes are always
-  enforced regardless of that flag.
-- Read APIs and ``profile_public_dict`` expose paths and flags only —
-  never secret bodies.
+  ``0o600`` and ``profiles/`` is ``0o700``.
 """
 
 from __future__ import annotations
@@ -45,9 +43,8 @@ _SECRET_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._@+-]*")
 _BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 _VALID_TRANSPORTS = frozenset({"local", "ssh", "winrm"})
 
-# Local equivalent of render.redact.is_sensitive_key. Duplicated here to avoid
-# a config→render layering dependency (render is the output layer; config is
-# foundational and must not import from it). Keep in sync with redact.py.
+# Keys forbidden outside [auth]. Password may live only under [auth].password
+# (product: plain password OK there), not under ssh=/winrm=/defaults=.
 _SENSITIVE_KEY_NAMES: frozenset[str] = frozenset(
     {
         "password",
@@ -72,11 +69,12 @@ _SENSITIVE_KEY_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# Known top-level [auth] inline secret *body* field names. Stripped on write
-# (tolerated-discouraged path). Also present in _SENSITIVE_KEY_NAMES so non-auth
-# sections reject them; listed here so the strip set is explicit.
+# Allowed as plain values only at the top level of [auth].
+_AUTH_ALLOWED_PLAIN_KEYS: frozenset[str] = frozenset({"password"})
+
+# Top-level [auth] keys that are still stripped on write (not passwords).
 _AUTH_INLINE_SECRET_KEYS: frozenset[str] = frozenset(
-    {"password", "private_key_pem", "private_key", "passphrase"}
+    {"private_key_pem", "private_key", "passphrase"}
 )
 
 
@@ -104,25 +102,35 @@ def _find_sensitive_keys(data: dict[str, Any], prefix: str = "") -> list[str]:
 
 
 def _clean_auth_table(auth: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of *auth* with top-level inline secret-body keys removed.
+    """Return a copy of *auth* for profile write.
 
-    Raises ``ProfileInvalid`` if any nested sub-table contains a sensitive key
-    (recurse-and-reject mirrors the non-auth section policy — flat strip alone
-    would miss nested values such as ``auth.credssp.client_secret``).
+    Keeps top-level ``password`` (plain text allowed). Strips private-key
+    bodies. Nested auth sub-tables still reject secret-bearing keys.
     """
-    cleaned = {
-        k: v
-        for k, v in auth.items()
-        if k not in _AUTH_INLINE_SECRET_KEYS
-        and not _is_sensitive_key(str(k))
-        and v is not None
-    }
-    leaks = _find_sensitive_keys(cleaned)
-    if leaks:
-        raise ProfileInvalid(
-            f"section [auth] must not contain secret-bearing keys: "
-            f"{', '.join(leaks)} (use secrets/ files + *_path fields instead)"
-        )
+    cleaned: dict[str, Any] = {}
+    for k, v in auth.items():
+        if v is None:
+            continue
+        key = str(k)
+        if key in _AUTH_INLINE_SECRET_KEYS:
+            continue
+        if isinstance(v, dict):
+            leaks = _find_sensitive_keys(v)
+            if leaks:
+                raise ProfileInvalid(
+                    f"section [auth] must not contain secret-bearing keys: "
+                    f"{', '.join(f'{key}.{x}' for x in leaks)} "
+                    f"(use secrets/ files + *_path fields instead)"
+                )
+            cleaned[key] = v
+            continue
+        # Allow plain password at auth top-level only.
+        if key in _AUTH_ALLOWED_PLAIN_KEYS:
+            cleaned[key] = v
+            continue
+        if _is_sensitive_key(key):
+            continue
+        cleaned[key] = v
     return cleaned
 
 
@@ -329,7 +337,10 @@ def render_profile_toml(
     defaults: dict[str, Any] | None = None,
     caps: dict[str, Any] | None = None,
 ) -> str:
-    """Build a profile TOML string (no secret bodies — paths only in auth)."""
+    """Build a profile TOML string.
+
+    Auth may include plain ``password``; private key bodies are stripped.
+    """
     if not _PROFILE_NAME_RE.fullmatch(name):
         raise ProfileInvalid(
             f"profile name {name!r} must match {_PROFILE_NAME_RE.pattern}"
@@ -655,13 +666,7 @@ def _security_strict_perms(home: Path) -> bool:
 
 
 def profile_public_dict(profile: Any) -> dict[str, Any]:
-    """JSON-safe profile view (paths and flags only — no secret bodies).
-
-    Exposes every non-secret ``AuthConfig`` field, including WinRM enterprise
-    auth fields (cert paths, SPN, negotiate/CredSSP options,
-    ``has_inline_*`` flags). Secret bodies are never stored on ``AuthConfig``,
-    so they cannot appear here.
-    """
+    """Profile view for agents: includes inline password; not private keys."""
     out: dict[str, Any] = {
         "name": profile.name,
         "transport": profile.transport,
@@ -685,7 +690,9 @@ def profile_public_dict(profile: Any) -> dict[str, Any]:
             auth["passphrase_path"] = str(a.passphrase_path)
         if a.password_env is not None:
             auth["password_env"] = a.password_env
-        if a.has_inline_password:
+        if a.password is not None:
+            auth["password"] = a.password
+        elif a.has_inline_password:
             auth["has_inline_password"] = True
         if a.has_inline_private_key:
             auth["has_inline_private_key"] = True

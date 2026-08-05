@@ -685,15 +685,18 @@ def _resolve_winrm_auth_protocol(
 
 
 def _resolve_password(profile: Profile) -> str | None:
-    """Load password from password_env or password_path; never log contents.
+    """Resolve password: inline first, then password_env, then password_path.
 
-    Returns None when no password material is configured (connector/mock may
-    still succeed). Missing env/path for a password-method profile surfaces as
-    AUTH_FAILED only when the real connector needs credentials.
+    Inline profile passwords are supported (not treated as private). File/env
+    paths remain optional. Missing material surfaces as AUTH_FAILED at connect
+    when the connector needs credentials.
     """
     auth = profile.auth
     if auth is None:
         return None
+
+    if auth.password is not None and str(auth.password) != "":
+        return str(auth.password)
 
     if auth.password_env:
         env_name = str(auth.password_env).strip()

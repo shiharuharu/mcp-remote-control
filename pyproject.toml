@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-remote-control"
-version = "0.2.1"
+version = "0.2.2"
 description = "mcp-remote-control — remote host control via MCP (endpoint/exec/fs/screen/ps)"
 readme = "README.md"
 license = "Apache-2.0"
