@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-remote-control"
-version = "0.1.0"
+version = "0.2.0"
 description = "mcp-remote-control — remote host control via MCP (endpoint/exec/fs/screen/ps)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -38,7 +38,10 @@ dependencies = [
     "asyncssh",
     "pyte",
     "pypsrp",
-    "mcp",
+    # Official MCP Python SDK. v2 renames FastMCP → MCPServer and drops
+    # mcp.server.fastmcp; keep a major pin so uvx cannot land on a future 3.x
+    # without an intentional bump.
+    "mcp>=2,<3",
     "pyserial",
 ]
 

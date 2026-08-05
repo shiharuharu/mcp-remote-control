@@ -5,4 +5,4 @@ Same Core ops power the MCP tools and the harness CLI. Configure under
 or ps. Serial hardware uses the separate console tool.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

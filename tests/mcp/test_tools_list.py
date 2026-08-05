@@ -17,6 +17,28 @@ from mcp_remote_control.serial.registry import reset_serial_registry
 EXPECTED = ["endpoint", "exec", "fs", "screen", "ps", "console", "config"]
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
+def _tool_text(out: object) -> str:
+    """Extract Agent-track text from MCPServer.call_tool result (SDK v1 or v2).
+
+    v2 returns ``CallToolResult`` with ``.content`` blocks.
+    v1 returned a list of blocks or ``(blocks, structured)``.
+    """
+    if hasattr(out, "content") and not isinstance(out, (list, tuple)):
+        blocks = getattr(out, "content") or []
+        structured = getattr(out, "structured_content", None)
+        if structured:
+            raise AssertionError(f"unexpected structured_content={structured!r}")
+        return "\n".join(getattr(b, "text", "") or "" for b in blocks)
+    if isinstance(out, tuple):
+        blocks = out[0]
+        if len(out) > 1 and out[1]:
+            raise AssertionError(f"unexpected structured={out[1]!r}")
+        return "\n".join(getattr(b, "text", "") or "" for b in blocks)
+    blocks = out  # type: ignore[assignment]
+    return "\n".join(getattr(b, "text", "") or "" for b in blocks)  # type: ignore[arg-type]
+
+
+
 
 @pytest.fixture(autouse=True)
 def _mrc_home(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -42,7 +64,7 @@ def test_tool_names_no_extras() -> None:
     assert len(tool_names()) == len(set(tool_names()))
 
 
-def test_fastmcp_list_tools_matches() -> None:
+def test_mcpserver_list_tools_matches() -> None:
     async def _run() -> list[str]:
         mcp = create_server()
         tools = await mcp.list_tools()
@@ -56,17 +78,7 @@ def test_fastmcp_list_tools_matches() -> None:
 def test_endpoint_tool_call_returns_agent_text() -> None:
     async def _run() -> str:
         mcp = create_server()
-        out = await mcp.call_tool("endpoint", {"op": "list"})
-        if isinstance(out, tuple):
-            blocks = out[0]
-        else:
-            blocks = out
-        texts = []
-        for b in blocks:
-            text = getattr(b, "text", None)
-            if text is not None:
-                texts.append(text)
-        return "\n".join(texts)
+        return _tool_text(await mcp.call_tool("endpoint", {"op": "list"}))
 
     text = asyncio.run(_run())
     first = text.splitlines()[0] if text else ""
@@ -76,24 +88,21 @@ def test_endpoint_tool_call_returns_agent_text() -> None:
 
 
 def test_tools_unstructured_agent_text_no_result_json_shell() -> None:
-    """MCP wire: plain content text, no FastMCP structuredContent {result:…}."""
+    """MCP wire: plain content text, no structured_content {result:…} shell."""
 
     async def _run() -> None:
         mcp = create_server()
         tools = await mcp.list_tools()
-        for t in tools:
-            schema = getattr(t, "outputSchema", None)
-            assert schema is None, f"{t.name} still has outputSchema={schema!r}"
+        for tool in tools:
+            schema = getattr(tool, "output_schema", None) or getattr(
+                tool, "outputSchema", None
+            )
+            assert schema is None, f"{tool.name} still has output_schema={schema!r}"
 
         out = await mcp.call_tool("config", {"op": "home"})
-        # Unstructured: list of TextContent only (not (blocks, structured_dict))
-        if isinstance(out, tuple):
-            blocks, structured = out[0], out[1] if len(out) > 1 else None
-            assert structured is None or structured == {}, structured
-        else:
-            blocks = out
-        texts = [getattr(b, "text", "") or "" for b in blocks]
-        text = "\n".join(texts)
+        if hasattr(out, "structured_content"):
+            assert not out.structured_content, out.structured_content
+        text = _tool_text(out)
         assert text.lstrip().startswith("@config")
         assert not text.lstrip().startswith("{")
         assert '"result"' not in text.split("\n", 1)[0]
@@ -104,10 +113,7 @@ def test_tools_unstructured_agent_text_no_result_json_shell() -> None:
 def test_console_tool_list_returns_console_kind() -> None:
     async def _run() -> str:
         mcp = create_server()
-        out = await mcp.call_tool("console", {"op": "list"})
-        blocks = out[0] if isinstance(out, tuple) else out
-        texts = [getattr(b, "text", "") or "" for b in blocks]
-        return "\n".join(texts)
+        return _tool_text(await mcp.call_tool("console", {"op": "list"}))
 
     text = asyncio.run(_run())
     assert "@console" in text
@@ -130,10 +136,7 @@ def test_all_tools_callable() -> None:
         }
         results: dict[str, str] = {}
         for name, args in payloads.items():
-            out = await mcp.call_tool(name, args)
-            blocks = out[0] if isinstance(out, tuple) else out
-            texts = [getattr(b, "text", "") or "" for b in blocks]
-            results[name] = "\n".join(texts)
+            results[name] = _tool_text(await mcp.call_tool(name, args))
         return results
 
     results = asyncio.run(_run())
@@ -197,7 +200,7 @@ def test_console_tool_routes_device_to_path_behavioral(
     ``path=`` (it does ``path=path or device`` and drops ``device=``).
 
     Source-inspection (``test_console_tool_passes_path_or_device_only``) is a
-    brittle secondary guard; this drives the actual registered FastMCP
+    brittle secondary guard; this drives the actual registered MCPServer
     ``console`` tool via ``mcp.call_tool`` with ``device=COM9`` (no ``path``)
     and asserts what reaches ``console_ops.run``: Core receives
     ``path="COM9"`` and NO ``device=`` kwarg (a caller's distinct ``device=``
@@ -226,10 +229,9 @@ def test_console_tool_routes_device_to_path_behavioral(
 
     async def _run() -> str:
         mcp = create_server()
-        out = await mcp.call_tool("console", {"op": "open", "device": "COM9"})
-        blocks = out[0] if isinstance(out, tuple) else out
-        texts = [getattr(b, "text", "") or "" for b in blocks]
-        return "\n".join(texts)
+        return _tool_text(
+            await mcp.call_tool("console", {"op": "open", "device": "COM9"})
+        )
 
     text = asyncio.run(_run())
 
@@ -323,10 +325,7 @@ def test_mcp_tool_param_pass_through_representative_payloads() -> None:
         }
         results: dict[str, str] = {}
         for name, args in payloads.items():
-            out = await mcp.call_tool(name, args)
-            blocks = out[0] if isinstance(out, tuple) else out
-            texts = [getattr(b, "text", "") or "" for b in blocks]
-            results[name] = "\n".join(texts)
+            results[name] = _tool_text(await mcp.call_tool(name, args))
         return results
 
     results = asyncio.run(_run())
@@ -361,9 +360,9 @@ def test_mcp_tool_param_pass_through_representative_payloads() -> None:
 
 def test_mcp_tool_handler_signatures_accept_documented_kwargs() -> None:
     """Static guard: every kwarg in the MCP handler signatures (per the
-    FastMCP ``inputSchema``) must be a name the Python handler declares.
+    MCPServer ``input_schema``) must be a name the Python handler declares.
     A future rename of a Core param that forgets to update the MCP handler
-    would surface here as an inputSchema mismatch (FastMCP derives properties
+    would surface here as an input_schema mismatch (MCPServer derives properties
     from the handler signature).
     """
 
@@ -371,8 +370,14 @@ def test_mcp_tool_handler_signatures_accept_documented_kwargs() -> None:
         mcp = create_server()
         tools = {t.name: t for t in await mcp.list_tools()}
         return {
-            name: set((t.inputSchema or {}).get("properties", {}).keys())
-            for name, t in tools.items()
+            name: set(
+                (
+                    getattr(tool, "input_schema", None)
+                    or getattr(tool, "inputSchema", None)
+                    or {}
+                ).get("properties", {}).keys()
+            )
+            for name, tool in tools.items()
         }
 
     schema_props = asyncio.run(_run())
@@ -430,7 +435,7 @@ def test_mcp_tool_handler_signatures_accept_documented_kwargs() -> None:
     assert set(schema_props) == set(expected_props)
     for name, props in expected_props.items():
         assert schema_props[name] == props, (
-            f"{name} inputSchema drifted: expected {props}, got {schema_props[name]}"
+            f"{name} input_schema drifted: expected {props}, got {schema_props[name]}"
         )
 
 
@@ -440,8 +445,8 @@ def test_mcp_tool_handler_signatures_accept_documented_kwargs() -> None:
 # uses ``config: {op: "list_profiles"}`` (a no-arg op), so the winrm/defaults/caps
 # forward path in the MCP config handler is not behaviorally exercised at the
 # MCP level — a future refactor dropping ``winrm=winrm`` from the MCP forward
-# would pass the inputSchema pin + the list_profiles test. This drives the
-# real FastMCP config tool with op=put_profile + winrm/defaults/caps dicts,
+# would pass the input_schema pin + the list_profiles test. This drives the
+# real MCPServer config tool with op=put_profile + winrm/defaults/caps dicts,
 # writes a real profile in a tmpdir MRC_HOME, and reads the TOML back (mirroring
 # the CLI round-trip at test_cli_tools.py::test_config_put_profile_roundtrip_with_winrm_json
 # but on the MCP↔Core surface).
@@ -456,7 +461,7 @@ def test_mcp_config_put_profile_winrm_defaults_caps_roundtrip(
 
     Uses a real write+readback against a tmpdir ``MRC_HOME`` (no monkeypatch of
     ``config_ops.run``) for maximum behavioral strength: the call traverses
-    FastMCP tool → ``mcp_server.config`` handler → ``config_ops.run`` →
+    MCPServer tool → ``mcp_server.config`` handler → ``config_ops.run`` →
     ``store.put_profile`` → TOML on disk, then ``get_profile`` reads it back.
     A future refactor that drops ``winrm=winrm`` / ``defaults=defaults`` /
     ``caps=caps`` from the MCP handler forward would silently lose the
@@ -471,9 +476,7 @@ def test_mcp_config_put_profile_winrm_defaults_caps_roundtrip(
         mcp = create_server()
 
         async def _call(args: dict[str, object]) -> str:
-            out = await mcp.call_tool("config", args)
-            blocks = out[0] if isinstance(out, tuple) else out
-            return "\n".join(getattr(b, "text", "") or "" for b in blocks)
+            return _tool_text(await mcp.call_tool("config", args))
 
         texts: dict[str, str] = {}
         texts["ensure"] = await _call({"op": "ensure_home"})

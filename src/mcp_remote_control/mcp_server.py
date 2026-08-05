@@ -6,20 +6,20 @@ No business logic lives here.
 MCP tools/call result shape used here:
 
 - ``content``: ``[{type: "text", text: "<Agent track>"}]``
-- ``isError``: false|true
-- ``structuredContent``: omitted for Agent-track tools
+- ``isError`` / ``is_error``: false|true
+- ``structuredContent`` / ``structured_content``: omitted for Agent-track tools
 
-FastMCP's default for ``-> str`` invents ``outputSchema {result: string}``
-and wraps the payload as ``structuredContent={"result": "..."}``, so hosts
-show a JSON shell around ``@kind status …`` text. We force unstructured
-output (``structured_output=False``) so Agent text is the sole payload.
+``MCPServer`` (SDK v2; was FastMCP in v1) defaults for ``-> str`` invent
+``output_schema {result: string}`` and wrap as structured content. We force
+unstructured output (``structured_output=False``) so Agent text is the sole
+payload and hosts do not show a JSON ``{"result":…}`` shell.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from mcp_remote_control.core import (
     config_ops,
@@ -43,9 +43,9 @@ TOOL_NAMES: tuple[str, ...] = (
     "config",
 )
 
-# Agent-track text only — no FastMCP ``{"result": ...}`` structured wrap.
+# Agent-track text only — no ``{"result": ...}`` structured wrap.
 # Pass as an explicit kwarg (not ``**dict``) so type checkers bind
-# ``structured_output: bool`` correctly on FastMCP.tool.
+# ``structured_output: bool`` correctly on MCPServer.tool.
 _STRUCTURED_OUTPUT_AGENT = False
 
 
@@ -54,9 +54,9 @@ def tool_names() -> list[str]:
     return list(TOOL_NAMES)
 
 
-def create_server(*, name: str = "mcp-remote-control") -> FastMCP:
-    """Build FastMCP with host tools, console, and config."""
-    mcp = FastMCP(
+def create_server(*, name: str = "mcp-remote-control") -> MCPServer[Any]:
+    """Build MCPServer with host tools, console, and config."""
+    mcp = MCPServer(
         name,
         instructions=(
             "mcp-remote-control tools: "
@@ -74,7 +74,8 @@ def create_server(*, name: str = "mcp-remote-control") -> FastMCP:
     register_tools(mcp)
     return mcp
 
-def register_tools(mcp: FastMCP) -> None:
+
+def register_tools(mcp: MCPServer[Any]) -> None:
     """Register MCP tools (idempotent per instance)."""
 
     @mcp.tool(

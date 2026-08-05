@@ -70,7 +70,7 @@ deploy
 { "result": "@exec ok …" }
 ```
 
-那一层 `{"result":…}` 来自 **FastMCP** 对 `-> str` 的自动 `structuredContent` 包装。本仓库在 tool 注册时使用 **`structured_output=False`**，只暴露 Agent 文本，避免 Host UI 显示 JSON 外壳。
+那一层 `{"result":…}` 来自 MCP SDK 对 `-> str` 的自动 structured 包装（v1 FastMCP / v2 `MCPServer`）。本仓库在 tool 注册时使用 **`structured_output=False`**，只暴露 Agent 文本，避免 Host UI 显示 JSON 外壳。要求 **`mcp` SDK ≥ 2**（`MCPServer`）。
 
 CLI 默认同样是 Agent 文本；加 **`--json`** 才走机器轨。
 
@@ -620,7 +620,8 @@ python -m mcp_remote_control.mcp_server
 |------|-------------|
 | **找不到 `config` 工具** | Host 仍在跑 **旧 uvx 缓存**（仅 6 tools）。改用 **本地** `--with-editable` 或 `.venv` 入口，或 `uvx --refresh`，然后 **重连 MCP**。 |
 | 想 **editable 却写了 `git+https://…`** | uv 的 editable **只接受本地路径**。先 `git clone`，再 `--with-editable "$REPO" --from "$REPO"`。只用远端请用 **`--from git+…`（非 editable）**。 |
-| 输出被 **`{"result":"@exec…"}` 包一层** | 旧 FastMCP structured 包装；当前源码已 `structured_output=False`。刷新安装并重启 MCP 进程。 |
+| 输出被 **`{"result":"@exec…"}` 包一层** | 旧 SDK structured 包装；当前源码已 `structured_output=False`。`uvx --refresh` 后重连 MCP。 |
+| `No module named 'mcp.server.fastmcp'` | 装到了 MCP SDK v1 API 路径但环境是旧缓存，或反过来。本项目 **0.2+ 需要 `mcp>=2`**（`MCPServer`）。`uvx --refresh`。 |
 | `cwd=True` / `cd True` | 旧 probe 把 `cap_pwd` 写成路径（已修）。升级后 **close 再 open** endpoint。 |
 | `uvx` / No solution · Python 版本 | 加 **`--python 3.12`**（或 ≥3.11）；确认仓库根有 `pyproject.toml`，勿乱加 `#subdirectory=`。 |
 | 私有仓认证失败 | `git+ssh://…` 或配好 Git/SSH 凭据。 |

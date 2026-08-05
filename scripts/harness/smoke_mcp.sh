@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # smoke_mcp.sh — L3-lite MCP smoke: list tools + call implemented ops (local).
 #
-# Uses FastMCP in-process (same process for open→send→close), not multi-process
+# Uses MCPServer in-process (same process for open→send→close), not multi-process
 # CLI. Screen/console registries are process-local.
 #
 # Usage (from repo root):
@@ -35,7 +35,7 @@ assert names == expected, f"tool_names={names!r} want {expected!r}"
 print("tools:", ",".join(names))
 PY
 
-echo "smoke_mcp: FastMCP list_tools + local tool calls …"
+echo "smoke_mcp: MCPServer list_tools + local tool calls …"
 "$PYTHON" - <<'PY'
 import asyncio
 import os
@@ -49,7 +49,13 @@ EXPECTED = tool_names()
 
 
 def _text(out) -> str:
-    blocks = out[0] if isinstance(out, tuple) else out
+    # SDK v2: CallToolResult.content; v1: list|(blocks, structured)
+    if hasattr(out, "content") and not isinstance(out, (list, tuple)):
+        blocks = out.content or []
+    elif isinstance(out, tuple):
+        blocks = out[0]
+    else:
+        blocks = out
     return "\n".join(getattr(b, "text", "") or "" for b in blocks)
 
 
