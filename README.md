@@ -248,40 +248,15 @@ uv run --python 3.12 mcp-remote-control
 
 ## MCP Host 配置
 
-`command` = 本机可执行文件（`which uvx` 或 venv **绝对**路径），`env.MRC_HOME` 指向配置根。
+`command` = 本机可执行文件（`which uvx` 或 venv 的绝对路径）。  
+**配置根默认**为用户目录下的 `~/.config/mcp-remote-control`；一般**不必**在 Host JSON 里写 `MRC_HOME`。
 
-### 路径怎么写（必读）
-
-| 写法 | 是否可用 | 说明 |
-|------|----------|------|
-| 省略 `MRC_HOME` | ✅ 推荐默认 | 进程内默认 **`$HOME/.config/mcp-remote-control`**（`~` 由本程序 `expanduser`） |
-| JSON 里写绝对路径 | ✅ | 如 `/Users/alice/.config/...`、`/home/alice/.config/...`（**粘贴本机真实路径**） |
-| JSON 里写 `~/.config/...` | ⚠️ 多数 Host 不展开 | Claude Desktop 等常把 `~` 当字面字符；应用内虽会 `expanduser`，但 **`command` 路径不要指望 Host 展开 `~`** |
-| `/Users/<you>/...` | ❌ 文档占位符 | **不是**合法路径；`<you>` 必须换成你的用户名，或干脆用下面命令生成 |
-| `~/Users/...` 或 `~/Users/<you>/...` | ❌ 错误 | `~` 已是家目录，再写 `Users/...` 会变成 **`$HOME/Users/...`**（多一层），不符合直觉 |
-
-生成**可粘贴**的绝对路径（shell 里跑，把输出拷进 JSON）：
-
-```bash
-# 配置根
-echo "$HOME/.config/mcp-remote-control"
-# → macOS 例: /Users/alice/.config/mcp-remote-control
-# → Linux 例: /home/alice/.config/mcp-remote-control
-
-# 本仓库根（editable / venv 用；在 clone 目录内）
-pwd -P
-# 或
-echo "$(cd /path/to/mcp-remote-control && pwd -P)"
-
-# venv 入口
-echo "$(pwd -P)/.venv/bin/mcp-remote-control"
-```
+若一定要指定，请用本机真实绝对路径（在终端 `echo "$HOME/.config/mcp-remote-control"` 后粘贴结果）。  
+不要照抄文档里的示例用户名，也不要写 `~/Users/...` 这类叠路径。
 
 ### 生产 / 只用：远端 GitHub（非 editable）
 
 Host 里写 **Git URL**，用 `--from git+…`。**不要**在 args 里写 `--with-editable` + `git+https://…`。
-
-下面 JSON 中的路径请换成你机器上 `echo "$HOME/.config/mcp-remote-control"` 的输出；若接受默认配置根，可**删掉整个 `env` 块**。
 
 ```json
 {
@@ -293,39 +268,17 @@ Host 里写 **Git URL**，用 `--from git+…`。**不要**在 args 里写 `--wi
         "--from",
         "git+https://github.com/shiharuharu/mcp-remote-control.git@main",
         "mcp-remote-control"
-      ],
-      "env": {
-        "MRC_HOME": "/Users/alice/.config/mcp-remote-control"
-      }
+      ]
     }
   }
 }
 ```
 
-强制刷新缓存（远端更新后 Host 仍旧时）：
-
-```json
-"args": [
-  "--python", "3.12",
-  "--refresh",
-  "--from",
-  "git+https://github.com/shiharuharu/mcp-remote-control.git@main",
-  "mcp-remote-control"
-]
-```
+需要自定义配置根时再加 `env.MRC_HOME`（绝对路径）。强制刷新缓存可在 `args` 最前加 `"--refresh"`。
 
 ### 开发：本地 checkout + `--with-editable`（推荐）
 
-先 `git clone`（或本机已有树）。`REPO` 必须是 **含 `pyproject.toml` 的绝对路径**（`pwd -P` 输出），不是 `git+https://…`。
-
-```bash
-cd /path/to/mcp-remote-control   # 仓库根
-export REPO="$(pwd -P)"
-export MRC_HOME="$HOME/.config/mcp-remote-control"
-# 把 $REPO / $MRC_HOME 展开后的字符串填进下面 JSON
-echo "REPO=$REPO"
-echo "MRC_HOME=$MRC_HOME"
-```
+先 `git clone`，在**含 `pyproject.toml` 的仓库根**取绝对路径（`pwd -P`），填入下面两处（不是 `git+https://…`）：
 
 ```json
 {
@@ -339,33 +292,22 @@ echo "MRC_HOME=$MRC_HOME"
         "--from",
         "/absolute/path/to/mcp-remote-control",
         "mcp-remote-control"
-      ],
-      "env": {
-        "MRC_HOME": "/Users/alice/.config/mcp-remote-control"
-      }
+      ]
     }
   }
 }
 ```
 
-改代码后 **重连 MCP**，不要指望 stdio 进程热更新。
+改代码后 **重连 MCP**。
 
 ### 开发：venv 绝对路径（最简单）
-
-```bash
-cd /path/to/mcp-remote-control
-echo "$(pwd -P)/.venv/bin/mcp-remote-control"
-```
 
 ```json
 {
   "mcpServers": {
     "mcp-remote-control": {
       "command": "/absolute/path/to/mcp-remote-control/.venv/bin/mcp-remote-control",
-      "args": [],
-      "env": {
-        "MRC_HOME": "/Users/alice/.config/mcp-remote-control"
-      }
+      "args": []
     }
   }
 }
@@ -668,8 +610,8 @@ python -m mcp_remote_control.mcp_server
 | `cwd=True` / `cd True` | 旧 probe 把 `cap_pwd` 写成路径（已修）。升级后 **close 再 open** endpoint。 |
 | `uvx` / No solution · Python 版本 | 加 **`--python 3.12`**（或 ≥3.11）；确认仓库根有 `pyproject.toml`，勿乱加 `#subdirectory=`。 |
 | 私有仓认证失败 | `git+ssh://…` 或配好 Git/SSH 凭据。 |
-| `PROFILE_NOT_FOUND` | 检查 `MRC_HOME` 与 `profiles/<name>.toml`；或用 `config put_profile`。 |
-| 配置跑到 **`$HOME/Users/...`** 怪路径 | 误写了 `~/Users/...` 或照抄 `/Users/<you>/...`。见 [路径怎么写](#路径怎么写必读)：用 `echo "$HOME/.config/mcp-remote-control"`，不要叠 `~` + `Users`。 |
+| `PROFILE_NOT_FOUND` | 检查配置根与 `profiles/<name>.toml`；或用 `config put_profile`。默认配置根：`~/.config/mcp-remote-control`。 |
+| `Permission denied` 指向奇怪家目录 | Host 里 `MRC_HOME` 若填了无效路径，删掉 `env.MRC_HOME` 用默认，或改成终端里 `echo "$HOME/.config/mcp-remote-control"` 的结果。 |
 | `SCREEN_NOT_FOUND` | 会话仅在**当前** Python 进程内。勿跨两次 CLI 进程接力 `screen open` / `send`；见 [CLI · 进程内状态限制](#进程内状态限制必读)。 |
 | 远端/源码已更新 Host 仍旧 | `uvx --refresh` / pin 新 commit / 开发用本地 `--with-editable`。 |
 | WinRM `screen` | 预期 `UNSUPPORTED`；用 `ps`。 |

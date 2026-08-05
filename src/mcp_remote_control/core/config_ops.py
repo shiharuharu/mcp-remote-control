@@ -48,9 +48,11 @@ VALID_OPS: frozenset[str] = frozenset(
 
 
 def _home(home: Path | str | None) -> Path:
+    """Resolve config root to an absolute path (same rules as ``resolve_home``)."""
     if home is None:
         return resolve_home()
-    return Path(home).expanduser().resolve()
+    # Treat explicit home= like MRC_HOME: expand ~ / $HOME; reject placeholders.
+    return resolve_home(env={"MRC_HOME": str(home)})
 
 
 def op_home(*, home: Path | str | None = None, **_kwargs: Any) -> OpResult:

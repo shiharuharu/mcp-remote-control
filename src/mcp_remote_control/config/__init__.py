@@ -27,6 +27,7 @@ from mcp_remote_control.config.models import (
 from mcp_remote_control.config.paths import (
     config_toml_path,
     profiles_dir,
+    default_home,
     resolve_home,
     resolve_under_home,
     secrets_dir,
@@ -44,6 +45,7 @@ __all__ = [
     "ProfileNotFound",
     "SecurityConfig",
     "config_toml_path",
+    "default_home",
     "list_profiles",
     "load_config",
     "load_profile",
