@@ -26,6 +26,7 @@ from mcp_remote_control.transport.async_bridge import AsyncLoopBridge, run_coro
 from mcp_remote_control.transport.base import BaseTransport, ExecResult, TransportError
 from mcp_remote_control.transport.shell_wrap import (
     POSIX_PROBE_SCRIPT,
+    POWERSHELL_PROBE_SCRIPT,
     WINDOWS_PROBE_SCRIPT,
     coerce_cwd_path,
     normalize_shell_family,
@@ -326,61 +327,77 @@ class SSHTransport(BaseTransport):
     def collect_probe(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
         """Best-effort remote shell/OS/encoding probe (never raises).
 
-        Runs the POSIX probe first, then may retry the Windows probe. Windows
-        results are adopted only when they look *credible* (real ``COMSPEC``
-        path or ``chcp``), so a POSIX host that merely echoes the Windows
-        script is not misclassified as cmd/PowerShell.
+        Order: POSIX → PowerShell (Windows OpenSSH default) → cmd /c.
+        A failed probe must not leave a dead session usable by exec: if the
+        peer closed mid-probe we reconnect once before returning.
         """
         out: dict[str, Any] = {"status": "ok"}
-        try:
-            result = self.run_command(
-                POSIX_PROBE_SCRIPT, timeout_s=timeout_s
-            )
+        parsed: dict[str, Any] = {}
+
+        def _ensure_live() -> bool:
+            if self.is_connected():
+                return True
+            try:
+                self.connect()
+                return self.is_connected()
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _try_script(script: str) -> dict[str, Any]:
+            if not _ensure_live():
+                return {}
+            try:
+                result = self.run_command(script, timeout_s=timeout_s)
+            except Exception:  # noqa: BLE001
+                if not self.is_alive():
+                    self.mark_dead("probe exec failed")
+                return {}
+            # Soft-fail scripts (exit -1 / empty) may still close OpenSSH.
+            if not self.is_alive():
+                self.mark_dead("probe closed ssh peer")
+                return {}
             text = (result.stdout or "") + "\n" + (result.stderr or "")
-            parsed = parse_probe_output(text)
-            # If POSIX probe failed hard (non-zero exit, no uname), retry Windows.
-            if result.exit_code not in (0, None) and not parsed.get("uname"):
-                # Same credible-windows gate as the elif branch below. A
-                # POSIX host whose login shell uses non-POSIX command
-                # substitution (fish/csh/tcsh) aborts on the POSIX probe's
-                # `$(uname …)` and falls into this hard-fail branch; the
-                # Windows probe then echoes `os=windows`/`comspec=%COMSPEC%`
-                # verbatim (no `%` expansion), which parse_probe_output
-                # parses as {os:windows, comspec:"%COMSPEC%", shell_base:cmd}
-                # — non-credible. Without this gate the host would be
-                # misclassified as cmd, breaking cwd wrap + run_argv on
-                # that shell. Only adopt the Windows parse when it
-                # credibly identifies windows (real COMSPEC / chcp);
-                # otherwise leave the original (empty/partial) parse and
-                # mark status partial when there is no usable data —
-                # mirroring the elif branch.
-                result_w = self.run_command(
-                    WINDOWS_PROBE_SCRIPT, timeout_s=timeout_s
-                )
-                text_w = (result_w.stdout or "") + "\n" + (result_w.stderr or "")
-                parsed_w = parse_probe_output(text_w)
-                if _looks_credibly_windows(parsed_w):
-                    parsed = parsed_w
-                elif not parsed:
-                    out["status"] = "partial"
-            elif parsed.get("os") != "windows":
-                # Retry Windows when the POSIX probe parsed as non-windows
-                # even with exit 0. A Windows host whose default shell is
-                # cmd.exe echoes the POSIX probe verbatim — the echoed
-                # ``echo os=posix`` line makes parse_probe_output set
-                # os=posix, so the retry branch above never runs. Only
-                # adopt the Windows parse when it credibly identifies
-                # windows (real COMSPEC / chcp, not echoed literals) so a
-                # genuine POSIX host is not misclassified.
-                result_w = self.run_command(
-                    WINDOWS_PROBE_SCRIPT, timeout_s=timeout_s
-                )
-                text_w = (result_w.stdout or "") + "\n" + (result_w.stderr or "")
-                parsed_w = parse_probe_output(text_w)
-                if _looks_credibly_windows(parsed_w):
-                    parsed = parsed_w
-                elif not parsed:
-                    out["status"] = "partial"
+            return parse_probe_output(text)
+
+        try:
+            parsed = _try_script(POSIX_PROBE_SCRIPT)
+            uname_val = str(parsed.get("uname") or "")
+            # cmd.exe may echo `uname=$(uname …)` literally — not a real uname.
+            echoed_posix = (
+                "$(" in uname_val
+                or "2>/dev" in uname_val
+                or "uname -" in uname_val
+                or uname_val.strip() in {"", "-", "--"}
+            )
+            credible_posix = bool(
+                uname_val
+                and parsed.get("os") != "windows"
+                and not echoed_posix
+            )
+            # Windows OpenSSH often defaults to PowerShell: the POSIX script
+            # can close the session. Prefer a native PS probe, then cmd /c.
+            if not credible_posix and not _looks_credibly_windows(parsed):
+                parsed_ps = _try_script(POWERSHELL_PROBE_SCRIPT)
+                if _looks_credibly_windows(parsed_ps) or parsed_ps.get(
+                    "shell_base"
+                ) in ("powershell", "pwsh"):
+                    parsed = parsed_ps
+                else:
+                    parsed_w = _try_script(WINDOWS_PROBE_SCRIPT)
+                    if _looks_credibly_windows(parsed_w):
+                        parsed = parsed_w
+                    elif not parsed:
+                        out["status"] = "partial"
+            elif parsed.get("os") != "windows" and not credible_posix:
+                parsed_ps = _try_script(POWERSHELL_PROBE_SCRIPT)
+                if _looks_credibly_windows(parsed_ps):
+                    parsed = parsed_ps
+                else:
+                    parsed_w = _try_script(WINDOWS_PROBE_SCRIPT)
+                    if _looks_credibly_windows(parsed_w):
+                        parsed = parsed_w
+                    elif not parsed:
+                        out["status"] = "partial"
 
             out.update({k: v for k, v in parsed.items() if v is not None})
 
@@ -422,6 +439,15 @@ class SSHTransport(BaseTransport):
         except Exception as exc:  # noqa: BLE001
             out["status"] = "partial"
             out["error"] = _safe_connect_msg(exc)
+        # Probe must not strand callers with a dead transport after open.
+        if not self.is_connected():
+            try:
+                self.connect()
+            except Exception as exc:  # noqa: BLE001
+                out["status"] = "partial"
+                out.setdefault("error", _safe_connect_msg(exc))
+        if not parsed and out.get("status") == "ok":
+            out["status"] = "partial"
         return out
 
     def run_argv(
@@ -485,6 +511,16 @@ class SSHTransport(BaseTransport):
                 details={"host": self.host},
             )
         return self._conn
+
+    def is_connected(self) -> bool:
+        """True only when flagged connected *and* the SSH socket is alive."""
+        if not self._connected or self._conn is None:
+            return False
+        if not self.is_alive():
+            # Peer drop / bad probe left a zombie flag — publish dead state.
+            self.mark_dead("ssh peer closed")
+            return False
+        return True
 
     def is_alive(self) -> bool:
         """Best-effort liveness of the underlying SSH connection."""

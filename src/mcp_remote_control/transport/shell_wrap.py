@@ -104,10 +104,11 @@ _HOME_RE = re.compile(r"^home=(.*)$", re.MULTILINE | re.IGNORECASE)
 _PWD_RE = re.compile(r"^pwd=(.*)$", re.MULTILINE | re.IGNORECASE)
 _OS_RE = re.compile(r"^os=(.*)$", re.MULTILINE | re.IGNORECASE)
 _COMSPEC_RE = re.compile(r"^comspec=(.*)$", re.MULTILINE | re.IGNORECASE)
+_SHELL_BASE_RE = re.compile(r"^shell_base=(.*)$", re.MULTILINE | re.IGNORECASE)
 _KV_RE = re.compile(r"^(busybox|busybox_banner|sh_link|cap_pwd|cap_pwd_p|cap_printf)=(.*)$", re.MULTILINE | re.IGNORECASE)
 
 
-# Dual-path probe: POSIX script first; Windows cmd fragment second attempt.
+# Dual-path probe: POSIX first; then PowerShell / cmd for Windows OpenSSH.
 # Busybox ash-friendly: no bash arrays, no [[, no local, no process substitution.
 POSIX_PROBE_SCRIPT = (
     "echo uname=$(uname -s 2>/dev/null)-$(uname -m 2>/dev/null); "
@@ -124,12 +125,20 @@ POSIX_PROBE_SCRIPT = (
     "echo os=posix"
 )
 
+# Windows OpenSSH often defaults to PowerShell. Bare ``echo a & echo b`` and
+# ``chcp`` (or ``cmd /c ver``) can close the SSH session. Prefer a native
+# PowerShell one-liner; fall back to a single ``cmd /c`` without chcp/ver.
+POWERSHELL_PROBE_SCRIPT = (
+    'Write-Output "os=windows"; '
+    'Write-Output "shell_base=powershell"; '
+    'Write-Output ("comspec=" + $env:ComSpec); '
+    'Write-Output ("home=" + $env:USERPROFILE); '
+    'Write-Output ("pwd=" + (Get-Location).Path)'
+)
+
 WINDOWS_PROBE_SCRIPT = (
-    "echo os=windows & "
-    "echo comspec=%COMSPEC% & "
-    "echo home=%USERPROFILE% & "
-    "echo pwd=%CD% & "
-    "chcp"
+    'cmd /c "echo os=windows& echo comspec=%COMSPEC%& '
+    'echo home=%USERPROFILE%& echo pwd=%CD%& echo shell_base=cmd"'
 )
 
 
@@ -177,10 +186,22 @@ def parse_probe_output(text: str) -> dict[str, Any]:
     if m and m.group(1).strip():
         data["pwd"] = m.group(1).strip()
 
+    # Explicit shell_base= from PowerShell/cmd probes (before comspec default).
+    m = _SHELL_BASE_RE.search(body)
+    if m and m.group(1).strip():
+        base = m.group(1).strip().lower().removesuffix(".exe")
+        if base:
+            data["shell_base"] = base
+            if base in ("cmd", "powershell", "pwsh", "command"):
+                data["os"] = "windows"
+
     m = _COMSPEC_RE.search(body)
     if m and m.group(1).strip():
         data["comspec"] = m.group(1).strip()
         data["os"] = "windows"
+        # comspec presence does not mean the login shell is cmd — Windows
+        # OpenSSH often defaults to PowerShell while COMSPEC still points at
+        # cmd.exe. Only default shell_base=cmd when probe did not say otherwise.
         data.setdefault("shell_base", "cmd")
 
     chcp = _CHCP_RE.search(body)

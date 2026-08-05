@@ -170,11 +170,35 @@ def open_endpoint(
             },
         )
 
+    # Probe must not leave a registered-but-dead endpoint looking healthy.
+    transport = endpoint.transport
+    if transport is not None and not transport.is_connected():
+        dead = None
+        meta = getattr(transport, "meta", None) or {}
+        if isinstance(meta, dict):
+            dead = meta.get("dead_reason") or meta.get("probe_error")
+        return OpResult(
+            kind="endpoint",
+            status="error",
+            code="NOT_CONNECTED",
+            fields={
+                "op": "open",
+                "profile": name,
+                "ep": endpoint.name,
+                "msg": dead or "transport not connected after open",
+            },
+            hint="check auth (password= plain ok) and ssh.known_hosts=none for lab hosts",
+        )
+
+    # Keep Endpoint.connected in sync with transport (probe may have flipped it).
+    endpoint.connected = bool(transport is not None and transport.is_connected())
+
     fields_ok: dict[str, Any] = {
         "op": "open",
         "ep": endpoint.name,
         "transport": endpoint.transport_name,
         "caps": endpoint.caps_token,
+        "open": 1 if endpoint.connected else 0,
     }
     if endpoint.meta.get("host"):
         fields_ok["host"] = endpoint.meta["host"]
