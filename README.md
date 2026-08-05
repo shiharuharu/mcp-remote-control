@@ -138,7 +138,7 @@ uvx --python 3.12 --from "$FROM" mcp-remote-control-cli endpoint list
 分支 / tag / commit / 私有仓：
 
 ```bash
-uvx --python 3.12 --from "git+https://github.com/shiharuharu/mcp-remote-control.git@v0.1.0" mcp-remote-control
+uvx --python 3.12 --from "git+https://github.com/shiharuharu/mcp-remote-control.git@v0.2.0" mcp-remote-control
 uvx --python 3.12 --from "git+https://github.com/shiharuharu/mcp-remote-control.git@abcdef1" mcp-remote-control
 uvx --python 3.12 --from "git+ssh://git@github.com/shiharuharu/mcp-remote-control.git@main" mcp-remote-control
 ```

@@ -5,7 +5,7 @@
 #   1. pytest -q --ignore=tests/integration   # unit + service + mcp
 #   2. mcp-remote-control-cli doctor && mcp-remote-control-cli selftest             # offline env / mock reachability
 #   3. ./scripts/harness/smoke_local.sh       # CLI local path + in-process screen
-#   4. ./scripts/harness/smoke_mcp.sh         # 7 tools + FastMCP local calls
+#   4. ./scripts/harness/smoke_mcp.sh         # 7 tools + MCPServer local calls
 #   5. mcp-remote-control-cli replay --fixture bash_prompt --check  # PTY fixture (no live TUI)
 #
 # Integration / real hosts are NEVER part of this script. When you have a
@@ -14,7 +14,7 @@
 #   pytest -q tests/integration   # optional future gate; not required for green
 #
 # Screen is process-local: open→send→close must share one Python process
-# (smoke_local uses local_screen_smoke.py; smoke_mcp uses in-process FastMCP).
+# (smoke_local uses local_screen_smoke.py; smoke_mcp uses in-process MCPServer).
 # Multi-process CLI sequences like `mcp-remote-control-cli screen open` then `mcp-remote-control-cli screen send`
 # in separate invocations will fail with SCREEN_NOT_FOUND.
 #
