@@ -17,7 +17,6 @@ from mcp_remote_control.transport.winrm import (
     WinRMTransport,
     assemble_pypsrp_kwargs,
     parse_spn,
-    redact_connect_kwargs_for_log,
 )
 
 __all__ = [
@@ -32,5 +31,4 @@ __all__ = [
     "WinRMTransport",
     "assemble_pypsrp_kwargs",
     "parse_spn",
-    "redact_connect_kwargs_for_log",
 ]

@@ -33,6 +33,11 @@ class AsyncLoopBridge:
     the deadline elapses. SSH layers treat that as a bridge timeout and
     may mark the connection dead, because cancelling mid-flight can leave
     the connection object stale.
+
+    ``timeout_s=None`` means *no* wall-clock deadline (``Future.result()``
+    blocks until the coroutine finishes). That unbounded mode is intentional
+    for non-fs callers that apply their own budgets; SFTP fs ops always pass
+    an explicit budget via their ``_run_maybe_async`` funnel.
     """
 
     def __init__(self) -> None:
@@ -130,6 +135,9 @@ class AsyncLoopBridge:
             coro, loop
         )
         try:
+            # None = unbounded wait (preserve for non-fs callers). SFTP and
+            # connect paths pass an explicit timeout_s so hangs surface as
+            # TimeoutError instead of parking the thread forever.
             if timeout_s is None:
                 return future.result()
             return future.result(timeout=timeout_s)
@@ -161,7 +169,7 @@ class AsyncLoopBridge:
             )
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:  # noqa: BLE001 — best-effort shutdown
+        except Exception:  # noqa: BLE001 - best-effort shutdown
             pass
 
 
@@ -201,7 +209,8 @@ def run_coro(
     result:
         Sync value or awaitable (coroutine / Future).
     timeout_s:
-        Optional wall-clock timeout for the bridge wait.
+        Optional wall-clock timeout for the bridge wait. ``None`` means wait
+        indefinitely (non-fs default). SFTP backends always supply a budget.
     bridge:
         Explicit bridge; defaults to :func:`get_shared_bridge`.
     """

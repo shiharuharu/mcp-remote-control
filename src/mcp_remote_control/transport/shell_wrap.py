@@ -38,7 +38,7 @@ def normalize_shell_family(value: str | None) -> str:
     ):
         return "powershell"
     if text in ("windows", "win32", "win"):
-        # OS hint without shell — prefer cmd for OpenSSH default shell legacy.
+        # OS hint without shell - prefer cmd for OpenSSH default shell legacy.
         return "cmd"
     # Fine-grained dialects still wrap as posix.
     if text.startswith("posix-") or text in ("bash", "zsh", "sh", "fish", "busybox"):
@@ -50,7 +50,7 @@ def coerce_cwd_path(cwd: Any) -> str | None:
     """Return a usable cwd path string, or None if *cwd* is not path-like.
 
     Guards against probe-cap bleed-through (``pwd`` path overwritten by
-    boolean ``cap_pwd`` → ``True`` → ``cd True``).
+    boolean ``cap_pwd`` -> ``True`` -> ``cd True``).
     """
     if cwd is None or isinstance(cwd, bool):
         return None
@@ -61,6 +61,9 @@ def coerce_cwd_path(cwd: Any) -> str | None:
         return None
     # str(True)/str(False)/str(None) and similar non-paths
     if text in {"True", "False", "None", "true", "false", "none"}:
+        return None
+    # Probe-script placeholders are not paths (``cd ${HOME:-}`` / ``cd %CD%``).
+    if _is_unexpanded_probe_value(text):
         return None
     return text
 
@@ -77,11 +80,17 @@ def wrap_with_cwd(
         return command
     family = normalize_shell_family(shell_family)
     if family == "cmd":
+        # Use && (not &) so a failed cd short-circuits: command is not run and
+        # exit status is non-zero - same semantics as POSIX wrap and WinRM.
         esc = _escape_cmd_path(path)
-        return f'cd /d "{esc}" & {command}'
+        return f'cd /d "{esc}" && {command}'
     if family == "powershell":
+        # -ErrorAction Stop makes a failed Set-Location terminating so the body
+        # after ';' does not run (PS 5.1 + 7+; non-terminating default would
+        # leave the prior directory while Result.cwd still shows the request).
+        # PS7+ && is optional; Stop is the portable short-circuit.
         esc = _escape_ps_single(path)
-        return f"Set-Location -LiteralPath '{esc}'; {command}"
+        return f"Set-Location -LiteralPath '{esc}' -ErrorAction Stop; {command}"
     # POSIX / bash / zsh / sh / busybox
     return f"cd {shlex.quote(path)} && {command}"
 
@@ -96,7 +105,7 @@ def _escape_ps_single(path: str) -> str:
     return str(path).replace("'", "''")
 
 
-_CHCP_RE = re.compile(r"(?:Active code page|代码页)[:\s]*(\d+)", re.IGNORECASE)
+_CHCP_RE = re.compile(r"(?:Active code page|\u4ee3\u7801\u9875)[:\s]*(\d+)", re.IGNORECASE)
 _UNAME_RE = re.compile(r"^uname=(.+)$", re.MULTILINE | re.IGNORECASE)
 _SHELL_RE = re.compile(r"^shell_path=(.*)$", re.MULTILINE | re.IGNORECASE)
 _CHARMAP_RE = re.compile(r"^charmap=(.*)$", re.MULTILINE | re.IGNORECASE)
@@ -108,8 +117,29 @@ _SHELL_BASE_RE = re.compile(r"^shell_base=(.*)$", re.MULTILINE | re.IGNORECASE)
 _KV_RE = re.compile(r"^(busybox|busybox_banner|sh_link|cap_pwd|cap_pwd_p|cap_printf)=(.*)$", re.MULTILINE | re.IGNORECASE)
 
 
+def _is_unexpanded_probe_value(value: Any) -> bool:
+    """True when *value* is a probe-script placeholder, not a resolved token.
+
+    A non-native shell echoes ``${HOME:-}``, ``$(uname ...)``, and ``%COMSPEC%``
+    verbatim. Those must not become identity fields, home, or cwd.
+    """
+    if value is None or isinstance(value, (bool, dict, list, tuple)):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    if "${" in text or "$(" in text:
+        return True
+    folded = text.upper()
+    return any(
+        marker in folded for marker in ("%COMSPEC%", "%USERPROFILE%", "%CD%")
+    )
+
+
 # Dual-path probe: POSIX first; then PowerShell / cmd for Windows OpenSSH.
 # Busybox ash-friendly: no bash arrays, no [[, no local, no process substitution.
+# Do not `echo os=posix`: that label is not identity. os is derived from a
+# real uname so a cmd host that prints this script is not a proven POSIX host.
 POSIX_PROBE_SCRIPT = (
     "echo uname=$(uname -s 2>/dev/null)-$(uname -m 2>/dev/null); "
     "echo shell_path=${SHELL:-}; "
@@ -121,8 +151,7 @@ POSIX_PROBE_SCRIPT = (
     "if pwd -P >/dev/null 2>&1; then echo cap_pwd_p=1; else echo cap_pwd_p=0; fi; "
     "if command -v pwd >/dev/null 2>&1; then echo cap_pwd=1; else echo cap_pwd=0; fi; "
     "if command -v printf >/dev/null 2>&1; then echo cap_printf=1; else echo cap_printf=0; fi; "
-    "locale charmap 2>/dev/null | sed 's/^/charmap=/'; "
-    "echo os=posix"
+    "locale charmap 2>/dev/null | sed 's/^/charmap=/'"
 )
 
 # Windows OpenSSH often defaults to PowerShell. Bare ``echo a & echo b`` and
@@ -155,12 +184,14 @@ def parse_probe_output(text: str) -> dict[str, Any]:
 
     m = _UNAME_RE.search(body)
     if m:
-        data["uname"] = m.group(1).strip()
-        u = data["uname"].lower()
-        if "windows" in u or "mingw" in u or "cygwin" in u or "msys" in u:
-            data["os"] = "windows"
-        else:
-            data["os"] = "posix"
+        uname = m.group(1).strip()
+        if uname and not _is_unexpanded_probe_value(uname):
+            data["uname"] = uname
+            u = uname.lower()
+            if "windows" in u or "mingw" in u or "cygwin" in u or "msys" in u:
+                data["os"] = "windows"
+            else:
+                data["os"] = "posix"
 
     m = _OS_RE.search(body)
     if m:
@@ -171,7 +202,7 @@ def parse_probe_output(text: str) -> dict[str, Any]:
             data["os"] = "posix" if os_val == "posix" else os_val
 
     m = _SHELL_RE.search(body)
-    if m and m.group(1).strip():
+    if m and m.group(1).strip() and not _is_unexpanded_probe_value(m.group(1)):
         data["shell_path"] = m.group(1).strip()
 
     m = _CHARMAP_RE.search(body)
@@ -179,27 +210,27 @@ def parse_probe_output(text: str) -> dict[str, Any]:
         data["charmap"] = m.group(1).strip()
 
     m = _HOME_RE.search(body)
-    if m and m.group(1).strip():
+    if m and m.group(1).strip() and not _is_unexpanded_probe_value(m.group(1)):
         data["home"] = m.group(1).strip()
 
     m = _PWD_RE.search(body)
-    if m and m.group(1).strip():
+    if m and m.group(1).strip() and not _is_unexpanded_probe_value(m.group(1)):
         data["pwd"] = m.group(1).strip()
 
-    # Explicit shell_base= from PowerShell/cmd probes (before comspec default).
+    # Explicit shell_base= is a wrap hint only. Probe scripts hardcode
+    # powershell/pwsh/cmd; those labels do not prove Windows (Linux pwsh
+    # and a POSIX host echoing the PS script both print them).
     m = _SHELL_BASE_RE.search(body)
     if m and m.group(1).strip():
         base = m.group(1).strip().lower().removesuffix(".exe")
         if base:
             data["shell_base"] = base
-            if base in ("cmd", "powershell", "pwsh", "command"):
-                data["os"] = "windows"
 
     m = _COMSPEC_RE.search(body)
-    if m and m.group(1).strip():
+    if m and m.group(1).strip() and not _is_unexpanded_probe_value(m.group(1)):
         data["comspec"] = m.group(1).strip()
         data["os"] = "windows"
-        # comspec presence does not mean the login shell is cmd — Windows
+        # comspec presence does not mean the login shell is cmd - Windows
         # OpenSSH often defaults to PowerShell while COMSPEC still points at
         # cmd.exe. Only default shell_base=cmd when probe did not say otherwise.
         data.setdefault("shell_base", "cmd")
@@ -213,9 +244,9 @@ def parse_probe_output(text: str) -> dict[str, Any]:
         key = km.group(1).lower()
         val = km.group(2).strip()
         if key in ("cap_pwd", "cap_pwd_p", "cap_printf"):
-            # Keep only cap_* keys as bools. Do NOT also set data["pwd"]=True —
+            # Keep only cap_* keys as bools. Do NOT also set data["pwd"]=True -
             # that collides with the path field pwd=/home/... from _PWD_RE and
-            # becomes transport.cwd → wrap_with_cwd → `cd True`.
+            # becomes transport.cwd -> wrap_with_cwd -> `cd True`.
             data[key] = val in ("1", "true", "yes")
         else:
             data[key] = val
@@ -230,10 +261,8 @@ def parse_probe_output(text: str) -> dict[str, Any]:
             data.setdefault("os", "posix")
         elif base in ("cmd", "command"):
             data["shell_base"] = "cmd"
-            data["os"] = "windows"
         elif base in ("powershell", "pwsh"):
             data["shell_base"] = "powershell" if base == "powershell" else "pwsh"
-            data["os"] = "windows"
 
     if data.get("os") == "windows" and "shell_base" not in data:
         data["shell_base"] = "cmd"

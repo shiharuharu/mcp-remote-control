@@ -57,8 +57,39 @@ def test_run_timeout() -> None:
             await asyncio.sleep(2.0)
             return "done"
 
-        with pytest.raises(TimeoutError):
+        with pytest.raises(TimeoutError) as ei:
             bridge.run(_slow(), timeout_s=0.05)
+        assert "AsyncLoopBridge" in str(ei.value)
+        assert "0.05" in str(ei.value)
+    finally:
+        bridge.stop()
+
+
+def test_run_none_timeout_waits_until_complete() -> None:
+    """timeout_s=None is unbounded: short coroutines complete (no false timeout)."""
+    bridge = AsyncLoopBridge()
+    try:
+
+        async def _brief() -> str:
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        # Explicit None must not impose a deadline (non-fs callers rely on this).
+        assert bridge.run(_brief(), timeout_s=None) == "ok"
+    finally:
+        bridge.stop()
+
+
+def test_run_coro_timeout_propagates() -> None:
+    bridge = AsyncLoopBridge()
+    try:
+
+        async def _slow() -> str:
+            await asyncio.sleep(2.0)
+            return "done"
+
+        with pytest.raises(TimeoutError, match="AsyncLoopBridge"):
+            run_coro(_slow(), timeout_s=0.05, bridge=bridge)
     finally:
         bridge.stop()
 

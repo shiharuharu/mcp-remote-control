@@ -151,7 +151,7 @@ def test_loop_identity_via_shared_bridge_and_ssh_pty() -> None:
         t.run_command("echo hi")
         t.open_sftp()
 
-        # SshPty uses _run_maybe_async → shared bridge (same as transport).
+        # SshPty uses _run_maybe_async -> shared bridge (same as transport).
         pty = SshPty.open_shell(conn, cols=80, rows=24)
         assert pty is not None
         assert "create_process" in conn.loops

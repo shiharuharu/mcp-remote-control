@@ -1,4 +1,4 @@
-"""Unit tests: WinRM enterprise auth param assembly (T17, no domain/network)."""
+"""Unit tests: WinRM enterprise auth param assembly (no domain/network)."""
 
 from __future__ import annotations
 
@@ -13,9 +13,13 @@ from mcp_remote_control.transport import (
     WinRMTransport,
     assemble_pypsrp_kwargs,
     parse_spn,
-    redact_connect_kwargs_for_log,
 )
 from mcp_remote_control.transport.base import ExecResult
+from mcp_remote_control.transport.winrm import (
+    _coerce_exec_result,
+    resolve_pypsrp_op_read_timeouts,
+)
+from mcp_remote_control.transport.winrm_timeouts import PYPSRP_HTTP_TIMEOUT_SLACK_S
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
@@ -43,7 +47,7 @@ def test_parse_spn_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# assemble_pypsrp_kwargs — enterprise methods
+# assemble_pypsrp_kwargs - enterprise methods
 # ---------------------------------------------------------------------------
 
 
@@ -219,30 +223,98 @@ def test_assemble_unknown_protocol() -> None:
     assert ei.value.code == "INVALID_ARG"
 
 
-def test_redact_connect_kwargs_hides_secrets() -> None:
+# ---------------------------------------------------------------------------
+# resolve_pypsrp_op_read_timeouts + connect kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_op_read_from_timeout_s_ceil() -> None:
+    """Positive timeout_s -> ceil for op; read keeps the HTTP slack above op."""
+    slack = PYPSRP_HTTP_TIMEOUT_SLACK_S
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=5) == (5, 5 + slack)
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=5.0) == (5, 5 + slack)
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=5.01) == (6, 6 + slack)
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=0.5) == (1, 1 + slack)
+
+
+def test_resolve_op_read_profile_explicit_wins() -> None:
+    """Profile operation_timeout_s / read_timeout_s override derivation.
+
+    The profile read also caps the profile op (the ordering invariant), so the
+    pair pinned here is an ordered one.
+    """
+    op, rd = resolve_pypsrp_op_read_timeouts(
+        timeout_s=5,
+        operation_timeout_s=60,
+        read_timeout_s=88,
+    )
+    assert op == 60
+    assert rd == 88
+    # Per-field: only op explicit -> read derived above that effective op.
+    op2, rd2 = resolve_pypsrp_op_read_timeouts(
+        timeout_s=5,
+        operation_timeout_s=60,
+        read_timeout_s=None,
+    )
+    assert op2 == 60
+    assert rd2 == 60 + PYPSRP_HTTP_TIMEOUT_SLACK_S
+
+
+def test_resolve_op_read_no_timeout_not_forced_short() -> None:
+    """timeout omitted/None -> no derived short op/read."""
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=None) == (None, None)
+    assert resolve_pypsrp_op_read_timeouts() == (None, None)
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=0) == (None, None)
+    assert resolve_pypsrp_op_read_timeouts(timeout_s=-1) == (None, None)
+    # Explicit profile still applies without a call timeout.
+    assert resolve_pypsrp_op_read_timeouts(
+        timeout_s=None,
+        operation_timeout_s=120,
+        read_timeout_s=150,
+    ) == (120, 150)
+
+
+def test_assemble_includes_operation_and_read_timeout() -> None:
     kw = assemble_pypsrp_kwargs(
         host="h",
         username="u",
-        password="super-secret-password",
+        password="p",
         auth="ntlm",
+        operation_timeout=45,
+        read_timeout=50,
     )
-    safe = redact_connect_kwargs_for_log(kw)
-    assert safe["password"] == "***"
-    assert "super-secret-password" not in str(safe)
-    assert safe["host"] == "h"
+    assert kw["operation_timeout"] == 45
+    assert kw["read_timeout"] == 50
 
 
-def test_redact_certificate_key_password() -> None:
-    safe = redact_connect_kwargs_for_log(
-        {
-            "auth": "certificate",
-            "certificate_pem": "/path/to/cert.pem",
-            "certificate_key_password": "pem-passphrase-body",
-        }
+def test_transport_connect_kwargs_profile_op_read_not_from_connect_ms() -> None:
+    """Connect uses connect_timeout_ms only; profile op/read when set."""
+    t = WinRMTransport(
+        host="h",
+        username="u",
+        password="p",
+        connect_timeout_ms=15000,
+        operation_timeout_s=77,
+        read_timeout_s=88,
+        connector=lambda **_k: object(),
     )
-    assert safe["certificate_key_password"] == "***"
-    assert safe["certificate_pem"] == "/path/to/cert.pem"  # path OK
-    assert "pem-passphrase-body" not in str(safe)
+    kw = t.connect_kwargs()
+    assert kw["connect_timeout"] == 15.0
+    assert kw["operation_timeout"] == 77
+    assert kw["read_timeout"] == 88
+
+    t2 = WinRMTransport(
+        host="h",
+        username="u",
+        password="p",
+        connect_timeout_ms=8000,
+        connector=lambda **_k: object(),
+    )
+    kw2 = t2.connect_kwargs()
+    assert kw2["connect_timeout"] == 8.0
+    # No profile op/read -> not forced short in connect kwargs.
+    assert "operation_timeout" not in kw2
+    assert "read_timeout" not in kw2
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +534,43 @@ def test_load_certificate_profile(tmp_path: Path) -> None:
     assert "client.pem" in blob or "cert_path" in blob
 
 
+def test_load_certificate_rejects_pem_body_as_cert_path(tmp_path: Path) -> None:
+    """PEM armor in cert_path / certificate_pem / cert_key_path is not a path."""
+    pem = "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n"
+    key = "-----BEGIN PRIVATE KEY-----\nFAKEKEYBODY\n-----END PRIVATE KEY-----\n"
+    cases = (
+        ("cert_path", pem),
+        ("certificate_pem", pem),
+        ("cert_key_path", key),
+        ("certificate_key_pem", key),
+    )
+    for field, body in cases:
+        name = f"pem-{field.replace('_', '-')}"
+        _write_profile(
+            tmp_path,
+            name,
+            "\n".join(
+                [
+                    f'name = "{name}"',
+                    'transport = "winrm"',
+                    'host = "h"',
+                    'username = "u"',
+                    "[auth]",
+                    'method = "certificate"',
+                    f'{field} = """{body}"""',
+                    "[winrm]",
+                    'scheme = "https"',
+                ]
+            )
+            + "\n",
+        )
+        with pytest.raises(ProfileInvalid) as ei:
+            load_profile(tmp_path, name)
+        msg = str(ei.value)
+        assert field in msg
+        assert "PEM" in msg or "path" in msg.lower()
+
+
 def test_invalid_certificate_missing_paths(tmp_path: Path) -> None:
     _write_profile(
         tmp_path,
@@ -647,7 +756,7 @@ def test_existing_lab_win_password_path_still_loads() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Registry wiring: profile → transport connect kwargs (mock, no network)
+# Registry wiring: profile -> transport connect kwargs (mock, no network)
 # ---------------------------------------------------------------------------
 
 
@@ -778,8 +887,268 @@ def test_registry_certificate_assembly(tmp_path: Path) -> None:
     assert str(seen["certificate_pem"]).endswith("c.pem")
     assert str(seen["certificate_key_pem"]).endswith("k.pem")
     assert seen["certificate_key_password"] == "key-pass-secret"
-    # Paths only in meta — never PEM bodies or key password
+    # Paths only in meta - never PEM bodies or key password
     assert "KEYBODYSECRET" not in str(ep.meta)
     assert "key-pass-secret" not in str(ep.meta)
     assert "KEYBODYSECRET" not in repr(ep.transport)
     assert "CERTBODY" not in repr(ep.transport)
+
+
+# ---------------------------------------------------------------------------
+# WinRM profile bool string-safe (no bool("false") enable)
+# ---------------------------------------------------------------------------
+
+
+def test_build_winrm_cert_validation_string_false_disables() -> None:
+    """cert_validation=\"false\"/\"0\"/\"no\"/\"off\" -> False (not bool(str))."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for raw in ("false", "False", "0", "no", "off", "  false  "):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                winrm={"cert_validation": raw},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.cert_validation is False, f"raw={raw!r}"
+        assert t.connect_kwargs()["cert_validation"] is False
+
+
+def test_build_winrm_cert_validation_true_forms() -> None:
+    """Native True and string true/1 still enable cert validation."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for raw in (True, "true", "TRUE", "1", "yes", "on"):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                winrm={"cert_validation": raw},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.cert_validation is True, f"raw={raw!r}"
+
+
+def test_build_winrm_cert_validation_bool_false() -> None:
+    """Native TOML bool false still disables."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    t = _build_winrm_transport(
+        Profile(
+            name="w",
+            transport="winrm",
+            host="h",
+            username="u",
+            winrm={"cert_validation": False},
+        ),
+        connector=lambda **_k: object(),
+    )
+    assert t.cert_validation is False
+
+
+def test_build_winrm_server_cert_validation_ignore_path_unchanged() -> None:
+    """server_cert_validation ignore/false/0/no still disable validation."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for scv in ("ignore", "false", "0", "no", "IGNORE"):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                winrm={"server_cert_validation": scv},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.cert_validation is False, f"scv={scv!r}"
+
+    # validate / other tokens keep default True
+    t_ok = _build_winrm_transport(
+        Profile(
+            name="w",
+            transport="winrm",
+            host="h",
+            username="u",
+            winrm={"server_cert_validation": "validate"},
+        ),
+        connector=lambda **_k: object(),
+    )
+    assert t_ok.cert_validation is True
+
+
+def test_build_winrm_ssl_string_false_does_not_force_ssl() -> None:
+    """ssl=\"false\" with non-https scheme must not enable SSL via bool(str)."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for raw in ("false", "0", "no", "off", False):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                port=5985,
+                winrm={"scheme": "http", "ssl": raw},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.ssl is False, f"raw={raw!r}"
+        assert t.connect_kwargs()["ssl"] is False
+
+
+def test_build_winrm_ssl_string_true_enables() -> None:
+    """ssl=\"true\"/1 with http scheme enables SSL; https scheme still forces ssl."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for raw in (True, "true", "1", "yes", "on"):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                port=5985,
+                winrm={"scheme": "http", "ssl": raw},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.ssl is True, f"raw={raw!r}"
+
+    t_https = _build_winrm_transport(
+        Profile(
+            name="w",
+            transport="winrm",
+            host="h",
+            username="u",
+            port=5986,
+            winrm={"scheme": "https", "ssl": "false"},
+        ),
+        connector=lambda **_k: object(),
+    )
+    # scheme=https still wins over ssl flag
+    assert t_https.ssl is True
+
+
+def test_build_winrm_credssp_disable_tlsv1_2_string_false() -> None:
+    """[winrm.credssp] disable_tlsv1_2=\"false\" -> False (not True)."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for raw in ("false", "0", "no", "off", False):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                winrm={"credssp": {"disable_tlsv1_2": raw}},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.credssp_disable_tlsv1_2 is False, f"raw={raw!r}"
+
+
+def test_build_winrm_credssp_disable_tlsv1_2_true_forms() -> None:
+    """disable_tlsv1_2 true/\"true\"/1 enable the flag."""
+    from mcp_remote_control.config.models import Profile
+    from mcp_remote_control.endpoint.registry import _build_winrm_transport
+
+    for raw in (True, "true", "1", "yes", "on"):
+        t = _build_winrm_transport(
+            Profile(
+                name="w",
+                transport="winrm",
+                host="h",
+                username="u",
+                winrm={"credssp": {"disable_tlsv1_2": raw}},
+            ),
+            connector=lambda **_k: object(),
+        )
+        assert t.credssp_disable_tlsv1_2 is True, f"raw={raw!r}"
+
+
+def test_registry_profile_bool_strings_map_to_transport(tmp_path: Path) -> None:
+    """End-to-end: TOML string false flags reach transport (and credssp kwargs)."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "pw").write_text("pw-value\n", encoding="utf-8")
+    _write_profile(
+        tmp_path,
+        "win-bools",
+        "\n".join(
+            [
+                'name = "win-bools"',
+                'transport = "winrm"',
+                'host = "h.example"',
+                "port = 5985",
+                'username = "admin"',
+                "[auth]",
+                'method = "credssp"',
+                'password_path = "secrets/pw"',
+                "[winrm]",
+                'scheme = "http"',
+                'ssl = "false"',
+                'cert_validation = "false"',
+                "[winrm.credssp]",
+                'disable_tlsv1_2 = "false"',
+            ]
+        )
+        + "\n",
+    )
+    seen: dict[str, object] = {}
+
+    def connector(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return object()
+
+    reg = EndpointRegistry()
+    ep = reg.open("win-bools", home=tmp_path, connector=connector, probe=False)
+    assert isinstance(ep.transport, WinRMTransport)
+    assert ep.transport.ssl is False
+    assert ep.transport.cert_validation is False
+    assert ep.transport.credssp_disable_tlsv1_2 is False
+    assert seen.get("ssl") is False
+    assert seen.get("cert_validation") is False
+    # CredSSP-only kwargs appear when auth=credssp (False must not be dropped).
+    assert seen.get("credssp_disable_tlsv1_2") is False
+
+
+# ---------------------------------------------------------------------------
+# _coerce_exec_result - missing status -> -1 (align SSH)
+# ---------------------------------------------------------------------------
+
+
+class _ExecRaw:
+    def __init__(self, **attrs: object) -> None:
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+
+def test_coerce_exec_result_no_status_object_exit_minus_one() -> None:
+    """No status object -> exit_code=-1 (not fake success 0)."""
+    raw = _ExecRaw(exit_code=None, exit_status=None, returncode=None, stdout=b"", stderr=b"")
+    r = _coerce_exec_result(raw, default_cwd=None)
+    assert r.exit_code == -1
+
+
+def test_coerce_exec_result_normal_returncode_zero_unchanged() -> None:
+    """returncode=0 stays exit_code=0 with stdout intact."""
+    raw = _ExecRaw(returncode=0, stdout=b"hi", stderr=b"")
+    r = _coerce_exec_result(raw, default_cwd=r"C:\Users\u")
+    assert r.exit_code == 0
+    assert r.stdout == "hi"
+    assert r.cwd == r"C:\Users\u"
