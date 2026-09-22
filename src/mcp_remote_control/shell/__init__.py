@@ -1,6 +1,6 @@
 """Shell dialect model: probe templates, capability flags, resolve helpers.
 
-Coarse dialect labels (posix-bash, busybox, powershell, …) drive silent cwd
+Coarse dialect labels (posix-bash, busybox, powershell, ...) drive silent cwd
 probes and exec script runtime defaults. Not a full shell taxonomy.
 """
 

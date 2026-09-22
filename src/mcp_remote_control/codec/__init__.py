@@ -1,7 +1,7 @@
 """Encoding and decoding helpers for remote I/O.
 
 Maps locale charmaps and Windows code pages to Python codecs, and decodes
-remote bytes with a preferred → utf-8 → gb18030 chain that never raises on
+remote bytes with a preferred -> utf-8 -> gb18030 chain that never raises on
 bad data for Agent-track paths.
 """
 

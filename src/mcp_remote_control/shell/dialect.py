@@ -6,11 +6,12 @@ shortest POSIX probe, never bashisms such as ``fc`` or ``history -d``.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-# Local copy of the silent-cwd marker to avoid a shell ↔ screen import cycle.
+# Local copy of the silent-cwd marker to avoid a shell <-> screen import cycle.
 # Must match mcp_remote_control.screen.buffer.PWD_MARKER.
 PWD_MARKER = "__MRC_PWD__:"
 
@@ -74,7 +75,7 @@ class ShellCaps:
         if not data:
             return cls()
         def _b(key: str, default: bool = False) -> bool:
-            # Prefer cap_* / nested caps so a path field like "pwd=/home/…"
+            # Prefer cap_* / nested caps so a path field like "pwd=/home/..."
             # is never treated as a capability flag (collides with short name).
             raw = data.get(f"cap_{key}")
             if raw is None:
@@ -112,7 +113,6 @@ class ProbeSpec:
 
     cmd: str
     max_len: int = 200
-    history_mode: str = "none"  # none | leading_space | fc_p | set_history | remove_last
     # If False, silent probe must not run (unknown / unsupported).
     enabled: bool = True
 
@@ -121,10 +121,10 @@ class ProbeSpec:
 
 
 # ---------------------------------------------------------------------------
-# Probe command templates (keep short — live PTY truncation risk)
+# Probe command templates (keep short - live PTY truncation risk)
 # ---------------------------------------------------------------------------
 #
-# Leading space → HISTCONTROL=ignorespace / HIST_IGNORE_SPACE when enabled.
+# Leading space -> HISTCONTROL=ignorespace / HIST_IGNORE_SPACE when enabled.
 # Soft-fail helpers with ||: so missing options cannot trip errexit.
 # End with ``:`` so compound $? is 0 (avoids a dirty prompt status).
 # Never use bash-only ``history -d`` (breaks under zsh).
@@ -143,19 +143,20 @@ _PROBE_BASH = (
     f":"
 )
 
-# dash/ash/busybox: shortest path; no fc, no set ±o history.
+# dash/ash/busybox: shortest path; no fc, no set +/-o history.
 _PROBE_SH = f" echo {PWD_MARKER}$(pwd -P 2>/dev/null||pwd)"
 
 _PROBE_BUSYBOX = f" echo {PWD_MARKER}$(pwd 2>/dev/null||pwd)"
 
 _PROBE_CMD = f"echo {PWD_MARKER}%CD%"
 
-_PROBE_PWSH = (
-    f"Write-Output {PWD_MARKER}$((Get-Location).Path); "
-    f"try {{ Get-History -Count 1 | Remove-History -ErrorAction SilentlyContinue }} "
-    f"catch {{ }}; "
-    f"$null"
-)
+# PowerShell has no portable per-entry history removal: the *-History cmdlets
+# are Add-/Clear-/Get-/Invoke-History - there is no Remove-History, so the step
+# this template once carried could only fail, swallowed by its own try/catch.
+# Per-entry deletion exists (Clear-History -Id, and the line editor's own
+# history API) but depends on the host and its version, so the probe declares
+# the leftover line instead of attempting a removal it cannot guarantee.
+_PROBE_PWSH = f"Write-Output {PWD_MARKER}$((Get-Location).Path); $null"
 
 # fish: skip silent inject (non-POSIX syntax); rely on cd heuristics only.
 
@@ -164,29 +165,24 @@ DIALECT_PROBES: dict[str, ProbeSpec | None] = {
     POSIX_ZSH: ProbeSpec(
         cmd=_PROBE_ZSH,
         max_len=120,
-        history_mode="fc_p",
     ),
     POSIX_BASH: ProbeSpec(
         cmd=_PROBE_BASH,
         max_len=140,
-        history_mode="set_history",
     ),
     POSIX_SH: ProbeSpec(
         cmd=_PROBE_SH,
         max_len=BUSYBOX_PROBE_MAX_LEN,
-        history_mode="leading_space",
     ),
     POSIX_BUSYBOX: ProbeSpec(
         cmd=_PROBE_BUSYBOX,
         max_len=BUSYBOX_PROBE_MAX_LEN,
-        history_mode="leading_space",
     ),
     FISH: None,
-    CMD: ProbeSpec(cmd=_PROBE_CMD, max_len=40, history_mode="none"),
+    CMD: ProbeSpec(cmd=_PROBE_CMD, max_len=40),
     POWERSHELL: ProbeSpec(
         cmd=_PROBE_PWSH,
         max_len=220,
-        history_mode="remove_last",
     ),
     UNKNOWN: None,
 }
@@ -219,7 +215,7 @@ def resolve_dialect(
     2. busybox flag / path / banner in flags
     3. shell_base basename
     4. shell_path basename
-    5. shell_family coarse (posix → posix-sh)
+    5. shell_family coarse (posix -> posix-sh)
     6. unknown
     """
     flags = flags or {}
@@ -275,7 +271,7 @@ def resolve_dialect(
     if is_bb and base in ("", "sh", "ash", "busybox", "hush"):
         return POSIX_BUSYBOX
     if is_bb and base in ("bash", "zsh", "fish"):
-        # Rare: busybox applet name only — still treat as busybox env.
+        # Rare: busybox applet name only - still treat as busybox env.
         if base == "bash":
             return POSIX_BASH
         if base == "zsh":
@@ -311,7 +307,7 @@ def resolve_dialect(
         return POSIX_ZSH
 
     if base or path:
-        # Unknown named shell — skip silent inject conservatively.
+        # Unknown named shell - skip silent inject conservatively.
         return UNKNOWN
     return UNKNOWN
 
@@ -335,8 +331,44 @@ def default_runtime_for_dialect(dialect: str | None) -> str:
     return "sh"
 
 
+def platform_default_runtime(
+    *,
+    platform: str | None = None,
+    shell_family: str | None = None,
+) -> str:
+    """Pick exec runtime when runtime=auto and dialect is unknown.
+
+    Order:
+    1. Explicit shell_family (powershell -> pwsh, cmd -> cmd, posix -> bash)
+    2. Platform: win32/Windows -> pwsh (not bash - local Windows rarely has it)
+    3. POSIX hosts -> bash (historical script-body default)
+
+    Does not override an explicit runtime token (caller handles that).
+    """
+    fam = (shell_family or "").strip().lower()
+    if fam in (
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "ps",
+        "ps1",
+    ):
+        return "pwsh"
+    if fam in ("cmd", "cmd.exe", "command", "command.com"):
+        return "cmd"
+    if fam == "posix":
+        return "bash"
+
+    plat = (platform if platform is not None else sys.platform).strip().lower()
+    if plat.startswith("win") or plat in ("windows", "cygwin", "msys"):
+        # Prefer pwsh over cmd for body scripts; never default to bash on win32.
+        return "pwsh"
+    return "bash"
+
+
 def transport_family_for_dialect(dialect: str | None) -> str:
-    """Map dialect → wrap_with_cwd family: posix | cmd | powershell."""
+    """Map dialect -> wrap_with_cwd family: posix | cmd | powershell."""
     d = (dialect or UNKNOWN).strip().lower()
     if d == CMD:
         return "cmd"
