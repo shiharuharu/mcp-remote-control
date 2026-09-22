@@ -23,3 +23,8 @@ todo-*.md
 
 # Local agent handoff (if ever created under code-root)
 .agent-handoff/
+
+# Generated at test time by the screen geometry memory: the file carries a
+# timestamp and the machine's last probe result, so committing it only ever
+# records whichever test run happened to go last. Tests recreate it.
+tests/fixtures/config/state/geometry_memory.json
