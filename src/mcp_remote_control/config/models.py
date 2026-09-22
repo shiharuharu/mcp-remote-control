@@ -7,25 +7,16 @@ never kept on ``AuthConfig`` or shown in ``repr``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 Transport = Literal["local", "ssh", "winrm"]
-# SSH methods + WinRM protocol methods (see load._VALID_AUTH_METHODS).
-AuthMethod = Literal[
-    "password",
-    "private_key",
-    "private_key_path",
-    "ssh_agent",
-    "none",
-    # WinRM / enterprise
-    "ntlm",
-    "basic",
-    "kerberos",
-    "credssp",
-    "certificate",
-]
+
+# fullmatch rejects names with a trailing newline (a $ anchor would still allow it).
+PROFILE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+VALID_TRANSPORTS: frozenset[str] = frozenset({"local", "ssh", "winrm"})
 
 
 @dataclass(frozen=True)
@@ -33,7 +24,7 @@ class AuthConfig:
     """Authentication recipe for a profile.
 
     Password may be inline (``password``) or referenced via path/env.
-    Private key *bodies* are not stored here — only ``key_path`` etc.
+    Private key *bodies* are not stored here - only ``key_path`` etc.
     Enterprise WinRM cert fields are paths / non-secret options only.
     """
 
@@ -165,7 +156,22 @@ class Profile:
 
 @dataclass(frozen=True)
 class DefaultsConfig:
-    """Default UI / exec limits from ``[defaults]`` in config.toml."""
+    """Global ``[defaults]`` values from ``config.toml``.
+
+    Consumed today: ``max_body_chars`` (notes body truncation) and
+    ``winrm_probe`` (WinRM open-time probe intensity).
+
+    ``verbosity``, ``screen_cols``, ``screen_rows``, ``screen_term``,
+    ``default_shell`` and ``exec_timeout_ms`` are parsed and type-checked but
+    no code path acts on them, so setting them has no effect. ``verbosity`` is
+    echoed by ``config op=get`` as a report of the parsed value; nothing reads
+    a level, installs a handler, or changes rendered output from it. The
+    behaviours the others name come from elsewhere: screen geometry and the
+    shell are per-profile (the *profile* ``[defaults]`` table's ``screen_cols``
+    / ``screen_rows`` / ``shell``), ``TERM`` is the built-in
+    ``xterm-256color``, and fs/exec wait budgets are fixed constants. Wire a
+    consumer before advertising any of these as effective.
+    """
 
     verbosity: str = "normal"
     max_body_chars: int = 24000
@@ -174,11 +180,22 @@ class DefaultsConfig:
     screen_term: str = "xterm-256color"
     default_shell: str = ""
     exec_timeout_ms: int = 60000
+    # WinRM open-time probe mode (skip | light | full). Default full keeps
+    # hard identity RTT; lab may set skip/light to avoid MaxShells oneshots.
+    winrm_probe: str = "full"
 
 
 @dataclass(frozen=True)
 class LoggingConfig:
-    """Logging settings from ``[logging]`` in config.toml."""
+    """Global ``[logging]`` values from ``config.toml``.
+
+    Parsed and type-checked, but not wired yet: nothing calls
+    ``logging.basicConfig`` / ``dictConfig`` or installs a handler, so
+    ``level``, ``dir``, ``max_bytes``, ``backup_count`` and ``audit`` have no
+    effect and the ``logs/`` directory created by ``ensure_home_layout``
+    stays empty. The table is reserved for a future file-logging consumer; do
+    not read it as an effective log configuration until one exists.
+    """
 
     level: str = "info"
     dir: str = "logs"
@@ -195,7 +212,7 @@ class SecurityConfig:
     are always enforced by ``store.put_secret`` / ``ensure_home_layout``,
     independent of this config. When ``strict_perms`` is True,
     ``store.put_profile`` additionally tightens profile artifacts (profile
-    TOML → ``0o600``, ``profiles/`` dir → ``0o700``).
+    TOML -> ``0o600``, ``profiles/`` dir -> ``0o700``).
 
     Unknown ``[security]`` keys (including removed legacy knobs such as
     ``redact_secrets_in_logs`` / ``allow_secret_paths_in_output``) are ignored

@@ -1,4 +1,4 @@
-"""Unit tests: xterm key encoder (T10)."""
+"""Unit tests: xterm key encoder."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def test_ctrl_c_and_common_controls() -> None:
 
 
 def test_shift_and_ctrl_arrows() -> None:
-    # shift = +1 → param 2; ctrl = +4 → param 5
+    # shift = +1 -> param 2; ctrl = +4 -> param 5
     assert encode_key("shift+up") == CSI + b"1;2A"
     assert encode_key("ctrl+left") == CSI + b"1;5D"
     assert encode_key("ctrl+shift+right") == CSI + b"1;6C"
@@ -109,7 +109,7 @@ def test_unknown_key_raises() -> None:
 
 
 def test_mouse_sgr_click() -> None:
-    # row=0,col=0 → 1-based 1;1
+    # row=0,col=0 -> 1-based 1;1
     press = encode_mouse_sgr(0, 0, button="left", press=True)
     assert press == CSI + b"<0;1;1M"
     release = encode_mouse_sgr(5, 10, button="left", press=False)
@@ -117,7 +117,7 @@ def test_mouse_sgr_click() -> None:
 
 
 # ---------------------------------------------------------------------------
-# O3: base-char case preservation (modifiers stay case-insensitive)
+# Base-char case preservation (modifiers stay case-insensitive)
 # ---------------------------------------------------------------------------
 
 
@@ -140,7 +140,7 @@ def test_alt_letter_case_preserved() -> None:
 
 
 def test_alt_shift_letter_uppercase() -> None:
-    # alt+shift+letter → ESC + uppercase (shift forces upper).
+    # alt+shift+letter -> ESC + uppercase (shift forces upper).
     assert encode_key("alt+shift+x") == ESC + b"X"
     assert encode_key("alt+shift+X") == ESC + b"X"
     assert encode_key("Alt+Shift+a") == ESC + b"A"

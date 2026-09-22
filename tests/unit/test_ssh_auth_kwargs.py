@@ -37,7 +37,7 @@ def test_connector_receives_password_and_passphrase() -> None:
 
 
 def test_text_encoding_decode_path() -> None:
-    gbk_hello = "你好".encode("gbk")
+    gbk_hello = "\u4f60\u597d".encode("gbk")
 
     class Conn:
         def run_command(self, command: str, **_k: object) -> object:
@@ -55,10 +55,10 @@ def test_text_encoding_decode_path() -> None:
         connector=connector,
     )
     t.connect()
-    # Coercion path via mock run_command returns ExecResult with bytes — 
+    # Coercion path via mock run_command returns ExecResult with bytes -
     # _coerce may not re-decode ExecResult.stdout if already ExecResult.
     # Exercise _decode_stream via collect when returning raw process.
     from mcp_remote_control.transport.ssh import _decode_stream
 
-    assert _decode_stream(gbk_hello, "gb18030") == "你好"
+    assert _decode_stream(gbk_hello, "gb18030") == "\u4f60\u597d"
     t.close()

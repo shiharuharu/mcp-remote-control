@@ -47,8 +47,8 @@ def _looks_like_unusable_home(text: str) -> bool:
 def _coerce_home_path(raw: str) -> Path | None:
     """Expand ``~`` / ``$HOME`` and return an absolute Path, or None if unusable.
 
-    Order: strip → expandvars → expanduser → reject placeholders / leftover
-    ``$VAR`` → resolve absolute (relative values resolve against cwd).
+    Order: strip -> expandvars -> expanduser -> reject placeholders / leftover
+    ``$VAR`` -> resolve absolute (relative values resolve against cwd).
     """
     text = str(raw).strip()
     if not text:
@@ -75,7 +75,7 @@ def resolve_home(env: Mapping[str, str] | None = None) -> Path:
       3. ``default_home()`` = ``Path.home().resolve() / .config / mcp-remote-control``
 
     Always returns an absolute path. Invalid overrides fall through to the
-    default instead of creating under a non-existent ``/Users/<you>/…`` tree.
+    default instead of creating under a non-existent ``/Users/<you>/...`` tree.
     """
     mapping: Mapping[str, str] = os.environ if env is None else env
 
@@ -98,6 +98,11 @@ def profiles_dir(home: Path) -> Path:
 def secrets_dir(home: Path) -> Path:
     """Return ``{home}/secrets``."""
     return Path(home) / "secrets"
+
+
+def notes_dir(home: Path) -> Path:
+    """Return ``{home}/notes`` (per-profile host notes, not under ``state/``)."""
+    return Path(home) / "notes"
 
 
 def config_toml_path(home: Path) -> Path:
