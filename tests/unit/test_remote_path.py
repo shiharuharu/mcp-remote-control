@@ -32,6 +32,20 @@ def test_is_abs() -> None:
     assert not is_abs_remote("rel/path")
 
 
+def test_is_abs_uses_the_path_verbatim() -> None:
+    """Whitespace is part of the name, so detection reads the string as given.
+
+    ``" /tmp"`` is relative (its first component is ``" "``), ``"/tmp "`` is
+    absolute. Trimming first would classify both as the same absolute path.
+    """
+    assert is_abs_remote("/tmp ") is True
+    assert is_abs_remote(" /tmp") is False
+    assert is_abs_remote(" ") is False
+    assert is_abs_remote("") is False
+    assert is_abs_remote("C:\\dir ") is True
+    assert is_abs_remote(" \\\\srv\\share") is False
+
+
 def test_join_windows_style() -> None:
     j = remote_join(r"C:\Users", "a")
     assert "a" in j

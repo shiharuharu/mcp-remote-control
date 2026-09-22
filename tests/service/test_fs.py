@@ -1,20 +1,30 @@
-"""Service tests: fs local full + sftp mock (T08)."""
+"""Service tests: fs local full + fs_ops + CLI."""
 
 from __future__ import annotations
 
+import base64
+import errno
 import json
 import os
-import stat as statmod
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+# Re-export so `from test_fs import MockSftp` still resolves after the split.
+from _sftp_fakes import MockSftp as MockSftp
+# Real pypsrp-shaped WinRM sessions for the link-failure row tests.
+from _winrm_fakes import HOME, TEMP, FakePypsrpSession
+
 from mcp_remote_control.cli import main
 from mcp_remote_control.cli_cmds import EXIT_OK, EXIT_VALIDATION
 from mcp_remote_control.core import fs_ops
+from mcp_remote_control.core.result import OpResult
 from mcp_remote_control.endpoint import get_registry, reset_registry
-from mcp_remote_control.fs.backends.sftp import SftpFs
+from mcp_remote_control.fs.backends.local import LocalFs, _MAX_RECURSE_DEPTH as _LOCAL_MAX_RECURSE_DEPTH
+from mcp_remote_control.fs.types import FsError, ProgressCallback
+from mcp_remote_control.transport.base import TransportError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
@@ -51,9 +61,143 @@ def test_local_list_absolute_path(tmp_path: Path) -> None:
     text = r.render_text()
     assert text.startswith("@fs list ok")
     assert f"path={path}" in text or f"path={tmp_path}" in text
-    # via is optional meta — may be present
+    # via is optional meta - may be present
     if "via=" in text:
         assert "via=local" in text
+
+
+def test_local_recursive_list_shallow_returns_full_tree(tmp_path: Path) -> None:
+    """Shallow recursive list still returns the full tree (no false truncate)."""
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.txt").write_text("y", encoding="utf-8")
+    deep = sub / "nested"
+    deep.mkdir()
+    (deep / "c.txt").write_text("z", encoding="utf-8")
+
+    backend = LocalFs()
+    result = backend.list(str(tmp_path), recursive=True)
+    assert result.truncated is False
+    names = {e.name for e in result.entries}
+    assert "a.txt" in names
+    assert "sub" in names
+    assert "sub/b.txt" in names or any(n.endswith("b.txt") for n in names)
+    assert "sub/nested" in names or any(n.endswith("nested") for n in names)
+    assert "sub/nested/c.txt" in names or any(n.endswith("c.txt") for n in names)
+    # Non-recursive list is unchanged: only top-level (+ . / ..).
+    flat = backend.list(str(tmp_path), recursive=False)
+    flat_names = {e.name for e in flat.entries}
+    assert "a.txt" in flat_names
+    assert "sub" in flat_names
+    assert "sub/b.txt" not in flat_names
+    assert "." in flat_names and ".." in flat_names
+
+
+def test_local_recursive_list_depth_exceeded_raises(tmp_path: Path) -> None:
+    """Chain deeper than max_depth raises DEPTH_EXCEEDED (not silent partial ok)."""
+    # Chain of max_depth+1 dirs under tmp so walk visits depth > max_depth.
+    cur = tmp_path
+    for i in range(_LOCAL_MAX_RECURSE_DEPTH + 1):
+        cur = cur / f"d{i}"
+        cur.mkdir()
+    (cur / "leaf.txt").write_text("x", encoding="utf-8")
+
+    backend = LocalFs()
+    with pytest.raises(FsError) as ei:
+        backend.list(str(tmp_path), recursive=True)
+    err = ei.value
+    assert err.code == "DEPTH_EXCEEDED"
+    assert "maximum recursion depth" in err.msg
+    assert str(_LOCAL_MAX_RECURSE_DEPTH) in err.msg
+    assert err.details.get("max_depth") == _LOCAL_MAX_RECURSE_DEPTH
+    assert err.details.get("path")
+
+
+def test_local_recursive_list_depth_cap_fast_path(tmp_path: Path) -> None:
+    """Small max_depth proves explicit incompleteness signal (fast path)."""
+    # Chain: tmp/a/b/c/leaf - exceeds max_depth=2 when entering c (depth 3).
+    for d in ("a", "a/b", "a/b/c"):
+        (tmp_path / d).mkdir()
+    (tmp_path / "a" / "b" / "c" / "leaf.txt").write_text("x", encoding="utf-8")
+
+    backend = LocalFs()
+    entries: list = []
+    with pytest.raises(FsError) as ei:
+        backend._list_recursive(str(tmp_path), entries, max_depth=2)
+    err = ei.value
+    assert err.code == "DEPTH_EXCEEDED"
+    assert "maximum recursion depth (2)" in err.msg
+    assert err.details.get("max_depth") == 2
+    assert err.details.get("path")
+    # Partial progress before the raise is fine; signal is the error.
+
+
+def _deny_scandir(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """Make ``os.scandir`` raise EACCES for *denied*, leaving every other path open.
+
+    The scan failure is injected rather than produced with a ``chmod 000``
+    directory so the test holds for a privileged (root) test process, which
+    bypasses directory permissions and would scan the tree anyway.
+    """
+    real_scandir = os.scandir
+
+    def fake_scandir(path: str = ".") -> object:
+        if os.fspath(path) == str(denied):
+            raise PermissionError(errno.EACCES, "Permission denied", str(denied))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+
+def test_local_recursive_list_root_scan_denied_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable root is PERMISSION_DENIED, not an empty ok tree."""
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.txt").write_text("x", encoding="utf-8")
+    _deny_scandir(monkeypatch, tmp_path)
+
+    backend = LocalFs()
+    with pytest.raises(FsError) as ei:
+        backend.list(str(tmp_path), recursive=True)
+    err = ei.value
+    assert err.code == "PERMISSION_DENIED"
+    assert err.details.get("path") == str(tmp_path)
+
+    # The same failure surfaces through the fs ops layer.
+    r = fs_ops.run(
+        "list",
+        ep="local",
+        path=str(tmp_path),
+        recursive=True,
+        home=FIXTURES,
+    )
+    assert r.status == "error"
+    assert r.code == "PERMISSION_DENIED"
+
+
+def test_local_recursive_list_subdir_scan_denied_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable subdirectory aborts the walk naming that node."""
+    (tmp_path / "top.txt").write_text("y", encoding="utf-8")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "hidden.txt").write_text("z", encoding="utf-8")
+    _deny_scandir(monkeypatch, locked)
+
+    backend = LocalFs()
+    with pytest.raises(FsError) as ei:
+        backend.list(str(tmp_path), recursive=True)
+    err = ei.value
+    assert err.code == "PERMISSION_DENIED"
+    assert err.details.get("path") == str(locked)
+    assert str(locked) in err.msg
+    # The scan failure stays reachable as the mapped error's cause.
+    assert isinstance(err.__cause__, OSError)
 
 
 def test_local_stat_file(tmp_path: Path) -> None:
@@ -106,7 +250,7 @@ def test_local_read_write(tmp_path: Path) -> None:
 
 
 def test_local_read_utf16le_with_bom(tmp_path: Path) -> None:
-    """C4: a UTF-16LE file with BOM reads as text (utf-16) via the local
+    """A UTF-16LE file with BOM reads as text (utf-16) via the local
     backend. Previously the simple any-NUL heuristic misclassified it as
     binary; the shared detect_text now detects UTF-16 consistently."""
     target = tmp_path / "u16.txt"
@@ -123,7 +267,7 @@ def test_local_read_utf16le_with_bom(tmp_path: Path) -> None:
 
 
 def test_local_read_utf16le_no_bom(tmp_path: Path) -> None:
-    """C4: UTF-16LE without a BOM (alternating-NUL ASCII) is detected as text
+    """UTF-16LE without a BOM (alternating-NUL ASCII) is detected as text
     via the shared heuristic; previously binary for the local backend."""
     target = tmp_path / "u16nobom.txt"
     text = "plain-ascii-content"
@@ -140,8 +284,8 @@ def test_local_read_utf16le_no_bom(tmp_path: Path) -> None:
 
 
 def test_local_read_binary_with_nul_stays_binary(tmp_path: Path) -> None:
-    """C4 guard: random binary with a NUL byte (no alternating-NUL pattern)
-    is NOT misclassified as UTF-16 — true binary stays binary."""
+    """Random binary with a NUL byte (no alternating-NUL pattern)
+    is NOT misclassified as UTF-16 - true binary stays binary."""
     target = tmp_path / "bin.dat"
     target.write_bytes(b"\x00\x01\x02\x03\x04\x05binary")
 
@@ -153,9 +297,9 @@ def test_local_read_binary_with_nul_stays_binary(tmp_path: Path) -> None:
 
 
 def test_local_read_big_endian_uint32_stays_binary(tmp_path: Path) -> None:
-    """LOW re-review guard: a NUL-dense binary with NON-PRINTABLE non-NUL bytes
+    """A NUL-dense binary with NON-PRINTABLE non-NUL bytes
     is NOT misclassified as UTF-16. A 12-byte big-endian uint32 file
-    (``\\x00\\x00\\x00\\x01...``) has every even byte NUL — the old
+    (``\\x00\\x00\\x00\\x01...``) has every even byte NUL - the old
     alternating-NUL heuristic reported ``utf-16-be`` and ``fs read`` returned
     gibberish text. The printable-ratio guard now rejects it as binary because
     the non-NUL bytes (0x01/0x02/0x03) are non-printable control chars."""
@@ -170,9 +314,9 @@ def test_local_read_big_endian_uint32_stays_binary(tmp_path: Path) -> None:
 
 
 def test_local_read_utf16be_no_bom(tmp_path: Path) -> None:
-    """LOW re-review guard: real UTF-16BE without a BOM (ASCII letters with NUL
+    """Real UTF-16BE without a BOM (ASCII letters with NUL
     at every even index) is STILL detected as text after the printable-ratio
-    guard — the BE direction's true positive is preserved."""
+    guard - the BE direction's true positive is preserved."""
     target = tmp_path / "u16be.txt"
     text = "plain-ascii-content"
     raw = text.encode("utf-16-be")
@@ -185,6 +329,169 @@ def test_local_read_utf16be_no_bom(tmp_path: Path) -> None:
     assert r.fields.get("type") == "text"
     assert r.fields.get("encoding") == "utf-16-be"
     assert text in (r.body or "")
+
+
+# Magic-only fixtures: classification is header match, not a decoded bitmap.
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 24
+_GIF = b"GIF89a" + b"\x00" * 24
+_WEBP = b"RIFF" + (28).to_bytes(4, "little") + b"WEBP" + b"\x00" * 16
+
+
+def _assert_image_render_has_no_body(r: OpResult, payload: bytes) -> None:
+    """CLI/text tracks must show image meta only, never the file bytes."""
+    text = r.render_text()
+    dumped = r.render_json()
+    b64 = base64.b64encode(payload).decode("ascii")
+    assert b64 not in text
+    assert b64 not in dumped
+    assert "image_data" not in dumped
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "mime"),
+    [
+        ("pic.png", _PNG, "image/png"),
+        ("pic.jpg", _JPEG, "image/jpeg"),
+        ("pic.gif", _GIF, "image/gif"),
+        ("pic.webp", _WEBP, "image/webp"),
+    ],
+)
+def test_local_read_image_ok(
+    tmp_path: Path, name: str, payload: bytes, mime: str
+) -> None:
+    """Recognized complete images succeed with raw bytes and MIME, no body."""
+    target = tmp_path / name
+    target.write_bytes(payload)
+    r = fs_ops.run("read", ep="local", path=str(target), home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.code is None
+    assert r.fields.get("type") == "image"
+    assert r.fields.get("mime_type") == mime
+    assert r.fields.get("bytes") == len(payload)
+    assert r.image_data == payload
+    assert r.body is None
+    assert r.fields.get("truncated") is None
+    _assert_image_render_has_no_body(r, payload)
+    assert "image_data" not in repr(r)
+
+
+def test_local_read_png_without_extension(tmp_path: Path) -> None:
+    """A PNG header is enough; the path suffix is not required."""
+    target = tmp_path / "noext"
+    target.write_bytes(_PNG)
+    r = fs_ops.run("read", ep="local", path=str(target), home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.fields.get("type") == "image"
+    assert r.fields.get("mime_type") == "image/png"
+    assert r.image_data == _PNG
+    assert r.body is None
+
+
+def test_local_read_png_named_file_is_still_jpeg(tmp_path: Path) -> None:
+    """MIME comes from bytes; a .png suffix does not override JPEG magic."""
+    target = tmp_path / "photo.png"
+    target.write_bytes(_JPEG)
+    r = fs_ops.run("read", ep="local", path=str(target), home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.fields.get("type") == "image"
+    assert r.fields.get("mime_type") == "image/jpeg"
+    assert r.image_data == _JPEG
+
+
+def test_local_read_text_named_png_stays_text(tmp_path: Path) -> None:
+    """A .png name is not enough; UTF-8 text still takes the text branch."""
+    target = tmp_path / "x.png"
+    target.write_text("hello world\n", encoding="utf-8")
+    r = fs_ops.run("read", ep="local", path=str(target), home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.fields.get("type") == "text"
+    assert r.fields.get("mime_type") is None
+    assert r.image_data is None
+    assert "hello world" in (r.body or "")
+
+
+def test_local_read_truncated_image_is_error(tmp_path: Path) -> None:
+    """Identified image that hits the budget is READ_LIMIT_EXCEEDED, no bytes."""
+    target = tmp_path / "big.png"
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 80
+    target.write_bytes(payload)
+    r = fs_ops.run(
+        "read",
+        ep="local",
+        path=str(target),
+        max_bytes=20,
+        home=FIXTURES,
+    )
+    assert r.status == "error", r.render_text()
+    assert r.code == "READ_LIMIT_EXCEEDED"
+    assert r.image_data is None
+    assert r.body is None
+    assert r.fields.get("truncated") is True
+    assert r.fields.get("mime_type") == "image/png"
+    text = r.render_text()
+    dumped = r.render_json()
+    b64 = base64.b64encode(payload).decode("ascii")
+    assert b64 not in text
+    assert b64 not in dumped
+    assert "increase max_bytes" in (r.hint or "")
+    assert "READ_LIMIT_EXCEEDED" in text
+
+
+def test_local_read_image_budget_too_small_stays_binary(tmp_path: Path) -> None:
+    """A budget shorter than the PNG signature keeps the binary truncated path."""
+    target = tmp_path / "tiny.png"
+    target.write_bytes(_PNG)
+    r = fs_ops.run(
+        "read",
+        ep="local",
+        path=str(target),
+        max_bytes=2,
+        home=FIXTURES,
+    )
+    assert r.status == "ok", r.render_text()
+    assert r.code != "READ_LIMIT_EXCEEDED"
+    assert r.fields.get("type") == "binary"
+    assert r.fields.get("truncated") is True
+    assert r.fields.get("mime_type") is None
+    assert r.image_data is None
+    assert r.fields.get("sha256")
+    assert "omitted" in (r.fields.get("note") or "")
+    assert r.body is None or r.body == ""
+
+
+def test_local_read_truncated_text_still_ok(tmp_path: Path) -> None:
+    """Non-image truncation stays a successful text read with truncated=True."""
+    target = tmp_path / "big.txt"
+    target.write_text("hello world " * 40, encoding="utf-8")
+    r = fs_ops.run(
+        "read",
+        ep="local",
+        path=str(target),
+        max_bytes=10,
+        home=FIXTURES,
+    )
+    assert r.status == "ok", r.render_text()
+    assert r.fields.get("type") == "text"
+    assert r.fields.get("truncated") is True
+    assert r.image_data is None
+    assert r.body is not None
+
+
+def test_local_read_riff_wav_stays_binary(tmp_path: Path) -> None:
+    """RIFF/WAVE is not WebP; other binary still omits the body and hashes."""
+    target = tmp_path / "sound.wav"
+    payload = b"RIFF" + (16).to_bytes(4, "little") + b"WAVE" + b"\x00" * 8
+    target.write_bytes(payload)
+    r = fs_ops.run("read", ep="local", path=str(target), home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.fields.get("type") == "binary"
+    assert r.fields.get("mime_type") is None
+    assert r.image_data is None
+    assert r.body is None or r.body == ""
+    digest = r.fields.get("sha256")
+    assert isinstance(digest, str) and len(digest) == 12
+    assert "omitted" in (r.fields.get("note") or "")
 
 
 def test_local_put_get(tmp_path: Path) -> None:
@@ -285,6 +592,48 @@ def test_missing_path() -> None:
     assert r.code == "MISSING_ARG"
 
 
+def test_read_missing_path_rejected_before_ensure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fs read without path is MISSING_ARG without attempting a lazy connect."""
+    calls: list[object] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        calls.append((_args, _kwargs))
+        raise TransportError("CONNECT_FAILED", "sentinel connect")
+
+    monkeypatch.setattr(fs_ops, "ensure_endpoint", _boom)
+    r = fs_ops.run("read", ep="probe-target", home=FIXTURES)
+    assert r.status == "error", r.render_text()
+    assert r.code == "MISSING_ARG", r.render_text()
+    assert r.code != "CONNECT_FAILED"
+    msg = str((r.fields or {}).get("msg") or "")
+    assert "path" in msg.lower(), msg
+    assert calls == []
+
+
+def test_read_with_path_still_calls_ensure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legal read path still lazy-connects; validation does not skip ensure."""
+    calls: list[object] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        calls.append((_args, _kwargs))
+        raise TransportError("CONNECT_FAILED", "sentinel connect")
+
+    monkeypatch.setattr(fs_ops, "ensure_endpoint", _boom)
+    r = fs_ops.run(
+        "read",
+        ep="probe-target",
+        path="/tmp/exists-for-arg-check",
+        home=FIXTURES,
+    )
+    assert r.status == "error", r.render_text()
+    assert r.code == "CONNECT_FAILED", r.render_text()
+    assert len(calls) == 1
+
+
 def test_invalid_op() -> None:
     r = fs_ops.run("explode", ep="local", path="/tmp", home=FIXTURES)
     assert r.status == "error"
@@ -292,7 +641,7 @@ def test_invalid_op() -> None:
 
 
 # ---------------------------------------------------------------------------
-# local: symlink semantics (O2) — stat/rm/read must not follow links
+# local: symlink semantics - stat/rm/read must not follow links
 # ---------------------------------------------------------------------------
 
 
@@ -325,7 +674,7 @@ def test_local_stat_symlink_relative_target(tmp_path: Path) -> None:
 
 
 def test_local_rm_symlink_preserves_target(tmp_path: Path) -> None:
-    """rm on a symlink removes the link only — the target MUST survive."""
+    """rm on a symlink removes the link only - the target MUST survive."""
     target = tmp_path / "target.txt"
     target.write_text("precious-content", encoding="utf-8")
     link = tmp_path / "link"
@@ -400,7 +749,7 @@ def test_local_stat_dir_unchanged(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# local: atomic writes (O2) — failure must not truncate the original
+# local: atomic writes - failure must not truncate the original
 # ---------------------------------------------------------------------------
 
 
@@ -425,7 +774,7 @@ def test_local_write_atomic_failure_preserves_original(
         home=FIXTURES,
     )
     assert r.status == "error"
-    # Original content is intact — no truncation.
+    # Original content is intact - no truncation.
     assert target.read_text(encoding="utf-8") == "original-content"
     # No temp file left behind.
     temps = [f for f in os.listdir(tmp_path) if ".mrc-tmp-" in f]
@@ -507,7 +856,7 @@ def test_local_put_atomic_failure_no_partial(
 
 
 # ---------------------------------------------------------------------------
-# local: atomic write mode preservation (O2 HIGH) — permissions must survive
+# local: atomic write mode preservation - permissions must survive
 # ---------------------------------------------------------------------------
 
 
@@ -546,8 +895,470 @@ def test_local_write_new_file_default_mode(tmp_path: Path) -> None:
     assert mode == 0o644, f"expected 0o644, got {oct(mode)}"
 
 
+def test_local_put_preserves_dest_mode_on_overwrite(tmp_path: Path) -> None:
+    """put overwrite keeps destination mode (no silent widen 0o600->source)."""
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"new-payload")
+    os.chmod(src, 0o644)
+    dest = tmp_path / "secret.bin"
+    dest.write_bytes(b"old-secret")
+    os.chmod(dest, 0o600)
+
+    r = fs_ops.run(
+        "put",
+        ep="local",
+        path=str(dest),
+        local=str(src),
+        home=FIXTURES,
+    )
+    assert r.status == "ok"
+    assert dest.read_bytes() == b"new-payload"
+    mode = os.stat(dest).st_mode & 0o777
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+def test_local_put_preserves_dest_mode_with_progress(tmp_path: Path) -> None:
+    """put overwrite with progress callback also preserves dest mode."""
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"new-payload-progress")
+    os.chmod(src, 0o644)
+    dest = tmp_path / "secret.bin"
+    dest.write_bytes(b"old-secret")
+    os.chmod(dest, 0o600)
+
+    events: list[tuple[int, int | None]] = []
+    r = fs_ops.run(
+        "put",
+        ep="local",
+        path=str(dest),
+        local=str(src),
+        home=FIXTURES,
+        progress=lambda d, t: events.append((d, t)),
+    )
+    assert r.status == "ok"
+    assert events, "progress callback must be invoked"
+    assert dest.read_bytes() == b"new-payload-progress"
+    mode = os.stat(dest).st_mode & 0o777
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+def test_local_get_preserves_dest_mode_on_overwrite(tmp_path: Path) -> None:
+    """get overwrite keeps local destination mode (no silent widen)."""
+    remote = tmp_path / "remote.bin"
+    remote.write_bytes(b"remote-payload")
+    os.chmod(remote, 0o644)
+    dest = tmp_path / "local-secret.bin"
+    dest.write_bytes(b"old-local")
+    os.chmod(dest, 0o600)
+
+    r = fs_ops.run(
+        "get",
+        ep="local",
+        path=str(remote),
+        local=str(dest),
+        home=FIXTURES,
+    )
+    assert r.status == "ok"
+    assert dest.read_bytes() == b"remote-payload"
+    mode = os.stat(dest).st_mode & 0o777
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+def test_local_get_preserves_dest_mode_with_progress(tmp_path: Path) -> None:
+    """get overwrite with progress callback also preserves dest mode."""
+    remote = tmp_path / "remote.bin"
+    remote.write_bytes(b"remote-payload-progress")
+    os.chmod(remote, 0o644)
+    dest = tmp_path / "local-secret.bin"
+    dest.write_bytes(b"old-local")
+    os.chmod(dest, 0o600)
+
+    events: list[tuple[int, int | None]] = []
+    r = fs_ops.run(
+        "get",
+        ep="local",
+        path=str(remote),
+        local=str(dest),
+        home=FIXTURES,
+        progress=lambda d, t: events.append((d, t)),
+    )
+    assert r.status == "ok"
+    assert events, "progress callback must be invoked"
+    assert dest.read_bytes() == b"remote-payload-progress"
+    mode = os.stat(dest).st_mode & 0o777
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
 # ---------------------------------------------------------------------------
-# local: write/put/get to symlink follows to target (O2 MED) — link preserved
+# local: read-only source - copyability must not depend on a progress callback
+# ---------------------------------------------------------------------------
+
+READONLY_PAYLOAD = b"read-only-source-payload"
+
+
+def _st_mode(path: Path) -> int:
+    return os.stat(path).st_mode & 0o777
+
+
+def _temp_files(directory: Path) -> list[str]:
+    return [name for name in os.listdir(directory) if ".mrc-tmp-" in name]
+
+
+def _readonly_source(directory: Path) -> Path:
+    """A mode 0444 regular file, e.g. a checked-out artifact or a CD-mounted one."""
+    src = directory / "readonly-source.bin"
+    src.write_bytes(READONLY_PAYLOAD)
+    os.chmod(src, 0o444)
+    return src
+
+
+def _transfer(
+    op: str,
+    src: Path,
+    dest: Path,
+    *,
+    progress: ProgressCallback | None = None,
+) -> OpResult:
+    """Run the same-host copy in the direction *op* names."""
+    if op == "put":
+        return fs_ops.run(
+            "put",
+            ep="local",
+            path=str(dest),
+            local=str(src),
+            home=FIXTURES,
+            progress=progress,
+        )
+    return fs_ops.run(
+        "get",
+        ep="local",
+        path=str(src),
+        local=str(dest),
+        home=FIXTURES,
+        progress=progress,
+    )
+
+
+@pytest.mark.parametrize("op", ["put", "get"])
+@pytest.mark.parametrize("with_progress", [False, True], ids=["no_progress", "progress"])
+def test_local_transfer_readonly_source_new_destination(
+    tmp_path: Path,
+    op: str,
+    with_progress: bool,
+) -> None:
+    """A 0444 source transfers to a new destination with and without progress.
+
+    The no-callback branch stages the copy in a temp file and reopens it to
+    fsync; applying the source mode before that reopen leaves the temp
+    unwritable, so the transfer is refused with PERMISSION_DENIED while the
+    same transfer carrying a progress callback succeeds.
+    """
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    src = _readonly_source(src_dir)
+    dest = dest_dir / "out.bin"
+
+    events: list[tuple[int, int | None]] = []
+    progress = (lambda d, t: events.append((d, t))) if with_progress else None
+    r = _transfer(op, src, dest, progress=progress)
+
+    assert r.status == "ok", f"{op}: {r.code} {r.body}"
+    assert dest.read_bytes() == READONLY_PAYLOAD
+    # A new destination keeps the source mode.
+    assert _st_mode(dest) == 0o444, f"expected 0o444, got {oct(_st_mode(dest))}"
+    assert _st_mode(src) == 0o444, "the source was modified"
+    if with_progress:
+        assert events, "progress callback must be invoked"
+    assert _temp_files(dest_dir) == []
+
+
+@pytest.mark.parametrize("op", ["put", "get"])
+@pytest.mark.parametrize("with_progress", [False, True], ids=["no_progress", "progress"])
+def test_local_transfer_readonly_source_overwrite(
+    tmp_path: Path,
+    op: str,
+    with_progress: bool,
+) -> None:
+    """A 0444 source overwrites an existing destination with and without progress."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    src = _readonly_source(src_dir)
+    dest = dest_dir / "out.bin"
+    dest.write_bytes(b"old-content")
+    os.chmod(dest, 0o600)
+
+    events: list[tuple[int, int | None]] = []
+    progress = (lambda d, t: events.append((d, t))) if with_progress else None
+    r = _transfer(op, src, dest, progress=progress)
+
+    assert r.status == "ok", f"{op}: {r.code} {r.body}"
+    assert dest.read_bytes() == READONLY_PAYLOAD
+    # An overwrite keeps the existing destination mode, not the source's.
+    assert _st_mode(dest) == 0o600, f"expected 0o600, got {oct(_st_mode(dest))}"
+    assert _temp_files(dest_dir) == []
+
+
+@pytest.mark.parametrize("with_progress", [False, True], ids=["no_progress", "progress"])
+def test_local_transfer_readonly_source_failure_keeps_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_progress: bool,
+) -> None:
+    """A failing replace leaves the old destination intact and removes the temp."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    src = _readonly_source(src_dir)
+    dest = dest_dir / "out.bin"
+    dest.write_bytes(b"old-content")
+    os.chmod(dest, 0o600)
+
+    def fail_replace(src_p: str, dst_p: str) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    events: list[tuple[int, int | None]] = []
+    progress = (lambda d, t: events.append((d, t))) if with_progress else None
+    r = _transfer("put", src, dest, progress=progress)
+
+    assert r.status == "error", f"{r.code} {r.body}"
+    assert dest.read_bytes() == b"old-content"
+    assert _st_mode(dest) == 0o600
+    assert _temp_files(dest_dir) == []
+
+
+immutable_flag_only = pytest.mark.skipif(
+    getattr(os, "chflags", None) is None or not hasattr(stat, "UF_IMMUTABLE"),
+    reason="BSD user-immutable flag not supported",
+)
+
+
+@immutable_flag_only
+@pytest.mark.parametrize("op", ["put", "get"])
+@pytest.mark.parametrize("with_progress", [False, True], ids=["no_progress", "progress"])
+def test_local_transfer_immutable_source_leaves_no_temp(
+    tmp_path: Path,
+    op: str,
+    with_progress: bool,
+) -> None:
+    """A flag-immutable source cannot be staged, and must not leak the temp.
+
+    ``copystat`` copies ``st_flags`` onto the temp, so a temp staged from a
+    user-immutable (``uchg``) source can be neither renamed into place nor
+    unlinked; the failure path must clear the flag before cleaning up, so the
+    transfer fails without leaving a temp in the destination directory.
+    """
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    src = _readonly_source(src_dir)
+    os.chflags(src, stat.UF_IMMUTABLE)
+    if not os.stat(src).st_flags:
+        pytest.skip("filesystem ignores the user immutable flag")
+    dest = dest_dir / "out.bin"
+    progress = (lambda d, t: None) if with_progress else None
+    try:
+        r = _transfer(op, src, dest, progress=progress)
+
+        assert r.status == "error", f"{op}: {r.code} {r.body}"
+        assert not dest.exists()
+        assert _temp_files(dest_dir) == []
+    finally:
+        # tmp_path teardown must be able to remove the immutable source and
+        # any temp left behind by a regression.
+        for path in (src, *dest_dir.iterdir()):
+            if os.stat(path).st_flags:
+                os.chflags(path, 0)
+
+
+# ---------------------------------------------------------------------------
+# local: a failed transfer names the object on the side that failed
+# ---------------------------------------------------------------------------
+
+
+def test_local_put_unreadable_source_names_the_local_source(
+    tmp_path: Path,
+) -> None:
+    """An unreadable source is reported against that source.
+
+    The destination is writable and the transfer never created it, so a row
+    naming the destination sends an Agent to chmod a file that had nothing to
+    do with the failure.
+    """
+    src = tmp_path / "unreadable.bin"
+    src.write_bytes(b"payload")
+    os.chmod(src, 0o000)
+    dest = tmp_path / "dest.bin"
+    try:
+        r = fs_ops.run(
+            "put",
+            ep="local",
+            path=str(dest),
+            local=str(src),
+            home=FIXTURES,
+        )
+    finally:
+        os.chmod(src, 0o644)
+
+    assert r.status == "error", r.render_text()
+    assert r.code == "PERMISSION_DENIED"
+    # path stays the caller's destination; node_path is the object that failed.
+    assert r.fields.get("path") == str(dest), r.render_text()
+    assert r.fields.get("node_path") == str(src), r.render_text()
+    msg = str(r.fields.get("msg") or "")
+    assert str(src) in msg, r.render_text()
+    assert str(dest) not in msg, r.render_text()
+    assert not dest.exists()
+    assert _temp_files(tmp_path) == []
+
+
+@pytest.mark.parametrize("existing", [True, False], ids=["existing_dir", "missing_dir"])
+def test_local_get_denied_destination_names_the_local_destination(
+    tmp_path: Path,
+    existing: bool,
+) -> None:
+    """A get the local destination refuses is reported against that destination.
+
+    The source is a readable regular file the transfer never touched, so the
+    old row blamed the object that was working.
+    """
+    src = tmp_path / "source.bin"
+    src.write_bytes(b"payload")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    dest = locked / "sub" / "out.bin"
+    if existing:
+        dest.parent.mkdir()
+    # The level that refuses the write: the destination's own directory when it
+    # is already there, otherwise the directory its creation goes through.
+    refused = dest.parent if existing else locked
+    os.chmod(refused, 0o555)
+    try:
+        r = fs_ops.run(
+            "get",
+            ep="local",
+            path=str(src),
+            local=str(dest),
+            home=FIXTURES,
+        )
+    finally:
+        os.chmod(refused, 0o755)
+
+    assert r.status == "error", r.render_text()
+    assert r.code == "PERMISSION_DENIED"
+    assert r.fields.get("path") == str(src), r.render_text()
+    assert r.fields.get("node_path") == str(dest), r.render_text()
+    msg = str(r.fields.get("msg") or "")
+    assert str(dest) in msg, r.render_text()
+    assert str(src) not in msg, r.render_text()
+    assert src.read_bytes() == b"payload"
+    assert not dest.exists()
+    assert _temp_files(refused) == []
+
+
+def test_local_get_directory_destination_names_the_local_destination(
+    tmp_path: Path,
+) -> None:
+    """"is a directory" is reported against the local directory that is there.
+
+    The source is a regular file, so the old row made a false statement about
+    it.
+    """
+    src = tmp_path / "source.bin"
+    src.write_bytes(b"payload")
+    dest = tmp_path / "dest-dir"
+    dest.mkdir()
+
+    r = fs_ops.run(
+        "get",
+        ep="local",
+        path=str(src),
+        local=str(dest),
+        home=FIXTURES,
+    )
+
+    assert r.status == "error", r.render_text()
+    assert r.code == "IS_A_DIR"
+    assert r.fields.get("path") == str(src), r.render_text()
+    assert r.fields.get("node_path") == str(dest), r.render_text()
+    msg = str(r.fields.get("msg") or "")
+    assert str(dest) in msg, r.render_text()
+    assert str(src) not in msg, r.render_text()
+    assert dest.is_dir() and list(dest.iterdir()) == []
+
+
+def test_local_put_directory_destination_stays_on_the_destination(
+    tmp_path: Path,
+) -> None:
+    """A destination-side failure keeps naming the destination.
+
+    The caller's path is the object that failed, so the row gains no node_path.
+    """
+    src = tmp_path / "source.bin"
+    src.write_bytes(b"payload")
+    dest = tmp_path / "dest-dir"
+    dest.mkdir()
+
+    r = fs_ops.run(
+        "put",
+        ep="local",
+        path=str(dest),
+        local=str(src),
+        home=FIXTURES,
+    )
+
+    assert r.status == "error", r.render_text()
+    assert r.code == "IS_A_DIR"
+    assert r.fields.get("path") == str(dest), r.render_text()
+    assert "node_path" not in r.fields, r.render_text()
+    msg = str(r.fields.get("msg") or "")
+    assert str(dest) in msg, r.render_text()
+    assert str(src) not in msg, r.render_text()
+
+
+def test_local_get_destination_link_cycle_names_the_local_destination(
+    tmp_path: Path,
+) -> None:
+    """A local destination link chain that cannot be walked is a local failure.
+
+    The walk's exception names an element of the chain; the row must still
+    name the local destination rather than the readable source the transfer
+    only read from.
+    """
+    src = tmp_path / "source.bin"
+    src.write_bytes(b"payload")
+    cycle = tmp_path / "cycle"
+    cycle.mkdir()
+    for name, target in (("cyc0", "cyc1"), ("cyc1", "cyc2"), ("cyc2", "cyc0")):
+        (cycle / name).symlink_to(target)
+    dest = cycle / "cyc0"
+
+    r = fs_ops.run(
+        "get",
+        ep="local",
+        path=str(src),
+        local=str(dest),
+        home=FIXTURES,
+    )
+
+    assert r.status == "error", r.render_text()
+    assert r.code == "FS_ERROR"
+    assert r.fields.get("path") == str(src), r.render_text()
+    assert r.fields.get("node_path") == str(dest), r.render_text()
+    assert src.read_bytes() == b"payload"
+    assert dest.is_symlink(), r.render_text()
+    assert _temp_files(cycle) == []
+
+
+# ---------------------------------------------------------------------------
+# local: write/put/get to symlink follows to target - link preserved
 # ---------------------------------------------------------------------------
 
 
@@ -660,910 +1471,143 @@ def test_local_put_symlink_dst_follows_to_target(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# sftp mock
+# local: the caller's path names the object the OS resolves
 # ---------------------------------------------------------------------------
 
 
-class _MockSftpFile:
-    def __init__(self, store: dict[str, bytes], path: str, mode: str) -> None:
-        self._store = store
-        self._path = path
-        self._mode = mode
-        self._buf = bytearray()
-        if "r" in mode:
-            self._data = store.get(path, b"")
-            self._pos = 0
-        else:
-            self._data = b""
-            self._pos = 0
+def test_local_dotdot_through_symlink_hits_referent_sibling(tmp_path: Path) -> None:
+    """``a/link/../victim`` must reach the object the OS resolves (b/victim).
 
-    def read(self, n: int = -1) -> bytes:
-        if n is None or n < 0:
-            chunk = self._data[self._pos :]
-            self._pos = len(self._data)
-            return chunk
-        chunk = self._data[self._pos : self._pos + n]
-        self._pos += len(chunk)
-        return chunk
-
-    def write(self, data: bytes) -> int:
-        self._buf.extend(data)
-        return len(data)
-
-    def close(self) -> None:
-        if "w" in self._mode:
-            self._store[self._path] = bytes(self._buf)
-
-
-class _MockAttrs:
-    def __init__(self, mode: int, size: int = 0, mtime: float = 0.0) -> None:
-        self.permissions = mode
-        self.size = size
-        self.mtime = mtime
-
-
-class _SFTPName:
-    """asyncssh SFTPName stand-in: carries .filename and .attrs."""
-
-    def __init__(self, filename: str, attrs: _MockAttrs) -> None:
-        self.filename = filename
-        self.attrs = attrs
-
-
-class MockSftp:
-    """In-memory SFTP-like client for unit/service tests (no network).
-
-    Models dirs/files/symlinks and exposes both the asyncssh-style ``readdir``
-    (yielding ``_SFTPName`` with attrs) and the bare-string ``listdir``. The
-    call counters (``stat_calls``/``open_calls``/``readdir_calls``) let tests
-    assert that ``list`` reuses readdir attrs and that ``read`` skips its
-    pre-stat. ``posix_rename``/``readlink`` exercise the atomic-write and
-    symlink-target code paths.
+    Lexically collapsing ``..`` walks over the intermediate link
+    (``a/link`` -> ``b/sub``) and names ``a/victim`` instead. read/write/rm
+    must all land on b/victim and leave the sibling a/victim alone.
     """
+    real = tmp_path / "b"
+    (real / "sub").mkdir(parents=True)
+    (real / "victim").write_text("REAL-B", encoding="utf-8")
+    decoy = tmp_path / "a"
+    decoy.mkdir()
+    (decoy / "victim").write_text("DECOY-A", encoding="utf-8")
+    (decoy / "link").symlink_to("../b/sub")
 
-    def __init__(self) -> None:
-        self.files: dict[str, bytes] = {}
-        self.dirs: set[str] = {"/"}
-        self.links: dict[str, str] = {}
-        self.stat_calls = 0
-        self.open_calls = 0
-        self.readdir_calls = 0
+    through = f"{tmp_path}/a/link/../victim"
 
-    def _norm(self, path: str) -> str:
-        p = path if path.startswith("/") else "/" + path
-        while "//" in p:
-            p = p.replace("//", "/")
-        if p != "/" and p.endswith("/"):
-            p = p.rstrip("/")
-        return p or "/"
+    r = fs_ops.run("read", ep="local", path=through, home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.body is not None and "REAL-B" in r.body
 
-    def _children(self, path: str) -> dict[str, str]:
-        path = self._norm(path)
-        if path not in self.dirs:
-            raise FileNotFoundError(path)
-        prefix = path.rstrip("/") + "/"
-        if path == "/":
-            prefix = "/"
-        result: dict[str, str] = {}
-        for d in self.dirs:
-            if d == path or d == "/":
-                continue
-            if d.startswith(prefix):
-                rest = d[len(prefix) :] if prefix != "/" else d.lstrip("/")
-                if rest and "/" not in rest:
-                    result[rest] = d
-        for f in self.files:
-            if f.startswith(prefix) or (prefix == "/" and f.startswith("/")):
-                rest = f[len(prefix) :] if prefix != "/" else f.lstrip("/")
-                if rest and "/" not in rest:
-                    result[rest] = f
-        for link in self.links:
-            if link.startswith(prefix) or (prefix == "/" and link.startswith("/")):
-                rest = link[len(prefix) :] if prefix != "/" else link.lstrip("/")
-                if rest and "/" not in rest:
-                    result[rest] = link
-        return result
+    w = fs_ops.run("write", ep="local", path=through, content="NEW-B", home=FIXTURES)
+    assert w.status == "ok", w.render_text()
+    assert (real / "victim").read_text(encoding="utf-8") == "NEW-B"
+    assert (decoy / "victim").read_text(encoding="utf-8") == "DECOY-A"
 
-    def _attrs_for(self, path: str) -> _MockAttrs:
-        path = self._norm(path)
-        if path in self.links:
-            return _MockAttrs(statmod.S_IFLNK | 0o777, 0, 1.0)
-        if path in self.dirs:
-            return _MockAttrs(statmod.S_IFDIR | 0o755, 0, 1.0)
-        if path in self.files:
-            return _MockAttrs(statmod.S_IFREG | 0o644, len(self.files[path]), 1.0)
-        raise FileNotFoundError(path)
-
-    def listdir(self, path: str) -> list[str]:
-        return sorted(self._children(path).keys())
-
-    def readdir(self, path: str) -> list[_SFTPName]:
-        self.readdir_calls += 1
-        kids = self._children(path)
-        return [
-            _SFTPName(name, self._attrs_for(abs_p))
-            for name, abs_p in sorted(kids.items())
-        ]
-
-    def stat(self, path: str) -> _MockAttrs:
-        self.stat_calls += 1
-        return self._attrs_for(path)
-
-    def lstat(self, path: str) -> _MockAttrs:
-        return self.stat(path)
-
-    def readlink(self, path: str) -> str:
-        path = self._norm(path)
-        if path not in self.links:
-            raise FileNotFoundError(path)
-        return self.links[path]
-
-    def posix_rename(self, src: str, dst: str) -> None:
-        src = self._norm(src)
-        dst = self._norm(dst)
-        if src in self.files:
-            self.files[dst] = self.files.pop(src)
-        elif src in self.links:
-            self.links[dst] = self.links.pop(src)
-        else:
-            raise FileNotFoundError(src)
-
-    def mkdir(self, path: str) -> None:
-        path = self._norm(path)
-        parent = path.rsplit("/", 1)[0] or "/"
-        if parent not in self.dirs:
-            raise FileNotFoundError(parent)
-        self.dirs.add(path)
-
-    def remove(self, path: str) -> None:
-        path = self._norm(path)
-        if path in self.files:
-            del self.files[path]
-            return
-        if path in self.links:
-            del self.links[path]
-            return
-        raise FileNotFoundError(path)
-
-    def rmdir(self, path: str) -> None:
-        path = self._norm(path)
-        if path not in self.dirs or path == "/":
-            raise FileNotFoundError(path)
-        # non-empty?
-        for f in self.files:
-            if f.startswith(path + "/"):
-                raise OSError("not empty")
-        for d in self.dirs:
-            if d != path and d.startswith(path + "/"):
-                raise OSError("not empty")
-        self.dirs.discard(path)
-
-    def open(self, path: str, mode: str = "r") -> _MockSftpFile:
-        path = self._norm(path)
-        self.open_calls += 1
-        if "r" in mode:
-            if path in self.dirs:
-                raise IsADirectoryError(path)
-            if path not in self.files:
-                raise FileNotFoundError(path)
-        return _MockSftpFile(self.files, path, mode)
-
-    def put(self, local: str, remote: str) -> None:
-        remote = self._norm(remote)
-        data = Path(local).read_bytes()
-        self.files[remote] = data
-
-    def get(self, remote: str, local: str) -> None:
-        remote = self._norm(remote)
-        if remote not in self.files:
-            raise FileNotFoundError(remote)
-        Path(local).write_bytes(self.files[remote])
+    rm = fs_ops.run("rm", ep="local", path=through, home=FIXTURES)
+    assert rm.status == "ok", rm.render_text()
+    assert not (real / "victim").exists()
+    assert (decoy / "victim").read_text(encoding="utf-8") == "DECOY-A"
+    # The intermediate link is untouched by rm (only the final component goes).
+    assert (decoy / "link").is_symlink()
 
 
-def test_sftp_mock_list_and_read() -> None:
-    mock = MockSftp()
-    mock.dirs.add("/var")
-    mock.dirs.add("/var/log")
-    mock.files["/var/log/syslog"] = b"log-line-1\nlog-line-2\n"
+def test_local_symlink_target_with_dotdot_resolves_via_os(tmp_path: Path) -> None:
+    """A stored link target containing ``dirlink/../file`` is joined verbatim.
 
-    backend = SftpFs(mock, cwd="/var", home="/home/deploy")
-    r = fs_ops.run(
-        "list",
-        ep="lab-ssh",
-        path="/var/log",
-        home=FIXTURES,
-        backend=backend,
-    )
-    # When backend is injected, ep may still be set; no real connect.
-    assert r.status == "ok"
-    assert r.fields.get("op") == "list"
-    assert r.fields.get("path") == "/var/log"
-    assert Path(r.fields["path"]).is_absolute() or r.fields["path"].startswith("/")
-    assert "syslog" in (r.body or "")
-    # via=sftp optional
-    if r.fields.get("via"):
-        assert r.fields["via"] == "sftp"
-
-    r2 = fs_ops.run(
-        "read",
-        ep="lab-ssh",
-        path="/var/log/syslog",
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r2.status == "ok"
-    assert r2.fields.get("path") == "/var/log/syslog"
-    assert r2.body is not None
-    assert "log-line-1" in r2.body
-
-
-def test_sftp_mock_via_ssh_connector() -> None:
-    """end-to-end: ensure_endpoint + open_sftp on mock connection."""
-    mock = MockSftp()
-    mock.dirs.add("/tmp")
-    mock.files["/tmp/hello.txt"] = b"sftp-hello\n"
-
-    class Conn:
-        cwd = "/tmp"
-        home = "/home/deploy"
-
-        def start_sftp_client(self) -> MockSftp:
-            return mock
-
-    def connector(**_kwargs: object) -> Conn:
-        return Conn()
-
-    reg = get_registry()
-    reg.ssh_connector = connector  # type: ignore[assignment]
-
-    r = fs_ops.run(
-        "list",
-        ep="lab-ssh",
-        path="/tmp",
-        home=FIXTURES,
-        connector=connector,
-    )
-    assert r.status == "ok"
-    assert r.fields.get("path") == "/tmp"
-    assert "hello.txt" in (r.body or "")
-    if r.fields.get("via"):
-        assert r.fields["via"] == "sftp"
-
-    r2 = fs_ops.run(
-        "read",
-        ep="lab-ssh",
-        path="/tmp/hello.txt",
-        home=FIXTURES,
-        connector=connector,
-    )
-    assert r2.status == "ok"
-    assert "sftp-hello" in (r2.body or "")
-    assert r2.fields["path"] == "/tmp/hello.txt"
-
-
-def test_sftp_mock_missing_path() -> None:
-    mock = MockSftp()
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    r = fs_ops.run(
-        "stat",
-        ep="lab-ssh",
-        path="/missing",
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "error"
-    assert r.code == "NOT_FOUND"
-
-
-# ---------------------------------------------------------------------------
-# sftp: O8 — recursive list, readdir attrs, reconnect, atomic write, symlinks
-# ---------------------------------------------------------------------------
-
-
-class ChannelClosed(Exception):
-    """Stand-in for an asyncssh channel-closed error (duck-typed by name)."""
-
-
-class _DeadSftp:
-    """Every op raises a channel-closed error (simulates a dropped channel)."""
-
-    def stat(self, path: str) -> None:
-        raise ChannelClosed("channel closed by remote")
-
-    def lstat(self, path: str) -> None:
-        raise ChannelClosed("channel closed by remote")
-
-    def readdir(self, path: str) -> None:
-        raise ChannelClosed("channel closed by remote")
-
-
-class _FailWriteFile:
-    """A remote file handle whose write always fails (simulates mid-upload)."""
-
-    def write(self, data: bytes) -> int:
-        raise OSError("simulated disk full")
-
-    def close(self) -> None:
-        pass
-
-
-class _AtomicFailSftp:
-    """SFTP mock with posix_rename where writes to a temp path always fail.
-
-    Used to prove write/put atomicity: the final remote file must survive a
-    mid-upload failure, and the temp must be removed.
+    Collapsing the target lexically names ``file`` in the link's own
+    directory; letting the OS resolve ``..`` after following ``dirlink``
+    names ``sub/file``. The referent the caller gets must be the latter.
     """
+    (tmp_path / "sub" / "inner").mkdir(parents=True)
+    (tmp_path / "sub" / "file").write_text("REAL-SUB", encoding="utf-8")
+    (tmp_path / "file").write_text("DECOY-ROOT", encoding="utf-8")
+    (tmp_path / "dirlink").symlink_to("sub/inner")
+    link = tmp_path / "link"
+    link.symlink_to("dirlink/../file")
 
-    def __init__(self) -> None:
-        self.files: dict[str, bytes] = {"/d/final.txt": b"original"}
-        self.dirs: set[str] = {"/", "/d"}
-        self.removed_temps: list[str] = []
+    r = fs_ops.run("read", ep="local", path=str(link), home=FIXTURES)
+    assert r.status == "ok", r.render_text()
+    assert r.body is not None and "REAL-SUB" in r.body
 
-    def _norm(self, p: str) -> str:
-        p = p if p.startswith("/") else "/" + p
-        while "//" in p:
-            p = p.replace("//", "/")
-        if p != "/" and p.endswith("/"):
-            p = p.rstrip("/")
-        return p or "/"
-
-    def stat(self, p: str) -> _MockAttrs:
-        p = self._norm(p)
-        if p in self.dirs:
-            return _MockAttrs(statmod.S_IFDIR | 0o755, 0, 1.0)
-        if p in self.files:
-            return _MockAttrs(statmod.S_IFREG | 0o644, len(self.files[p]), 1.0)
-        raise FileNotFoundError(p)
-
-    def lstat(self, p: str) -> _MockAttrs:
-        return self.stat(p)
-
-    def mkdir(self, p: str) -> None:
-        self.dirs.add(self._norm(p))
-
-    def open(self, p: str, mode: str = "r") -> object:
-        p = self._norm(p)
-        if "w" in mode and ".mrc-tmp-" in p:
-            return _FailWriteFile()  # writes to the temp path fail
-        if "r" in mode:
-            if p in self.dirs:
-                raise IsADirectoryError(p)
-            if p not in self.files:
-                raise FileNotFoundError(p)
-            data = self.files[p]
-
-            class _R:
-                def __init__(self, d: bytes) -> None:
-                    self._d = d
-                    self._p = 0
-
-                def read(self, n: int = -1) -> bytes:
-                    if n is None or n < 0:
-                        r = self._d[self._p :]
-                        self._p = len(self._d)
-                        return r
-                    r = self._d[self._p : self._p + n]
-                    self._p += len(r)
-                    return r
-
-                def close(self) -> None:
-                    pass
-
-            return _R(data)
-        # write to a non-temp path: buffer + commit (not used by the atomic path).
-        key = p
-        store = self.files
-
-        class _W:
-            def __init__(self) -> None:
-                self._buf = bytearray()
-
-            def write(self, d: bytes) -> int:
-                self._buf.extend(d)
-                return len(d)
-
-            def close(self) -> None:
-                store[key] = bytes(self._buf)
-
-        return _W()
-
-    def posix_rename(self, src: str, dst: str) -> None:
-        src = self._norm(src)
-        dst = self._norm(dst)
-        if src not in self.files:
-            raise FileNotFoundError(src)
-        self.files[dst] = self.files.pop(src)
-
-    def remove(self, p: str) -> None:
-        p = self._norm(p)
-        if p in self.files:
-            del self.files[p]
-        if ".mrc-tmp-" in p:
-            self.removed_temps.append(p)
+    w = fs_ops.run("write", ep="local", path=str(link), content="NEW-SUB", home=FIXTURES)
+    assert w.status == "ok", w.render_text()
+    assert (tmp_path / "sub" / "file").read_text(encoding="utf-8") == "NEW-SUB"
+    assert (tmp_path / "file").read_text(encoding="utf-8") == "DECOY-ROOT"
+    # write updates the referent; the link entry stays a link.
+    assert link.is_symlink()
 
 
-class _FailReadFile:
-    """A remote file handle whose read fails partway (simulates mid-download).
+def test_local_list_derived_rows_name_the_objects_they_describe(
+    tmp_path: Path,
+) -> None:
+    """The "." and ".." rows of a listing resolve to the listed objects.
 
-    A full ``read()`` (no arg / n<0, used by the no-progress ``_read_bytes``
-    path) fails immediately so no bytes are ever returned. A chunked
-    ``read(n)`` (n>0, used by the progress ``_get_with_progress`` path) returns
-    a small chunk on the first call so a partial temp is written, then raises
-    on every subsequent call. Either way the atomic get path must remove the
-    temp and leave the pre-existing destination untouched.
+    A caller path that walks ".." through a symlink is listed from the
+    directory the OS resolves it to, so the row naming that directory and the
+    row naming its parent must resolve to that directory and its real parent.
+    Deriving them lexically instead names the collapse target - a different
+    object, or no object at all.
     """
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b" / "sub").mkdir(parents=True)
+    (tmp_path / "a" / "victim").write_text("DECOY-A", encoding="utf-8")
+    (tmp_path / "b" / "sub" / "child.txt").write_text("REAL-B", encoding="utf-8")
+    (tmp_path / "a" / "link").symlink_to("../b/sub")
 
-    def __init__(self, data: bytes, chunk: int = 10) -> None:
-        self._data = data
-        self._chunk = chunk
-        self._calls = 0
+    backend = LocalFs()
 
-    def read(self, n: int = -1) -> bytes:
-        self._calls += 1
-        if n is None or n < 0:
-            # Full-read path: fail before returning any bytes.
-            raise OSError("simulated mid-download drop")
-        if self._calls > 1:
-            # Chunked path: second+ chunk fails (mid-download).
-            raise OSError("simulated mid-download drop")
-        return self._data[: min(n, self._chunk)]
+    # The link is followed before "..", so this lists b/sub.
+    rows = {e.name: e for e in backend.list(f"{tmp_path}/a/link/../sub").entries}
+    assert set(rows) >= {".", "..", "child.txt"}
+    for name in (".", ".."):
+        assert os.path.exists(rows[name].path), (name, rows[name].path)
+    assert os.path.samefile(rows["."].path, tmp_path / "b" / "sub")
+    assert os.path.samefile(rows[".."].path, tmp_path / "b")
 
-    def close(self) -> None:
-        pass
+    # A caller path ending in ".." lists b too, whose parent is the root here.
+    rows = {e.name: e for e in backend.list(f"{tmp_path}/a/link/..").entries}
+    for name in (".", ".."):
+        assert os.path.exists(rows[name].path), (name, rows[name].path)
+    assert os.path.samefile(rows["."].path, tmp_path / "b")
+    assert os.path.samefile(rows[".."].path, tmp_path)
+
+    # An ordinary directory listing keeps both rows on the objects they name.
+    rows = {e.name: e for e in backend.list(str(tmp_path / "b")).entries}
+    assert os.path.samefile(rows["."].path, tmp_path / "b")
+    assert os.path.samefile(rows[".."].path, tmp_path)
 
 
-class _GetFailSftp:
-    """SFTP mock where reads fail partway through (simulates a mid-get drop).
+def test_local_whitespace_names_stay_distinct(tmp_path: Path) -> None:
+    """``x``, ``x `` and `` x`` are three different files.
 
-    Used to prove sftp get atomicity: the local destination must survive a
-    mid-download failure, and the local temp must be removed. Exposes only
-    ``open`` (no ``get``/``read_file``/``posix_rename``) so both the progress
-    and no-progress branches exercise the open+read code path.
+    Trimming the caller's path collapses them onto one object, so a read or
+    rm issued for one would hit another. Every op must use the string as
+    given and report it back unchanged.
     """
+    contents = {"x": "PLAIN", "x ": "TRAILING", " x": "LEADING"}
+    for name, text in contents.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
 
-    def __init__(self) -> None:
-        self.files: dict[str, bytes] = {"/d/final.txt": b"original-remote-content"}
-        self.dirs: set[str] = {"/", "/d"}
+    for name, text in contents.items():
+        r = fs_ops.run("read", ep="local", path=f"{tmp_path}/{name}", home=FIXTURES)
+        assert r.status == "ok", r.render_text()
+        assert r.body is not None and text in r.body, (name, r.render_text())
+        s = fs_ops.run("stat", ep="local", path=f"{tmp_path}/{name}", home=FIXTURES)
+        assert s.status == "ok", s.render_text()
+        assert s.fields.get("path") == f"{tmp_path}/{name}"
+        assert s.fields.get("bytes") == len(text)
 
-    def _norm(self, p: str) -> str:
-        p = p if p.startswith("/") else "/" + p
-        while "//" in p:
-            p = p.replace("//", "/")
-        if p != "/" and p.endswith("/"):
-            p = p.rstrip("/")
-        return p or "/"
-
-    def stat(self, p: str) -> _MockAttrs:
-        p = self._norm(p)
-        if p in self.dirs:
-            return _MockAttrs(statmod.S_IFDIR | 0o755, 0, 1.0)
-        if p in self.files:
-            return _MockAttrs(statmod.S_IFREG | 0o644, len(self.files[p]), 1.0)
-        raise FileNotFoundError(p)
-
-    def lstat(self, p: str) -> _MockAttrs:
-        return self.stat(p)
-
-    def open(self, p: str, mode: str = "r") -> _FailReadFile:
-        p = self._norm(p)
-        if "r" in mode:
-            if p in self.dirs:
-                raise IsADirectoryError(p)
-            if p not in self.files:
-                raise FileNotFoundError(p)
-            return _FailReadFile(self.files[p])
-        raise OSError("unexpected write")
-
-
-def test_sftp_recursive_list_name_not_corrupted() -> None:
-    """H2: recursive list at depth >=3 with a child basename starting with the
-    parent basename must produce correct relative names (the old startswith
-    heuristic dropped the prefix for sub_file under sub and sub2/bar)."""
-    mock = MockSftp()
-    mock.dirs.update({"/d", "/d/sub", "/d/sub/sub2"})
-    mock.files["/d/sub/sub_file"] = b"x"
-    mock.files["/d/sub/sub2/bar"] = b"yy"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    result = backend.list("/d", recursive=True)
-    by_name = {e.name: e for e in result.entries}
-    # Correct relative paths preserved at every depth.
-    assert "sub" in by_name and by_name["sub"].kind == "d"
-    assert "sub/sub_file" in by_name and by_name["sub/sub_file"].kind == "f"
-    assert by_name["sub/sub_file"].path == "/d/sub/sub_file"
-    assert "sub/sub2" in by_name and by_name["sub/sub2"].kind == "d"
-    assert "sub/sub2/bar" in by_name and by_name["sub/sub2/bar"].kind == "f"
-    assert by_name["sub/sub2/bar"].path == "/d/sub/sub2/bar"
-    # The corrupted unprefixed names must NOT appear.
-    assert "sub_file" not in by_name
-    assert "sub2/bar" not in by_name
-
-
-def test_sftp_list_reuses_readdir_attrs_no_per_child_stat() -> None:
-    """F + LOW: list reuses readdir attrs (no per-child stat) and reuses the
-    dir attrs for "." (no second stat of the same path)."""
-    mock = MockSftp()
-    mock.dirs.update({"/dir"})
-    mock.files["/dir/a"] = b"1"
-    mock.files["/dir/b"] = b"22"
-    mock.files["/dir/c"] = b"333"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    result = backend.list("/dir")
-    by_name = {e.name: e for e in result.entries}
-    assert set(by_name) >= {".", "..", "a", "b", "c"}
-    # readdir supplied the children's attrs (one readdir for the dir contents).
-    assert mock.readdir_calls == 1, f"expected 1 readdir, got {mock.readdir_calls}"
-    # Only 2 stats: the dir (kind check, reused for ".") + the parent for "..".
-    # A per-child stat or a second dir stat for "." would raise this to 3+.
-    assert mock.stat_calls == 2, f"expected 2 stats, got {mock.stat_calls}"
-    # "." carries the dir's mode/mtime (reused attrs, not the bare fallback).
-    assert by_name["."].mode is not None
-    assert by_name["."].mtime is not None
-    assert by_name["a"].kind == "f" and by_name["a"].size == 1
-    assert by_name["b"].kind == "f" and by_name["b"].size == 2
-    assert by_name["c"].kind == "f" and by_name["c"].size == 3
-
-
-def test_sftp_read_dir_maps_is_a_dir_without_pre_stat() -> None:
-    """LOW: read on a dir maps to IS_A_DIR via the open failure, with no
-    pre-stat (open is attempted; stat is not called)."""
-    mock = MockSftp()
-    mock.dirs.update({"/dir"})
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    r = fs_ops.run(
-        "read", ep="lab-ssh", path="/dir", home=FIXTURES, backend=backend
+    w = fs_ops.run(
+        "write", ep="local", path=f"{tmp_path}/x", content="NEW-PLAIN", home=FIXTURES
     )
-    assert r.status == "error"
-    assert r.code == "IS_A_DIR"
-    # No pre-stat: read no longer calls stat.
-    assert mock.stat_calls == 0
-    # open was attempted (and its IsADirectoryError mapped to IS_A_DIR).
-    assert mock.open_calls >= 1
+    assert w.status == "ok", w.render_text()
+    assert (tmp_path / "x").read_text(encoding="utf-8") == "NEW-PLAIN"
+    assert (tmp_path / "x ").read_text(encoding="utf-8") == "TRAILING"
+    assert (tmp_path / " x").read_text(encoding="utf-8") == "LEADING"
 
-
-def test_sftp_client_reconnects_after_channel_closed() -> None:
-    """F: after a channel-closed error on an op, the cached client is reset
-    and the next op re-invokes the factory (reconnect works)."""
-    factory_calls = {"n": 0}
-    working = MockSftp()
-    working.dirs.update({"/x"})
-    working.files["/x/hello.txt"] = b"reconnected\n"
-
-    def factory() -> object:
-        factory_calls["n"] += 1
-        if factory_calls["n"] == 1:
-            return _DeadSftp()
-        return working
-
-    backend = SftpFs(factory=factory, cwd="/", home="/home/u")
-    # First op fails on the dead client; the cached client is reset.
-    r1 = fs_ops.run(
-        "list", ep="lab-ssh", path="/x", home=FIXTURES, backend=backend
-    )
-    assert r1.status == "error"
-    assert backend._client is None
-    assert factory_calls["n"] == 1
-    # Second op re-invokes the factory and succeeds on the fresh client.
-    r2 = fs_ops.run(
-        "list", ep="lab-ssh", path="/x", home=FIXTURES, backend=backend
-    )
-    assert r2.status == "ok"
-    assert factory_calls["n"] == 2
-    assert backend._client is not None
-    assert "hello.txt" in (r2.body or "")
-
-
-def test_sftp_write_atomic_failure_preserves_remote() -> None:
-    """Theme D: write that fails mid-upload leaves NO partial remote file at
-    the final path (temp removed; final unchanged)."""
-    mock = _AtomicFailSftp()
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    r = fs_ops.run(
-        "write",
-        ep="lab-ssh",
-        path="/d/final.txt",
-        content="new-content",
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "error"
-    # Final file untouched (no partial write at the final path).
-    assert mock.files.get("/d/final.txt") == b"original"
-    # No temp file left behind.
-    assert [k for k in mock.files if ".mrc-tmp-" in k] == []
-    # Temp cleanup was attempted.
-    assert mock.removed_temps
-
-
-def test_sftp_put_atomic_failure_preserves_remote(tmp_path: Path) -> None:
-    """Theme D: put that fails mid-upload leaves NO partial remote file at the
-    final path (temp removed; final unchanged)."""
-    mock = _AtomicFailSftp()
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    src = tmp_path / "local.bin"
-    src.write_bytes(b"would-be-payload")
-    r = fs_ops.run(
-        "put",
-        ep="lab-ssh",
-        path="/d/final.txt",
-        local=str(src),
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "error"
-    assert mock.files.get("/d/final.txt") == b"original"
-    assert [k for k in mock.files if ".mrc-tmp-" in k] == []
-    assert mock.removed_temps
-
-
-def test_sftp_get_atomic_failure_preserves_local(tmp_path: Path) -> None:
-    """Theme D: sftp get that fails mid-download leaves NO partial file at the
-    local destination (local temp removed; pre-existing dst unchanged). The
-    progress branch streams chunks into a local temp, then os.replace — a
-    mid-read failure must remove the temp and preserve the original dst."""
-    mock = _GetFailSftp()
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    dst = tmp_path / "downloaded.bin"
-    # Pre-existing destination must survive across the failed get.
-    dst.write_bytes(b"pre-existing-local-content")
-
-    r = fs_ops.run(
-        "get",
-        ep="lab-ssh",
-        path="/d/final.txt",
-        local=str(dst),
-        home=FIXTURES,
-        backend=backend,
-        progress=lambda d, t: None,  # exercise the chunked _get_with_progress path
-    )
-    assert r.status == "error"
-    # Pre-existing destination intact — no partial write at the final path.
-    assert dst.read_bytes() == b"pre-existing-local-content"
-    # No local temp file left behind in dst.parent.
-    temps = [f for f in os.listdir(tmp_path) if ".mrc-tmp-" in f]
-    assert len(temps) == 0
-
-
-def test_sftp_get_atomic_failure_no_progress_preserves_local(tmp_path: Path) -> None:
-    """Theme D: the no-progress sftp get branch is also atomic — a mid-read
-    failure (``_read_bytes`` open+read path) leaves the pre-existing dst
-    unchanged and removes the local temp."""
-    mock = _GetFailSftp()
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    dst = tmp_path / "downloaded.bin"
-    dst.write_bytes(b"pre-existing-local-content")
-
-    r = fs_ops.run(
-        "get",
-        ep="lab-ssh",
-        path="/d/final.txt",
-        local=str(dst),
-        home=FIXTURES,
-        backend=backend,
-        # no progress callback → _read_bytes open+read path
-    )
-    assert r.status == "error"
-    assert dst.read_bytes() == b"pre-existing-local-content"
-    temps = [f for f in os.listdir(tmp_path) if ".mrc-tmp-" in f]
-    assert len(temps) == 0
-
-
-def test_sftp_stat_symlink_reports_target() -> None:
-    """LOW: stat on a symlink returns kind=link and the target via readlink."""
-    mock = MockSftp()
-    mock.dirs.update({"/d"})
-    mock.files["/d/target.txt"] = b"content"
-    mock.links["/d/link"] = "/d/target.txt"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    r = fs_ops.run(
-        "stat", ep="lab-ssh", path="/d/link", home=FIXTURES, backend=backend
-    )
-    assert r.status == "ok"
-    assert r.fields.get("type") == "link"
-    assert r.fields.get("target") == "/d/target.txt"
-
-
-def test_sftp_write_symlink_preserves_link() -> None:
-    """Atomic write through a symlink updates the target; link entry preserved.
-
-    Matches local backend policy: posix_rename must land on the final referent,
-    not replace the symlink directory entry with a regular file.
-    """
-    mock = MockSftp()
-    mock.dirs.update({"/d"})
-    mock.files["/d/target.txt"] = b"old-content"
-    mock.links["/d/link"] = "/d/target.txt"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-
-    r = fs_ops.run(
-        "write",
-        ep="lab-ssh",
-        path="/d/link",
-        content="new-content",
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "ok"
-    # Symlink directory entry still a link to the same target.
-    assert "/d/link" in mock.links
-    assert mock.links["/d/link"] == "/d/target.txt"
-    assert "/d/link" not in mock.files
-    # Referent content updated.
-    assert mock.files["/d/target.txt"] == b"new-content"
-    # Public stat still reports kind=link.
-    r_stat = fs_ops.run(
-        "stat", ep="lab-ssh", path="/d/link", home=FIXTURES, backend=backend
-    )
-    assert r_stat.status == "ok"
-    assert r_stat.fields.get("type") == "link"
-    assert r_stat.fields.get("target") == "/d/target.txt"
-
-
-def test_sftp_put_symlink_preserves_link(tmp_path: Path) -> None:
-    """Atomic put through a symlink updates the target; link entry preserved."""
-    mock = MockSftp()
-    mock.dirs.update({"/d"})
-    mock.files["/d/target.bin"] = b"old"
-    mock.links["/d/link.bin"] = "/d/target.bin"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-    src = tmp_path / "payload.bin"
-    src.write_bytes(b"payload-via-link")
-
-    r = fs_ops.run(
-        "put",
-        ep="lab-ssh",
-        path="/d/link.bin",
-        local=str(src),
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "ok"
-    assert "/d/link.bin" in mock.links
-    assert mock.links["/d/link.bin"] == "/d/target.bin"
-    assert "/d/link.bin" not in mock.files
-    assert mock.files["/d/target.bin"] == b"payload-via-link"
-
-
-def test_sftp_write_symlink_chain_preserves_links() -> None:
-    """Atomic write through a symlink chain resolves to the final target."""
-    mock = MockSftp()
-    mock.dirs.update({"/d"})
-    mock.files["/d/real.txt"] = b"old"
-    mock.links["/d/link1"] = "/d/real.txt"
-    mock.links["/d/link2"] = "/d/link1"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-
-    r = fs_ops.run(
-        "write",
-        ep="lab-ssh",
-        path="/d/link2",
-        content="via-chain",
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "ok"
-    assert mock.links["/d/link1"] == "/d/real.txt"
-    assert mock.links["/d/link2"] == "/d/link1"
-    assert "/d/link1" not in mock.files
-    assert "/d/link2" not in mock.files
-    assert mock.files["/d/real.txt"] == b"via-chain"
-
-
-# ---------------------------------------------------------------------------
-# sftp: C4 — UTF-16 detection (shared detect_text) + _rmtree readdir-attrs
-# ---------------------------------------------------------------------------
-
-
-def test_sftp_read_utf16le_with_bom() -> None:
-    """C4: SFTP read of a UTF-16LE file (BOM) returns text. SFTP from Windows
-    servers commonly serves UTF-16; the simple any-NUL heuristic previously
-    misclassified it as binary. The shared detect_text now detects it."""
-    mock = MockSftp()
-    mock.dirs.add("/var")
-    text = "hello-sftp"
-    mock.files["/var/u16.txt"] = b"\xff\xfe" + text.encode("utf-16-le")
-    backend = SftpFs(mock, cwd="/var", home="/home/u")
-
-    r = fs_ops.run(
-        "read", ep="lab-ssh", path="/var/u16.txt", home=FIXTURES, backend=backend
-    )
-    assert r.status == "ok"
-    assert r.fields.get("type") == "text"
-    assert r.fields.get("encoding") == "utf-16"
-    assert text in (r.body or "")
-
-
-def test_sftp_read_utf16le_no_bom() -> None:
-    """C4: SFTP read of no-BOM UTF-16LE (alternating-NUL ASCII) is detected as
-    text via the shared heuristic; previously binary."""
-    mock = MockSftp()
-    mock.dirs.add("/var")
-    text = "plain-ascii-content"
-    raw = text.encode("utf-16-le")
-    assert b"\x00" in raw and raw[1] == 0
-    mock.files["/var/u16nobom.txt"] = raw
-    backend = SftpFs(mock, cwd="/var", home="/home/u")
-
-    r = fs_ops.run(
-        "read",
-        ep="lab-ssh",
-        path="/var/u16nobom.txt",
-        home=FIXTURES,
-        backend=backend,
-    )
-    assert r.status == "ok"
-    assert r.fields.get("type") == "text"
-    assert r.fields.get("encoding") == "utf-16-le"
-    assert text in (r.body or "")
-
-
-def test_sftp_read_binary_with_nul_stays_binary() -> None:
-    """C4 guard: random binary with a NUL byte (no alternating-NUL pattern)
-    stays binary on sftp — the shared heuristic doesn't misfire."""
-    mock = MockSftp()
-    mock.dirs.add("/var")
-    mock.files["/var/bin.dat"] = b"\x00\x01\x02\x03\x04\x05binary"
-    backend = SftpFs(mock, cwd="/var", home="/home/u")
-
-    r = fs_ops.run(
-        "read", ep="lab-ssh", path="/var/bin.dat", home=FIXTURES, backend=backend
-    )
-    assert r.status == "ok"
-    assert r.fields.get("type") == "binary"
-    assert r.fields.get("encoding") is None
-    assert r.body is None or r.body == ""
-
-
-def test_sftp_read_big_endian_uint32_stays_binary() -> None:
-    """LOW re-review guard: a NUL-dense binary with NON-PRINTABLE non-NUL bytes
-    is NOT misclassified as UTF-16 on sftp (shared detect_text). The 12-byte
-    big-endian uint32 repro (``\\x00\\x00\\x00\\x01...``) previously reported
-    ``utf-16-be`` + gibberish text; the printable-ratio guard now rejects it
-    as binary because the non-NUL bytes (0x01/0x02/0x03) are non-printable."""
-    mock = MockSftp()
-    mock.dirs.add("/var")
-    mock.files["/var/u32.bin"] = b"\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03"
-    backend = SftpFs(mock, cwd="/var", home="/home/u")
-
-    r = fs_ops.run(
-        "read", ep="lab-ssh", path="/var/u32.bin", home=FIXTURES, backend=backend
-    )
-    assert r.status == "ok"
-    assert r.fields.get("type") == "binary"
-    assert r.fields.get("encoding") is None
-    assert r.body is None or r.body == ""
-
-
-def test_sftp_rmtree_uses_readdir_attrs_no_per_child_stat() -> None:
-    """C4: _rmtree uses _scandir (readdir attrs) to recover each child's
-    kind — the same N+1 fix ``list`` got. No per-child _stat when readdir
-    yields attrs (the asyncssh common path)."""
-    mock = MockSftp()
-    mock.dirs.update({"/tree", "/tree/sub"})
-    mock.files["/tree/a"] = b"1"
-    mock.files["/tree/b"] = b"22"
-    mock.files["/tree/sub/c"] = b"333"
-    backend = SftpFs(mock, cwd="/", home="/home/u")
-
-    # Counters reset right before rm so the assertion only counts _rmtree's
-    # work (rm itself still does 1 stat for the top-level dir kind check).
-    mock.stat_calls = 0
-    mock.readdir_calls = 0
-    result = backend.rm("/tree", recursive=True)
-
-    assert result == "/tree"
-    # Tree fully removed.
-    assert "/tree" not in mock.dirs
-    assert "/tree/sub" not in mock.dirs
-    assert all(not f.startswith("/tree/") for f in mock.files)
-    # Only the rm top-level stat — _rmtree derives kinds from readdir attrs.
-    # (The old per-child _stat path would have left this at 5: 1 + a/b/sub + c.)
-    assert mock.stat_calls == 1, (
-        f"expected 1 stat (rm top-level only), got {mock.stat_calls}"
-    )
-    # One readdir per dir level (tree + sub).
-    assert mock.readdir_calls == 2, (
-        f"expected 2 readdirs, got {mock.readdir_calls}"
-    )
+    rm = fs_ops.run("rm", ep="local", path=f"{tmp_path}/ x", home=FIXTURES)
+    assert rm.status == "ok", rm.render_text()
+    assert not (tmp_path / " x").exists()
+    assert (tmp_path / "x").read_text(encoding="utf-8") == "NEW-PLAIN"
+    assert (tmp_path / "x ").read_text(encoding="utf-8") == "TRAILING"
 
 
 # ---------------------------------------------------------------------------
@@ -1600,3 +1644,292 @@ def test_cli_fs_missing_path(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "@fs list error" in out
     assert "MISSING_ARG" in out
+
+
+def test_cli_fs_read_image_meta_only(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """CLI image read prints type/MIME/bytes, not Base64 file bytes."""
+    target = tmp_path / "pic.png"
+    target.write_bytes(_PNG)
+    code = main(["fs", "read", "--ep", "local", "--path", str(target)])
+    assert code == EXIT_OK
+    out = capsys.readouterr().out
+    assert out.startswith("@fs read ok")
+    assert "type=image" in out
+    assert "mime_type=image/png" in out
+    assert f"bytes={len(_PNG)}" in out
+    assert base64.b64encode(_PNG).decode("ascii") not in out
+
+
+def test_cli_fs_read_image_json_omits_bytes(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    target = tmp_path / "pic.png"
+    target.write_bytes(_PNG)
+    code = main(["fs", "read", "--ep", "local", "--path", str(target), "--json"])
+    assert code == EXIT_OK
+    out = capsys.readouterr().out.strip()
+    data = json.loads(out)
+    assert data["status"] == "ok"
+    assert data["type"] == "image"
+    assert data["mime_type"] == "image/png"
+    assert data["bytes"] == len(_PNG)
+    assert "image_data" not in data
+    assert "body" not in data
+    assert base64.b64encode(_PNG).decode("ascii") not in out
+
+
+# ---------------------------------------------------------------------------
+# winrm: failure rows carry machine-readable link tokens + the caller's path
+# ---------------------------------------------------------------------------
+
+try:  # pypsrp is an optional extra; the doubles below cover its absence.
+    from pypsrp import exceptions as _pypsrp_exceptions
+except Exception:  # noqa: BLE001 - importability probe
+    _pypsrp_exceptions = None
+
+
+def _pypsrp_error(qualname: str, *args: object) -> BaseException:
+    """A pypsrp exception (real when importable, else a name-matching double).
+
+    The link classifiers match on the type's own (module, qualname), so a
+    double describes a pypsrp failure exactly as the real class would.
+    """
+    if _pypsrp_exceptions is not None:
+        real = getattr(_pypsrp_exceptions, qualname, None)
+        if real is not None:
+            return real(*args)
+    return type(qualname, (Exception,), {"__module__": "pypsrp.exceptions"})(*args)
+
+
+class _RejectingLinkSession(FakePypsrpSession):
+    """pypsrp-shaped session whose live link starts refusing on demand.
+
+    Identity seeds let the endpoint open without a probe round trip; setting
+    *reject* then poisons the live session in place, the way a real link's
+    security context goes stale under an idle connection.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.os = "windows"
+        self.shell = "powershell"
+        self.ps_version = "5.1.19041"
+        self.cwd = HOME
+        self.home = HOME
+        self.reject: BaseException | None = None
+
+    def close(self) -> None:
+        self.closed = True
+
+    def execute_ps(self, script: str, *, environment: object = None) -> object:
+        if self.reject is not None:
+            raise self.reject
+        return super().execute_ps(script, environment=environment)
+
+
+class _ProbeFailingSession(FakePypsrpSession):
+    """Session that refuses the open-time identity probe (no identity seeds)."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def close(self) -> None:
+        self.closed = True
+
+    def execute_ps(self, script: str, *, environment: object = None) -> object:
+        raise self._exc
+
+
+def _session_factory(
+    exc: BaseException | None = None,
+) -> tuple[list[object], object]:
+    """Connector building a fresh session per call; returns (sessions, connector)."""
+    sessions: list[object] = []
+
+    def connector(**_kwargs: object) -> object:
+        session = (
+            _ProbeFailingSession(exc) if exc is not None else _RejectingLinkSession()
+        )
+        sessions.append(session)
+        return session
+
+    return sessions, connector
+
+
+def test_fs_winrm_link_failure_row_carries_tokens_and_destination(
+    tmp_path: Path,
+) -> None:
+    """A failed put names the caller's destination and the transport's tokens.
+
+    The row used to carry only op/ep/path and a raw pypsrp message, with the
+    path pointing at whichever node the op had reached (the parent dir the
+    mkdir_p stat touched), so an Agent could not attribute the failure to the
+    file it asked for nor tell a dead link from a remote path verdict.
+    """
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"x" * 4096)
+    sessions, connector = _session_factory()
+    dest = rf"{TEMP}\b.bin"
+
+    warm = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=rf"{TEMP}\warm.bin",
+        local=str(payload),
+        home=FIXTURES,
+        connector=connector,
+    )
+    assert warm.status == "ok", warm.render_text()
+    # A healthy row gains no link keys.
+    assert "link_lost" not in warm.fields
+    assert "reopen_hint" not in warm.fields
+    assert "node_path" not in warm.fields
+
+    assert isinstance(sessions[0], _RejectingLinkSession)
+    sessions[0].reject = _pypsrp_error("WinRMTransportError", "http", 400, "")
+    r = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=dest,
+        local=str(payload),
+        home=FIXTURES,
+        connector=connector,
+    )
+
+    assert r.status == "error", r.render_text()
+    assert r.code == "FS_ERROR"
+    assert r.fields.get("path") == dest, r.render_text()
+    assert r.fields.get("node_path") == TEMP, r.render_text()
+    assert r.fields.get("link_lost") == 1, r.render_text()
+    assert r.fields.get("marked_dead") is True, r.render_text()
+    assert r.fields.get("reopen_hint") == "endpoint close then open"
+
+    ep = get_registry().get("lab-win")
+    assert ep is not None and ep.transport is not None
+    assert ep.transport.is_connected() is False
+
+    # README contract: the fs path retires the endpoint, so the next call
+    # lazily reconnects and lands the payload.
+    r2 = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=dest,
+        local=str(payload),
+        home=FIXTURES,
+        connector=connector,
+    )
+    assert r2.status == "ok", r2.render_text()
+    assert len(sessions) == 2
+
+
+def test_fs_winrm_auth_refusal_retires_link_not_handed_back_live(
+    tmp_path: Path,
+) -> None:
+    """A WSMan-layer 401 refusal must not leave a live-looking handle.
+
+    pypsrp's AuthenticationError is not in the fs client's link-failure
+    predicate, so nothing retires the poisoned session: the transport keeps
+    reporting connected, ``endpoint open`` reconnects nothing, and every later
+    call fails identically. Core retires it from the failure the op observed.
+    """
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"x" * 4096)
+    sessions, connector = _session_factory()
+
+    warm = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=rf"{TEMP}\warm.bin",
+        local=str(payload),
+        home=FIXTURES,
+        connector=connector,
+    )
+    assert warm.status == "ok", warm.render_text()
+
+    assert isinstance(sessions[0], _RejectingLinkSession)
+    sessions[0].reject = _pypsrp_error(
+        "AuthenticationError", "Failed to authenticate the user lab with ntlm"
+    )
+    dest = rf"{TEMP}\refused.bin"
+    r = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=dest,
+        local=str(payload),
+        home=FIXTURES,
+        connector=connector,
+    )
+
+    assert r.status == "error", r.render_text()
+    assert r.fields.get("path") == dest, r.render_text()
+    assert r.fields.get("link_lost") == 1, r.render_text()
+    assert r.fields.get("reopen_hint") == "endpoint close then open"
+    ep = get_registry().get("lab-win")
+    assert ep is not None and ep.transport is not None
+    # The dead handle is not handed back as live: the remedy reconnects.
+    assert ep.transport.is_connected() is False
+
+    r2 = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=dest,
+        local=str(payload),
+        home=FIXTURES,
+        connector=connector,
+    )
+    assert r2.status == "ok", r2.render_text()
+    assert len(sessions) == 2, "refused link must be replaced, not reused"
+
+
+def test_fs_winrm_reconnect_rejection_row_is_distinguishable(
+    tmp_path: Path,
+) -> None:
+    """A refused reconnect and an unreachable host are different rows.
+
+    Both surface as NOT_CONNECTED "identity probe failed: ...". The refusal
+    carries the HTTP status tokens; an unreachable host has none, so an Agent
+    can branch (reopen vs. treat the host as down) on fields, not prose.
+    """
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"x" * 4096)
+    dest = rf"{TEMP}\x.bin"
+
+    _, refused_connector = _session_factory(_pypsrp_error("WinRMTransportError", "http", 400, ""))
+    refused = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=dest,
+        local=str(payload),
+        home=FIXTURES,
+        connector=refused_connector,
+    )
+    assert refused.status == "error", refused.render_text()
+    assert refused.code == "NOT_CONNECTED"
+    assert refused.fields.get("path") == dest
+    assert refused.fields.get("probe_failed") == 1, refused.render_text()
+    assert refused.fields.get("rejected") == 1, refused.render_text()
+    assert refused.fields.get("http_status") == 400, refused.render_text()
+
+    _, down_connector = _session_factory(
+        ConnectionError(
+            "HTTPConnectionPool(host='10.0.0.20', port=5985): Max retries "
+            "exceeded with url: /wsman"
+        )
+    )
+    down = fs_ops.run(
+        "put",
+        ep="lab-win",
+        path=dest,
+        local=str(payload),
+        home=FIXTURES,
+        connector=down_connector,
+    )
+    assert down.status == "error", down.render_text()
+    assert down.code == "NOT_CONNECTED"
+    assert down.fields.get("probe_failed") == 1, down.render_text()
+    # Nothing answered with an HTTP status: not a refusal.
+    assert "rejected" not in down.fields
+    assert "http_status" not in down.fields

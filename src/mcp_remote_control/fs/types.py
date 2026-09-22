@@ -17,7 +17,7 @@ DEFAULT_READ_MAX_BYTES: int = 1_048_576
 # Chunk size for put/get when a progress callback is active.
 DEFAULT_TRANSFER_CHUNK: int = 256 * 1024
 
-# progress(bytes_done, total_or_none) — total is None when size is unknown.
+# progress(bytes_done, total_or_none) - total is None when size is unknown.
 ProgressCallback = Callable[[int, int | None], None]
 
 
@@ -35,11 +35,11 @@ def _utf16_ascii_half_is_printable(sample: bytes, indices: list[int]) -> bool:
     """True when the non-NUL bytes at *indices* look like ASCII text.
 
     For ASCII-range UTF-16LE/BE the non-NUL half of each 16-bit unit is the
-    character byte (``0x20``–``0x7E`` printable, or ``0x09``/``0x0A``/``0x0D``
+    character byte (``0x20``-``0x7E`` printable, or ``0x09``/``0x0A``/``0x0D``
     for tab/LF/CR). NULs in that half are allowed (U+0000). If the non-NUL
-    bytes are mostly non-printable control/high bytes — e.g. a big-endian
+    bytes are mostly non-printable control/high bytes - e.g. a big-endian
     uint32 record ``b"\\x00\\x00\\x00\\x01"`` where the non-NULs are
-    ``0x01``/``0x02`` — the payload is binary, not UTF-16 text.
+    ``0x01``/``0x02`` - the payload is binary, not UTF-16 text.
     """
     if not indices:
         return True
@@ -59,8 +59,8 @@ def _utf16_ascii_half_is_printable(sample: bytes, indices: list[int]) -> bool:
 def _looks_like_utf16(data: bytes) -> tuple[bool, str]:
     """Heuristic for ASCII-range UTF-16LE/BE without a BOM.
 
-    Requires even length and that ≥80% of the high bytes in the first 64 bytes
-    are NUL — the common shape of ASCII-range UTF-16. Random binary with NULs
+    Requires even length and that >=80% of the high bytes in the first 64 bytes
+    are NUL - the common shape of ASCII-range UTF-16. Random binary with NULs
     rarely matches that alternating pattern.
 
     Alternating NULs alone are not enough: a small big-endian uint32 stream
@@ -102,12 +102,12 @@ def detect_text(data: bytes) -> tuple[bool, str | None]:
 
     Detection order:
 
-    1. BOM-prefixed UTF-16 (``FF FE`` / ``FE FF``) → encoding ``"utf-16"`` so
+    1. BOM-prefixed UTF-16 (``FF FE`` / ``FE FF``) -> encoding ``"utf-16"`` so
        ``decode("utf-16")`` picks endianness and strips the BOM.
-    2. Any interior NUL → alternating-NUL UTF-16 heuristic for no-BOM
+    2. Any interior NUL -> alternating-NUL UTF-16 heuristic for no-BOM
        ASCII-range LE/BE, plus the printable-ASCII-half guard (rejects
        NUL-dense binary with control/high non-NUL bytes).
-    3. Strict UTF-8 decode → ``"utf-8"``.
+    3. Strict UTF-8 decode -> ``"utf-8"``.
     4. Otherwise binary.
     """
     # BOM-prefixed UTF-16: report "utf-16" so decode auto-detects endianness
@@ -202,7 +202,7 @@ class WriteResult:
 
 @dataclass
 class TransferResult:
-    """Outcome of put (local→remote) or get (remote→local)."""
+    """Outcome of put (local->remote) or get (remote->local)."""
 
     path: str  # remote path (absolute preferred)
     local: str

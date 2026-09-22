@@ -2,7 +2,7 @@
 
 Agent-facing op dispatch lives in :mod:`mcp_remote_control.core.fs_ops`.
 This module only builds the backend from a connected endpoint transport
-(and optional injected clients for tests).
+(and optional injected clients).
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ def _sftp_backend(
 def _winrm_ps_caps(transport: BaseTransport) -> dict[str, Any] | None:
     """Return ``transport.meta["winrm_ps"]`` when present as a dict.
 
-    ``None`` means absent / unprobed — WinrmFs keeps legacy allow.
+    ``None`` means absent / unprobed - WinrmFs keeps legacy allow.
     """
     meta = getattr(transport, "meta", None)
     if not isinstance(meta, dict):

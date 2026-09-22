@@ -1,4 +1,4 @@
-"""Service tests: put/get progress callbacks (T16)."""
+"""Service tests for put/get transfer progress callbacks."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from mcp_remote_control.fs.types import DEFAULT_TRANSFER_CHUNK
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
-# Large enough to span multiple transfer chunks → ≥1 intermediate progress.
+# Large enough to span multiple transfer chunks -> >=1 intermediate progress.
 LARGE_SIZE = DEFAULT_TRANSFER_CHUNK + 12_345
 
 
@@ -294,6 +294,122 @@ def test_sftp_put_without_progress_still_works(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# sftp: close failure on progress put path
+# ---------------------------------------------------------------------------
+
+
+class _CloseFailProgressFile:
+    """Write handle for progress put: streams ok, close raises (FXP_CLOSE)."""
+
+    def __init__(self, store: dict[str, bytes], path: str) -> None:
+        self._store = store
+        self._path = path
+        self._buf = bytearray()
+        self.close_calls = 0
+
+    def write(self, data: bytes) -> int:
+        self._buf.extend(data)
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.close_calls += 1
+        # Commit temp so remove can observe it, then fail close.
+        self._store[self._path] = bytes(self._buf)
+        raise OSError("simulated FXP_CLOSE failure on progress put")
+
+
+class _CloseFailProgressSftp:
+    """Atomic progress put mock: open+posix_rename, close always fails."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {"/tmp/up.bin": b"original-remote"}
+        self.dirs: set[str] = {"/", "/tmp"}
+        self.removed_temps: list[str] = []
+        self.rename_calls: list[tuple[str, str]] = []
+        self.handles: list[_CloseFailProgressFile] = []
+
+    def _norm(self, path: str) -> str:
+        p = path if path.startswith("/") else "/" + path
+        while "//" in p:
+            p = p.replace("//", "/")
+        if p != "/" and p.endswith("/"):
+            p = p.rstrip("/")
+        return p or "/"
+
+    def stat(self, path: str) -> _MockAttrs:
+        path = self._norm(path)
+        if path in self.dirs:
+            return _MockAttrs(statmod.S_IFDIR | 0o755, 0, 1.0)
+        if path in self.files:
+            return _MockAttrs(statmod.S_IFREG | 0o644, len(self.files[path]), 1.0)
+        raise FileNotFoundError(path)
+
+    def lstat(self, path: str) -> _MockAttrs:
+        return self.stat(path)
+
+    def mkdir(self, path: str) -> None:
+        self.dirs.add(self._norm(path))
+
+    def open(self, path: str, mode: str = "r") -> object:
+        path = self._norm(path)
+        if "w" in mode:
+            fh = _CloseFailProgressFile(self.files, path)
+            self.handles.append(fh)
+            return fh
+        raise FileNotFoundError(path)
+
+    def posix_rename(self, src: str, dst: str) -> None:
+        src = self._norm(src)
+        dst = self._norm(dst)
+        self.rename_calls.append((src, dst))
+        if src not in self.files:
+            raise FileNotFoundError(src)
+        self.files[dst] = self.files.pop(src)
+
+    def remove(self, path: str) -> None:
+        path = self._norm(path)
+        if path in self.files:
+            del self.files[path]
+        if ".mrc-tmp-" in path:
+            self.removed_temps.append(path)
+
+
+def test_sftp_put_progress_close_failure_preserves_remote(tmp_path: Path) -> None:
+    """Progress put streaming close fail -> error, no rename, temp cleaned."""
+    mock = _CloseFailProgressSftp()
+    backend = SftpFs(mock, cwd="/tmp", home="/home/u")
+    src = tmp_path / "up.bin"
+    payload = b"S" * LARGE_SIZE
+    src.write_bytes(payload)
+    events = _events()
+
+    r = fs_ops.run(
+        "put",
+        ep="lab-ssh",
+        path="/tmp/up.bin",
+        local=str(src),
+        home=FIXTURES,
+        backend=backend,
+        progress=_cb(events),
+    )
+    assert r.status == "error"
+    assert r.code == "FS_ERROR"
+    msg = str(r.fields.get("msg") or "")
+    assert "close" in msg.lower()
+    assert mock.files.get("/tmp/up.bin") == b"original-remote"
+    assert [k for k in mock.files if ".mrc-tmp-" in k] == []
+    assert mock.rename_calls == []
+    assert mock.removed_temps
+    assert mock.handles
+    assert all(h.close_calls >= 1 for h in mock.handles)
+    # Progress may have fired for streamed chunks before close failed.
+    assert len(events) >= 1
+
+
+# ---------------------------------------------------------------------------
 # winrm mock
 # ---------------------------------------------------------------------------
 
@@ -309,7 +425,7 @@ class _MockWinAttrs:
 class MockWinrmFileClient:
     """In-memory WinRM file client with real native copy/fetch (opt-in flags)."""
 
-    # Explicit True: production-like native transfer (H3 default is False when missing).
+    # Explicit True: production-like native transfer (default is False when missing).
     has_native_copy = True
     has_native_fetch = True
 

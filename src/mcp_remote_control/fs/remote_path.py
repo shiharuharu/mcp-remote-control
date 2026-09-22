@@ -9,8 +9,13 @@ from __future__ import annotations
 
 
 def is_abs_remote(path: str) -> bool:
-    """True for POSIX absolute, drive-absolute (``C:\\``), or UNC paths."""
-    text = (path or "").strip()
+    """True for POSIX absolute, drive-absolute (``C:\\``), or UNC paths.
+
+    The string is classified as given: whitespace is part of the name, so
+    ``" /tmp"`` is relative and ``"/tmp "`` is absolute. Trimming first would
+    make two different names look like one absolute path.
+    """
+    text = path or ""
     if not text:
         return False
     if text.startswith("/"):
@@ -43,7 +48,7 @@ def remote_parent(path: str) -> str | None:
     """Parent directory of a remote path, or ``None`` at a root.
 
     UNC: ``\\\\server\\share`` is the share root (no parent). Deeper paths climb
-    toward the share root and never above it — ``\\\\server`` alone is not a
+    toward the share root and never above it - ``\\\\server`` alone is not a
     valid operable target. Drive roots (``C:`` / ``C:/`` / ``C:\\``) and
     POSIX ``/`` also return ``None``.
     """
