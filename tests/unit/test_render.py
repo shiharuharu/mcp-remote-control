@@ -1,4 +1,4 @@
-"""Unit tests for mcp_remote_control.render (T02)."""
+"""Unit tests for mcp_remote_control.render."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from mcp_remote_control.render import (
 from mcp_remote_control.render.redact import is_sensitive_key, redact_string
 
 # ---------------------------------------------------------------------------
-# Agent track — shape & kinds
+# Agent track - shape & kinds
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +176,7 @@ def test_screen_unchanged_omits_frame():
             "idle": True,
             "surface": "shell",
         },
-        # no body — unchanged path
+        # no body - unchanged path
     )
     assert text.startswith("@screen unchanged")
     assert "hash=a1b2c3d4" in text
@@ -231,6 +231,46 @@ def test_msg_with_spaces_on_meta_not_header():
     assert "| msg=permission denied for write" in text
 
 
+def test_agent_cwd_and_path_with_spaces_stay_verbatim():
+    """Absolute cwd/path with spaces must appear unchanged, not underscore-rewritten."""
+    cwd = "/home/user/My Documents"
+    path = "/tmp/My Files/a.txt"
+    text = render_agent_text(
+        "fs",
+        "ok",
+        cwd=cwd,
+        fields={"op": "stat", "ep": "local", "path": path},
+    )
+    assert f"cwd={cwd}" in text
+    assert f"path={path}" in text
+    assert "My_Documents" not in text
+    assert "My_Files" not in text
+    # Header stays one token stream; spaced paths live on | meta.
+    first = text.splitlines()[0]
+    assert first.startswith("@fs stat ok")
+    assert "My Documents" not in first
+    assert "My Files" not in first
+    assert f"| cwd={cwd}" in text
+    assert f"| path={path}" in text
+
+
+def test_agent_windows_cwd_with_spaces_stays_verbatim():
+    """Windows cwd with a space must stay verbatim (not My_Documents)."""
+    cwd = r"C:\Users\My Documents"
+    text = render_agent_text(
+        "exec",
+        "ok",
+        cwd=cwd,
+        fields={"ep": "win-lab", "exit": 0},
+    )
+    assert f"cwd={cwd}" in text
+    assert "My_Documents" not in text
+    first = text.splitlines()[0]
+    assert first.startswith("@exec ok")
+    assert "cwd=" not in first
+    assert f"| cwd={cwd}" in text
+
+
 def test_exec_error_with_code():
     text = render_agent_text(
         "exec",
@@ -264,6 +304,40 @@ def test_geometry_meta_omitted_when_fit_ok_steps_zero():
     assert "| seed=" not in text
     assert "| class=" not in text
     assert "| geom=" not in text
+
+
+def test_geometry_meta_cmd_kept_when_fit_ok_steps_zero():
+    """Healthy fit must still surface opened command."""
+    body = "line1\nline2"
+    text = render_agent_text(
+        "screen",
+        "ok",
+        fields={
+            "id": "scr_01",
+            "cols": 160,
+            "rows": 48,
+            "fit": "ok",
+            "steps": 0,
+            "seed": "160x48",
+            "class": "shell",
+            "cmd": "htop",
+        },
+        body=body,
+    )
+    assert text.startswith("@screen ok")
+    assert "cmd=htop" in text
+    assert "| geom=" in text
+    geom_line = next(ln for ln in text.splitlines() if ln.startswith("| geom="))
+    assert "cmd=htop" in geom_line
+    # Still quiet for seed/class noise on healthy fit.
+    assert "seed=" not in geom_line
+    assert "class=" not in geom_line
+    assert "| seed=" not in text
+    assert "| class=" not in text
+    assert "| fit=" not in text
+    assert "| steps=" not in text
+    # Frame/body content unchanged.
+    assert body in text
 
 
 def test_geometry_meta_merged_when_nontrivial():
@@ -358,7 +432,7 @@ def test_probe_summary_winrm_ps_tokens_on_meta_line():
     """WinRM PS Agent tokens collapse onto the probe meta line, not the header.
 
     endpoint_ops emits ps_version / lang_mode / ps_fs / ps_edition / ps_probe;
-    they must share the ``| shell=… dialect=…`` line so agents skim one row.
+    they must share the ``| shell=... dialect=...`` line so agents skim one row.
     """
     text = render_agent_text(
         "endpoint",
@@ -442,7 +516,7 @@ def test_cwd_omitted_when_not_provided():
 
 
 # ---------------------------------------------------------------------------
-# Machine track — compact JSON
+# Machine track - compact JSON
 # ---------------------------------------------------------------------------
 
 
@@ -496,8 +570,27 @@ def test_json_error_code():
     assert data["code"] == "PERMISSION_DENIED"
 
 
+def test_json_cwd_and_path_with_spaces_stay_verbatim():
+    """JSON track keeps spaced cwd/path as raw strings; compact separators stay."""
+    cwd = "/home/user/My Documents"
+    path = "/tmp/My Files/a.txt"
+    raw = render_json(
+        "fs",
+        "ok",
+        cwd=cwd,
+        fields={"op": "stat", "path": path},
+    )
+    assert "\n" not in raw
+    assert ": " not in raw
+    data = json.loads(raw)
+    assert data["cwd"] == cwd
+    assert data["path"] == path
+    assert "My_Documents" not in raw
+    assert "My_Files" not in raw
+
+
 # ---------------------------------------------------------------------------
-# Redaction — both tracks
+# Redaction - both tracks
 # ---------------------------------------------------------------------------
 
 
@@ -571,14 +664,14 @@ def test_all_kinds_render(kind: str):
 
 
 # ---------------------------------------------------------------------------
-# Redaction — quoted secrets with spaces + sensitive-key heuristics (O10)
+# Redaction - quoted secrets with spaces + sensitive-key heuristics
 # ---------------------------------------------------------------------------
 
 
 def test_redact_inline_quoted_secret_with_spaces_agent_and_json():
     """Quoted secret= with spaces must redact the full value on both tracks.
 
-    Uses ``secret=`` (not password=) — passwords are product-visible.
+    Uses ``secret=`` (not password=) - passwords are product-visible.
     """
     body = 'export secret="my secret value" && run'
     red = redact_string(body)
@@ -640,7 +733,7 @@ def test_is_sensitive_key_concatenated_no_underscore_not_redacted():
 
 
 def test_is_sensitive_key_private_key_pem():
-    """F2/M2: private_key_pem is a known secret field name (not only private_key)."""
+    """private_key_pem is a known secret field name (not only private_key)."""
     assert is_sensitive_key("private_key_pem") is True
     assert is_sensitive_key("PRIVATE_KEY_PEM") is True
     assert is_sensitive_key("ssh_private_key_pem") is True
@@ -664,7 +757,7 @@ def test_redact_private_key_pem_field_name_agent_and_json():
 
 
 def test_redact_inline_private_key_pem_assignment():
-    """Inline assign pattern redacts private_key_pem=… values."""
+    """Inline assign pattern redacts private_key_pem=... values."""
     body = 'private_key_pem="-----BEGIN FAKE-----\nabc\n-----END FAKE-----"'
     red = redact_string(body)
     assert "BEGIN FAKE" not in red
@@ -672,18 +765,16 @@ def test_redact_inline_private_key_pem_assignment():
 
 
 # ---------------------------------------------------------------------------
-# render `dead` flag on Agent track (O10)
+# render `dead` flag on Agent track
 # ---------------------------------------------------------------------------
 
 
 def test_dead_flag_emitted_on_agent_track():
     """``fields={"dead": True}`` emits a bare ``dead`` token on the Agent track.
 
-    Regression: ``flag_keys`` listed ``dead`` (so it was skipped in the
-    ordered/sorted header loops) but the flag-emission tuple omitted it →
-    the flag was silently dropped on the Agent track while the JSON track
-    kept it, diverging the two tracks. ``dead`` is added to the emission
-    tuple so the two stay in sync.
+    Flag membership and emission order both come from ``_FLAG_ORDER``. A
+    true flag omitted from that tuple is skipped in the header loops and
+    dropped from Agent output while JSON still carries the field.
     """
     text = render_agent_text(
         "screen",
@@ -709,9 +800,7 @@ def test_dead_status_with_dead_field_combo_renders():
     The two ``dead`` tokens are independent (``status`` is the OpResult
     outcome; the ``dead`` field is a boolean-ish flag the renderer emits as a
     bare token). They can co-occur (a dead endpoint surfaces ``@screen dead``
-    plus a ``dead`` flag from fields). Pin the combination so a future change
-    to either path (status vocabulary vs flag emission, now driven by the
-    single-source ``_FLAG_ORDER``) does not silently break it.
+    plus a ``dead`` flag from fields).
     """
     text = render_agent_text(
         "screen",

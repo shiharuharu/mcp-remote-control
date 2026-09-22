@@ -1,45 +1,55 @@
 """Process-local endpoint registry: open / list / close / ensure_connected.
 
-Two-tier locking lets different profiles connect concurrently while each name
-keeps at most one live transport. The MCP server runs sync tools in a thread
-pool, so concurrent open/close/exec can race.
+Two-tier locking lets profiles connect concurrently while each name keeps at
+most one live transport; sync tools run in a thread pool, so open/close/exec
+can race.
 
 Locks:
-- ``self._lock`` (RLock): guards ``_endpoints`` and ``_name_locks``. Held only
-  for short dict critical sections. Never held across ``transport.connect()``
-  or session teardown ``transport.close()`` (network IO: SSH exit/close/
-  wait_closed, WinRM ``session.close()``). Registered or stale endpoints are
-  popped under this lock, then closed outside it (still under the per-name
-  lock). Exception: a race-loser may close its *unconnected* transport under
-  the main lock — no session exists yet, so close is cheap and does no
-  network IO.
-- ``self._name_locks[name]`` (RLock, lazy): serializes same-name open / close /
-  ensure_connected, including connect and close IO. Different names use
-  different locks and proceed in parallel.
-
-Lock ordering: never hold the main RLock while acquiring a per-name lock.
-Acquire main → get-or-create the per-name lock reference → release main →
-acquire per-name → re-acquire main only for short dict ops. No path holds two
-per-name locks. Per-name locks are RLocks so ``ensure_connected`` may re-enter
-``open`` while already holding the same-name lock.
+- ``self._lock`` (RLock) guards ``_endpoints`` and ``_name_locks`` briefly, and
+  is never held across ``transport.connect()``, session teardown
+  ``transport.close()``, or a liveness probe (``is_connected`` / ``is_alive`` /
+  ``mark_dead``): probes serialize on the transport ``_op_lock`` and can wait
+  behind a long ``run_command``, stalling other registry critical sections.
+  Pop stale entries under main and close them outside it; a race-loser may
+  close its *unconnected* transport under main (no session yet, so no IO).
+- ``self._name_locks[name]`` (RLock, lazy) serializes same-name open / close /
+  ensure_connected, connect and close IO included - a name never has two live
+  transports - while different names run in parallel. Never acquire one while
+  holding the main RLock: acquire main -> get-or-create the per-name lock
+  reference -> release main -> acquire per-name -> re-acquire main only for
+  short dict ops. No path holds two per-name locks; they are RLocks, so
+  ``ensure_connected`` may re-enter ``open``.
+- **Transport ``_op_lock``** (per-instance RLock) wraps exec / sftp /
+  mark_dead / connect / close, and is what covers concurrent ``run_command``
+  after ensure returns - registry name locks do not: name locks = lifecycle
+  registration, op lock = session liveness ops.
 
 Invariants:
-- No double-live transport per name: after taking the per-name lock, open
-  re-checks under the main lock and returns any live entry already registered.
-- Pop under main lock, close outside it (under per-name lock) so a slow
-  teardown of A does not block open of B; same-name ops still serialize.
-- Per-name locks live for the registry lifetime (not popped on close) so an
-  in-flight open cannot race a new open on a freshly created lock for the same
-  name. ``reset_registry`` replaces the instance and discards all locks.
+- Per-name locks live for the registry lifetime, never popped on close, so an
+  in-flight open cannot race a new one on a lock created for the same name
+  meanwhile. ``reset_registry`` discards all locks; ``clear()`` skips per-name
+  locks and must not run while an open is in flight.
+- Popping a dead or stale transport snapshots that generation's screen/ps
+  session ids and closes them via ``close_ids`` outside the main RLock;
+  ``close_if_same`` does the same for the matched generation only, never a
+  name-wide ``close_for_endpoint`` after a new open under the same name. Plain
+  ``close`` does **not** tear down sessions - ``close_endpoint`` owns that path.
+- Dead-path cleanup must use ``close_if_same(name, handle)`` (object identity),
+  never name-only ``close(name)``: ``open`` Phase-1 may return a live
+  ``Endpoint`` under only the main RLock while a concurrent ``mark_dead`` +
+  ``ensure_connected`` retires it. ``ensure_endpoint`` likewise returns before
+  screen/ps open their PTY or runspace, so callers re-validate with
+  :meth:`holds_same` plus transport liveness before publishing the session -
+  on mismatch close the orphan handle and return ``NOT_CONNECTED``.
 
-``clear()`` does not take per-name locks (process teardown /
-``reset_registry`` only); do not call it while an open is in flight.
+Construction lives in ``connect``, probing in ``probe``; the module re-exports
+``_build_winrm_transport``, ``_resolve_password`` and ``_seed_cwd``.
 """
 
 from __future__ import annotations
 
 import logging
-import os
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -52,16 +62,33 @@ from mcp_remote_control.config import (
     load_profile,
     resolve_home,
 )
-from mcp_remote_control.endpoint.caps import format_caps, merge_caps
+from mcp_remote_control.endpoint.caps import (
+    coerce_toml_bool,
+    format_caps,
+    merge_caps,
+)
+from mcp_remote_control.endpoint.connect import (
+    _build_winrm_transport as _build_winrm_transport,
+    _first_defined as _first_defined,
+    _optional_int as _optional_int,
+    _read_secret_file_first_line as _read_secret_file_first_line,
+    _resolve_password as _resolve_password,
+    _resolve_winrm_auth_protocol as _resolve_winrm_auth_protocol,
+    _seed_cwd as _seed_cwd,
+    _ssh_known_hosts as _ssh_known_hosts,
+)
+from mcp_remote_control.endpoint.probe import (
+    _light_probe as _light_probe,
+    _resolve_open_probe_mode as _resolve_open_probe_mode,
+    _short_probe_err as _short_probe_err,
+)
 from mcp_remote_control.identity.ssh_keys import resolve_ssh_key_paths
 from mcp_remote_control.transport import (
     LocalTransport,
     SSHTransport,
     TransportError,
-    WinRMTransport,
 )
 from mcp_remote_control.transport.base import BaseTransport
-from mcp_remote_control.transport.shell_wrap import coerce_cwd_path
 from mcp_remote_control.transport.ssh import SSHConnector
 from mcp_remote_control.transport.winrm import WinRMConnector
 
@@ -89,6 +116,196 @@ class Endpoint:
     def caps_token(self) -> str:
         return format_caps(self.caps)
 
+    @property
+    def op_lock(self) -> threading.RLock | None:
+        """Transport-level serial lock, or None when no transport yet.
+
+        Registry per-name locks cover open/close/ensure only. Concurrent
+        exec/sftp/mark_dead serialize on this lock (held by the transport).
+        """
+        transport = self.transport
+        if transport is None:
+            return None
+        return transport.op_lock
+
+
+# ---------------------------------------------------------------------------
+# Refused-link classification
+# ---------------------------------------------------------------------------
+
+# pypsrp raises AuthenticationError for any HTTP 401 the WSMan endpoint returns
+# (pypsrp ``wsman.py`` ``_send_request``): the server refused a request from a
+# session that had already authenticated, so the local auth/encryption context
+# is unusable and every later call on that session is refused too. The fs
+# client's link-failure predicate (``transport/winrm_files.py``
+# ``_LINK_FAILURE_TYPES``) does not list it - it matches
+# ``WinRMTransportError``, and AuthenticationError derives from ``WinRMError``
+# instead - so the transport keeps reporting connected and ``open`` reconnects
+# nothing. Duck-typed on (module, qualname) so pypsrp need not be importable.
+_WSMAN_REFUSAL_TYPES: frozenset[tuple[str, str]] = frozenset(
+    {("pypsrp.exceptions", "AuthenticationError")}
+)
+
+# pypsrp renders a rejection's structured ("http", status, body) triple as
+# ``Bad HTTP response returned from the server. Code: 400, Content: ''`` and
+# the transport's identity probe stores only that string, so a reconnect
+# failure's HTTP status is read back from the text.
+_HTTP_STATUS_RE = re.compile(r"\bCode:\s*(\d{3})\b")
+
+
+def _is_wsman_refusal(exc: BaseException | None) -> bool:
+    """True when *exc* or a chained cause is a WSMan-layer auth refusal.
+
+    Core sees the backend's ``FsError``; the session-layer failure that
+    produced it stays reachable through ``__cause__`` / ``__context__``. The
+    walk is bounded - a hostile chain must not become an infinite loop.
+    """
+    seen = 0
+    while exc is not None and seen < 4:
+        for cls in type(exc).__mro__:
+            if (
+                getattr(cls, "__module__", None),
+                getattr(cls, "__qualname__", ""),
+            ) in _WSMAN_REFUSAL_TYPES:
+                return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
+
+
+def retire_refused_link(transport: Any, exc: BaseException | None) -> bool:
+    """Retire a link the transport's own failure bookkeeping did not notice.
+
+    Called by Core after an op failed with *exc*. True when the transport was
+    marked dead, i.e. the next op reconnects instead of reusing a session the
+    server is refusing.
+
+    The transport owns the verdict for every failure it classifies; this covers
+    the refusal it does not (see ``_WSMAN_REFUSAL_TYPES``). Retiring the link
+    is the same end state the transport's own fs link callback produces
+    (``WinRMTransport._on_fs_link_failure`` -> ``_mark_link_dead``): mark dead,
+    record the machine-readable tokens, dispose the session. Never raises -
+    a failed retirement must not replace the op's own error.
+    """
+    if transport is None or not _is_wsman_refusal(exc):
+        return False
+    # Prefer the transport's own link-death handler so the meta token contract
+    # stays defined in one place; a transport without it still gets an honest
+    # flag from the public mark_dead.
+    retire = getattr(transport, "_mark_link_dead", None)
+    try:
+        if callable(retire):
+            retire()
+        else:
+            transport.mark_dead("link lost")
+    except Exception:  # noqa: BLE001 - best-effort, caller keeps its own error
+        return False
+    return True
+
+
+def _open_failure_tokens(
+    reason: str | None, probe_meta: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Classified tokens for a failed open/reconnect, for the caller's row.
+
+    A reconnect can fail because nothing answered (unreachable host, DNS,
+    refused socket) or because something answered and *rejected* the request
+    (a gateway's own error page, a stale WinRM auth context). Both surface as
+    NOT_CONNECTED, so the classification travels as tokens an Agent can branch
+    on instead of prose: without them "the host is down" and "the request was
+    rejected - open again" are the same row.
+
+    ``rejected`` follows the 4xx rule of :func:`is_winrm_refusal`
+    (``transport/winrm_exec.py``): a 4xx means the receiver refused *this
+    request*, while a 5xx means something failed *while handling* it - the
+    request may already have been dispatched, so that class is reported as a
+    bare ``http_status`` and never as a refusal.
+    """
+    tokens: dict[str, Any] = {}
+    status = str((probe_meta or {}).get("status") or "").strip().lower()
+    if status in ("fail", "error"):
+        tokens["probe_failed"] = 1
+    match = _HTTP_STATUS_RE.search(reason or "")
+    if match:
+        http_status = int(match.group(1))
+        tokens["http_status"] = http_status
+        if 400 <= http_status < 500:
+            tokens["rejected"] = 1
+    return tokens
+
+
+# ``TransportError.details`` keys that name the *class* of a failed connect or
+# of a link the transport retired. They travel from where the refusal is
+# classified to every caller surface, so the vocabulary has to be defined once:
+# a caller that copies a subset (or a surface that copies none) silently turns
+# "the intermediary refused this request" back into an undifferentiated failure,
+# which is the ambiguity these tokens exist to remove.
+CONNECT_TOKEN_KEYS: tuple[str, ...] = ("probe_failed", "rejected", "http_status", "host")
+
+
+def connect_failure_fields(exc: TransportError) -> dict[str, Any]:
+    """Copy the classified connect/refusal tokens out of *exc* for a result row.
+
+    Every Core surface that reports a failed connect - ``endpoint open``, and
+    the lazy-connect legs of exec / ps / fs - funnels through here so a caller
+    sees the same fields regardless of which tool it used.
+    """
+    details = exc.details if isinstance(exc.details, dict) else {}
+    return {key: details[key] for key in CONNECT_TOKEN_KEYS if key in details}
+
+
+def _endpoint_transport_live(
+    ep: Endpoint, *, dead_reason: str = "stale"
+) -> bool:
+    """True when *ep* has a usable transport (same checks as ensure_connected).
+
+    Never trust ``Endpoint.connected`` alone: after ``mark_dead`` the cache
+    flag can stay True while ``transport.is_connected()`` is False. Syncs
+    ``ep.connected`` to the observed liveness so list does not stick on a
+    stale ``open=1``. When an optional ``is_alive`` probe fails, best-effort
+    ``mark_dead`` then returns False.
+
+    **Caller must NOT hold the registry main RLock.** Probes are
+    local socket/flag checks (no network RTT), but SSH/WinRM ``is_connected``
+    and this helper's dead-path ``mark_dead`` acquire the transport
+    ``_op_lock`` and can wait behind a long ``run_command``. Holding main
+    across that wait starves other names' Phase-1 open / dict ops.
+    """
+    transport = ep.transport
+    if transport is None:
+        ep.connected = False
+        return False
+    try:
+        flagged = bool(transport.is_connected())
+    except Exception:  # noqa: BLE001 - treat probe failure as dead
+        flagged = False
+    if not flagged:
+        ep.connected = False
+        return False
+    # SSH and WinRM expose is_alive beyond the connected flag.
+    # Their is_connected already includes is_alive; keep the extra probe for
+    # backends that split the two, matching ensure_connected.
+    alive_fn = getattr(transport, "is_alive", None)
+    if not callable(alive_fn):
+        ep.connected = True
+        return True
+    try:
+        if alive_fn():
+            ep.connected = True
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # mark_dead is transport-serial (op_lock). Safe only because the
+    # caller released the registry main RLock first (snapshot-then-probe).
+    try:
+        mark = getattr(transport, "mark_dead", None)
+        if callable(mark):
+            mark(dead_reason)
+    except Exception:  # noqa: BLE001
+        pass
+    ep.connected = False
+    return False
+
 
 class EndpointRegistry:
     """In-process map of open endpoints (keyed by profile name)."""
@@ -110,7 +327,7 @@ class EndpointRegistry:
 
         Caller MUST hold ``self._lock``: only the dict lookup/insert is
         guarded; the returned lock is then acquired/released by the caller
-        WITHOUT holding ``self._lock`` (see module docstring — never hold
+        WITHOUT holding ``self._lock`` (see module docstring - never hold
         the main RLock while acquiring a per-name lock).
         """
         lk = self._name_locks.get(name)
@@ -123,9 +340,73 @@ class EndpointRegistry:
         with self._lock:
             return self._endpoints.get(name)
 
-    def list_open(self) -> list[Endpoint]:
+    def holds_same(self, ep_name: str, handle: Endpoint | None) -> bool:
+        """True when *handle* is still the registered object for *ep_name*.
+
+        Generation pin for long open paths (screen/ps): after
+        ``ensure_endpoint`` returns and before session ``reg.add``, callers
+        re-check that concurrent ``close`` / reconnect did not retire this
+        generation. Does **not** probe transport liveness - use
+        :meth:`generation_still_open` or check ``is_connected`` outside the
+        main RLock.
+        """
+        if not ep_name or handle is None:
+            return False
+        name = str(ep_name).strip()
         with self._lock:
-            return [self._endpoints[k] for k in sorted(self._endpoints)]
+            return self._endpoints.get(name) is handle
+
+    def generation_still_open(self, handle: Endpoint | None) -> bool:
+        """True when *handle* is still registered and its transport is live.
+
+        Screen/ps open fence: call after PTY/runspace create and again
+        immediately before session registry ``add``. On False the caller must
+        close any orphan handle and must not publish a session for this
+        generation. Identity check under the main RLock; ``is_connected``
+        runs **outside** main.
+        """
+        if handle is None:
+            return False
+        name = str(handle.name or "").strip()
+        if not name:
+            return False
+        with self._lock:
+            if self._endpoints.get(name) is not handle:
+                return False
+        transport = handle.transport
+        if transport is None:
+            return False
+        try:
+            return bool(transport.is_connected())
+        except Exception:  # noqa: BLE001 - treat probe failure as dead
+            return False
+
+    def list_open(self) -> list[Endpoint]:
+        """Return open endpoints, syncing ``connected`` from each transport.
+
+        ``Endpoint.connected`` can lag ``mark_dead``; list refreshes the flag
+        from ``transport.is_connected()`` (local check) so callers do not
+        report a long-lived false ``open=1``.
+
+        Snapshot under the main RLock, then probe **outside** it:
+        ``is_connected`` may call ``mark_dead`` (transport ``_op_lock``) and
+        must not stall other registry critical sections for a long
+        ``run_command`` on any one endpoint.
+        """
+        with self._lock:
+            out = [self._endpoints[k] for k in sorted(self._endpoints)]
+        for ep in out:
+            # is_connected only (no separate is_alive round) - enough to
+            # clear mark_dead zombies; full open path re-probes on use.
+            transport = ep.transport
+            if transport is None:
+                ep.connected = False
+                continue
+            try:
+                ep.connected = bool(transport.is_connected())
+            except Exception:  # noqa: BLE001
+                ep.connected = False
+        return out
 
     def open(
         self,
@@ -138,27 +419,43 @@ class EndpointRegistry:
     ) -> Endpoint:
         """Load profile, connect transport, register endpoint.
 
-        Idempotent: if already open and connected (and not *force*), returns it.
+        Idempotent: if already open *and the transport is live* (and not
+        *force*), returns it. A stale ``Endpoint.connected`` flag alone is
+        not enough - same liveness path as ``ensure_connected``
+        (``is_connected`` + optional ``is_alive``); dead entries are popped
+        and reconnected under the per-name lock.
 
         Locking: brief main-RLock hold to read ``_endpoints`` and look up the
-        per-name lock, then the per-name lock is acquired (main RLock released)
-        and held across ``transport.connect()``. Different names use different
-        per-name locks → concurrent connects. Same name serializes → no
-        double-live. See module docstring.
+        per-name lock; liveness probes run **outside** main so a long
+        ``run_command`` holding another endpoint's ``_op_lock`` cannot starve
+        Phase-1. Then the per-name lock is acquired and held across
+        ``transport.connect()``. Different names use different per-name locks
+        -> concurrent connects. Same name serializes -> no double-live. See
+        module docstring.
         """
         if not profile_name or not str(profile_name).strip():
             raise ValueError("profile name is required")
 
         name = str(profile_name).strip()
-        # Phase 1: quick idempotent check + get the per-name lock reference.
-        # Main RLock held only for the dict read + lock lookup.
+        # Phase 1: snapshot dict + per-name lock ref under main RLock only.
+        # Liveness is probed OUTSIDE main: is_connected/mark_dead
+        # may wait on transport op_lock behind a long run_command.
         with self._lock:
             existing = self._endpoints.get(name)
-            if existing is not None and existing.connected and not force:
-                return existing
             name_lock = self._get_or_create_name_lock(name)
+        if existing is not None and not force:
+            if _endpoint_transport_live(
+                existing, dead_reason="stale_on_open"
+            ):
+                # Generation pin: still the registered object?
+                with self._lock:
+                    if self._endpoints.get(name) is existing:
+                        return existing
+                # Replaced while we probed - fall through under per-name lock.
+            # Zombie / mark_dead: fall through under per-name lock to
+            # pop + real reconnect (do not return early on cache flag).
         # Phase 2: serialize same-name opens (no double-live). Different names
-        # use different locks → connect concurrently. The per-name lock is
+        # use different locks -> connect concurrently. The per-name lock is
         # held across connect (network IO); the main RLock is NOT, so other
         # names keep progressing.
         with name_lock:
@@ -177,67 +474,133 @@ class EndpointRegistry:
     ) -> Endpoint:
         """Connect + register. Caller already holds the per-name lock for *name*.
 
-        The per-name lock serializes same-name opens (no double-live). The
-        main RLock guards only ``_endpoints`` (short critical sections).
-        ``connect()`` and any previously registered transport's ``close()``
-        run under the per-name lock only — not the main RLock — so different
-        profiles proceed concurrently. Stale entries are popped under the main
-        lock, then closed outside it (same pattern as ``close()``).
+        The per-name lock serializes same-name open/close/ensure (no double-live
+        registration). It does **not** skip build work for race losers: a waiter
+        that enters after a winner may still load the profile and construct a
+        transport, then discard that unconnected transport when the live
+        registered endpoint is re-checked. The main RLock guards only
+        ``_endpoints`` (short critical sections). ``connect()`` and any
+        previously registered transport's ``close()`` run under the per-name
+        lock only - not the main RLock - so different profiles proceed
+        concurrently. Stale entries are popped under the main lock, then closed
+        outside it (same pattern as ``close()``).
         """
         # Build profile + transport outside the main RLock (disk reads, object
-        # construction — no network). Inside the per-name lock so same-name
-        # callers don't duplicate work; different names build concurrently.
+        # construction - no network). Still under the per-name lock so same-
+        # name open/close/ensure are serialized; different names build
+        # concurrently. Race losers still full-build here, then discard the
+        # unconnected transport after the live winner re-check below.
         home_path = _resolve_home_arg(home)
         profile = load_profile(home_path, name)
         caps = merge_caps(profile.transport, profile.caps or None)
         transport = self._build_transport(profile, connector=connector)
 
-        # Re-check under the main RLock: another opener may have registered a
-        # live endpoint while we waited on the per-name lock. Stale / partial /
-        # force-replace entries are popped here and closed outside below.
+        # Re-check liveness OUTSIDE the main RLock, then short
+        # main-lock critical sections for identity-pinned dict ops only.
+        # Under the per-name lock no concurrent same-name open/close/ensure
+        # can replace the entry (clear() teardown is the exception). Liveness
+        # matches ensure_connected (not Endpoint.connected alone).
         stale_ep: Endpoint | None = None
         with self._lock:
             existing = self._endpoints.get(name)
-            if existing is not None and existing.connected and not force:
-                # Race loser: discard our unconnected transport (close is cheap
-                # with no session) and return the winner's endpoint. No network
-                # IO under the main RLock.
-                self._safe_close_transport_obj(transport, name)
-                return existing
-            # Pop previous partial/stale entry under the main RLock; close
-            # outside it (still under the per-name lock).
-            if existing is not None:
-                self._endpoints.pop(name, None)
-                stale_ep = existing
+        if existing is not None and not force:
+            if _endpoint_transport_live(
+                existing, dead_reason="stale_on_open"
+            ):
+                with self._lock:
+                    if self._endpoints.get(name) is existing:
+                        # Race loser against a live winner: discard our
+                        # unconnected transport (close is cheap with no
+                        # session) and return the winner.
+                        self._safe_close_transport_obj(transport, name)
+                        return existing
+                # Entry gone (e.g. clear) while probing - fall through to
+                # fresh connect.
+            else:
+                # Dead/stale: pop under main if still this generation.
+                with self._lock:
+                    if self._endpoints.get(name) is existing:
+                        self._endpoints.pop(name, None)
+                        stale_ep = existing
+        elif existing is not None:
+            # force=True: replace whatever is registered for this name.
+            with self._lock:
+                stale_ep = self._endpoints.pop(name, None)
 
-        # Close the previously-registered transport outside the main RLock
-        # (still under the per-name lock). Close is network IO; holding the
-        # main RLock across it would serialize different-name opens.
+        # Close the previously-registered transport + generation-fenced
+        # screen/ps outside the main RLock (still under the per-name lock).
+        # Close is network IO; holding the main RLock across it would
+        # serialize different-name opens. Snapshot+close_ids before reopen
+        # registers a new transport so zombie sessions cannot outlive the
+        # dead generation (same fence as close_endpoint).
         if stale_ep is not None:
-            self._safe_close_transport(stale_ep)
+            self._retire_stale_endpoint(stale_ep)
 
         # connect may raise TransportError / Profile*. Network IO under the
-        # per-name lock only — NOT the main RLock — so different profiles
+        # per-name lock only - NOT the main RLock - so different profiles
         # connect concurrently.
         transport.connect()
 
         cwd = _seed_cwd(profile, transport)
         probe_meta: dict[str, Any] | None = None
-        if probe:
+        winrm_probe_mode = _resolve_open_probe_mode(
+            profile, home_path, explicit_probe=probe
+        )
+        if profile.transport == "winrm":
+            if winrm_probe_mode == "skip":
+                # probe=False / mode=skip: historical assume-runnable; record
+                # skip so gates stay permissive and Agent sees skipped vs
+                # probed. Risk: no identity RTT (lab acceleration only).
+                probe_meta = {"ps_probe": "skipped"}
+                transport.meta["winrm_ps"] = {"ps_probe": "skipped"}
+            else:
+                # full (default) or light - collect_probe intensity via mode.
+                probe_meta = _light_probe(
+                    profile, transport, probe_mode=winrm_probe_mode
+                )
+        elif probe:
+            # Non-winrm: historical probe=bool (SSH/local).
             probe_meta = _light_probe(profile, transport)
-        elif profile.transport == "winrm":
-            # probe disabled: keep the historical assume-runnable behavior,
-            # but record the skip so downstream gates stay permissive (no
-            # ps_oneshot/ps_script_fs keys → gates allow) and the Agent can
-            # see the probe was skipped rather than probed-and-capable.
-            probe_meta = {"ps_probe": "skipped"}
-            transport.meta["winrm_ps"] = {"ps_probe": "skipped"}
+
+        # connect() may return without raising while
+        # peer-gone / probe mark_dead left is_connected False. Never insert a
+        # DOA handle - ensure_connected and direct reg.open would otherwise
+        # return a zombie (false success / list open=1). Dispose best-effort
+        # then raise before the dict insert; open_endpoint post-check remains
+        # defense-in-depth for races after a live return.
+        try:
+            live_after_open = bool(transport.is_connected())
+        except Exception:  # noqa: BLE001 - treat probe failure as dead
+            live_after_open = False
+        if not live_after_open:
+            dead_reason: str | None = None
+            t_meta = getattr(transport, "meta", None) or {}
+            if isinstance(t_meta, dict):
+                raw_dead = t_meta.get("dead_reason") or t_meta.get("probe_error")
+                if raw_dead:
+                    dead_reason = str(raw_dead)[:200]
+            if not dead_reason and isinstance(probe_meta, dict):
+                raw_probe = probe_meta.get("error") or probe_meta.get("probe_error")
+                if raw_probe:
+                    dead_reason = str(raw_probe)[:200]
+            self._safe_close_transport_obj(transport, name)
+            details: dict[str, Any] = {"profile": name}
+            if profile.host:
+                details["host"] = profile.host
+            # Probe-vs-connect and refusal class, so a caller of this open
+            # (fs/exec/ps lazy connect) can branch on fields, not on prose.
+            details.update(_open_failure_tokens(dead_reason, probe_meta))
+            raise TransportError(
+                "NOT_CONNECTED",
+                dead_reason or "transport not connected after open",
+                details=details,
+            )
 
         ep = Endpoint(
             name=name,
             transport_name=profile.transport,
             caps=caps,
-            connected=transport.is_connected(),
+            connected=True,
             profile=profile,
             transport=transport,
             cwd=cwd,
@@ -279,6 +642,50 @@ class EndpointRegistry:
             ep.connected = False
             return ep
 
+    def close_if_same(
+        self, ep_name: str, handle: Endpoint | None
+    ) -> Endpoint | None:
+        """Disconnect and remove *ep_name* only when the registered object is *handle*.
+
+        Generation fence for open dead-path cleanup. ``open``
+        Phase-1 can return a live ``Endpoint`` under only the main RLock;
+        concurrent ``mark_dead`` + ``ensure_connected`` may then pop that
+        object and register a newer generation under the same name. Callers
+        that later find their handle dead must not ``close(name)`` (name-pop
+        would kill the newer transport). Identity compare under the same
+        locking scheme as :meth:`close` closes only the matching generation.
+
+        When the pin matches, also snapshot+close that generation's screen/ps
+        sessions - same fence as ``_retire_stale_endpoint`` /
+        explicit ``close_endpoint``. Snapshot runs after the identity-pinned
+        pop under the per-name lock so only the dying generation's name-keyed
+        ids are collected; a pin miss returns None with no session teardown
+        (concurrent newer generation under the same name is left intact).
+
+        Returns the removed endpoint, or None when the name is empty, *handle*
+        is None, the name is not open, or a different generation is registered.
+        """
+        if not ep_name or handle is None:
+            return None
+        name = str(ep_name).strip()
+        with self._lock:
+            name_lock = self._get_or_create_name_lock(name)
+        with name_lock:
+            with self._lock:
+                current = self._endpoints.get(name)
+                if current is not handle:
+                    return None
+                ep = self._endpoints.pop(name, None)
+                if ep is None:
+                    return None
+            # Matched dying generation: snapshot+close_ids + transport
+            # teardown outside the main RLock (still under per-name lock so
+            # same-name open cannot re-register mid-close of this generation).
+            # Reuses _retire_stale_endpoint - never name-wide close_for_endpoint.
+            self._retire_stale_endpoint(ep)
+            ep.connected = False
+            return ep
+
     def ensure_connected(
         self,
         ep_or_profile: str,
@@ -300,44 +707,33 @@ class EndpointRegistry:
         with self._lock:
             name_lock = self._get_or_create_name_lock(name)
         with name_lock:
-            # Phase 1: liveness check + pop under the main RLock. Live
-            # endpoints return immediately; dead/stale ones are collected for
-            # close outside the main RLock (Phase 2).
+            # Phase 1: snapshot under main, probe OUTSIDE main,
+            # then identity-pinned return or pop under main. Shared helper
+            # keeps open and ensure_connected on the same is_connected /
+            # is_alive path - never wait on transport op_lock while holding
+            # the registry main RLock.
             stale_ep: Endpoint | None = None
             with self._lock:
                 existing = self._endpoints.get(name)
-                if existing is not None and existing.connected:
-                    transport = existing.transport
-                    if transport is not None and transport.is_connected():
-                        # SSH may still report connected after peer drop —
-                        # probe liveness when available.
-                        alive = getattr(transport, "is_alive", None)
-                        if callable(alive):
-                            try:
-                                if alive():
-                                    return existing
-                            except Exception:  # noqa: BLE001
-                                pass
-                            # Dead transport: mark, pop under main RLock;
-                            # close runs in Phase 2.
-                            try:
-                                mark = getattr(transport, "mark_dead", None)
-                                if callable(mark):
-                                    mark("stale_on_ensure")
-                            except Exception:  # noqa: BLE001
-                                pass
+            if existing is not None:
+                if _endpoint_transport_live(
+                    existing, dead_reason="stale_on_ensure"
+                ):
+                    with self._lock:
+                        if self._endpoints.get(name) is existing:
+                            return existing
+                    # Entry replaced/cleared while probing - fall through.
+                else:
+                    with self._lock:
+                        if self._endpoints.get(name) is existing:
                             stale_ep = existing
                             self._endpoints.pop(name, None)
-                        else:
-                            return existing
-                    else:
-                        # Flagged connected but transport says no.
-                        stale_ep = existing
-                        self._endpoints.pop(name, None)
-            # Phase 2: close dead/stale transport outside the main RLock
-            # (still under the per-name lock). Close is network IO.
+            # Phase 2: close dead/stale transport + its screen/ps outside the
+            # main RLock (still under the per-name lock). Close is network IO.
+            # Snapshot ids for this generation before reopen so zombie PTYs /
+            # runspaces cannot survive mark_dead -> ensure reconnect.
             if stale_ep is not None:
-                self._safe_close_transport(stale_ep)
+                self._retire_stale_endpoint(stale_ep)
             # Phase 3: re-open under the same per-name RLock (re-entrant).
             return self.open(
                 name,
@@ -405,10 +801,13 @@ class EndpointRegistry:
                 profile.defaults or {}
             ).get("encoding")
             text_encoding = str(encoding).strip() if encoding else None
-            force_utf8 = _truthy(
-                ssh_table.get("force_utf8_remote")
-                or ssh_table.get("force_utf8")
-                or (profile.defaults or {}).get("force_utf8_remote")
+            # First defined key wins: TOML false/0 must not fall through.
+            force_utf8 = coerce_toml_bool(
+                _first_defined(
+                    ssh_table.get("force_utf8_remote"),
+                    ssh_table.get("force_utf8"),
+                    (profile.defaults or {}).get("force_utf8_remote"),
+                )
             )
             return SSHTransport(
                 host=profile.host,
@@ -447,7 +846,7 @@ class EndpointRegistry:
         """Best-effort ``transport.close()``; never raises. Used to discard a
         freshly-built transport when another opener won the race (and to close
         a registered endpoint's transport). A swallowed failure leaks a
-        remote session invisibly — surface it at debug.
+        remote session invisibly - surface it at debug.
         """
         if transport is None:
             return
@@ -458,6 +857,85 @@ class EndpointRegistry:
                 _log.debug("transport close failed for %s: %s", name, exc)
             else:
                 _log.debug("transport close failed: %s", exc)
+
+    @staticmethod
+    def _snapshot_attached_session_ids(
+        ep_name: str,
+    ) -> tuple[list[str], list[str]]:
+        """Snapshot screen/ps session ids for *ep_name* (generation fence).
+
+        Lazy-imports core helpers so the endpoint package does not import
+        screen/ps at module load (avoids cycles with ensure_endpoint).
+        Best-effort; never raises.
+        """
+        screen_ids: list[str] = []
+        ps_ids: list[str] = []
+        try:
+            from mcp_remote_control.core.screen_ops import (
+                snapshot_endpoint_session_ids as _scr_ids,
+            )
+
+            screen_ids = list(_scr_ids(ep_name))
+        except Exception:  # noqa: BLE001
+            screen_ids = []
+        try:
+            from mcp_remote_control.core.ps_ops import (
+                snapshot_endpoint_session_ids as _ps_ids,
+            )
+
+            ps_ids = list(_ps_ids(ep_name))
+        except Exception:  # noqa: BLE001
+            ps_ids = []
+        return screen_ids, ps_ids
+
+    @staticmethod
+    def _close_attached_session_ids(
+        screen_ids: list[str],
+        ps_ids: list[str],
+    ) -> None:
+        """Close only snapshotted screen/ps ids. Best-effort; never raises.
+
+        Must run outside the registry main RLock (session close is IO).
+        Never use name-wide close_for_endpoint after a same-name reopen -
+        only the pre-reopen generation ids belong in the lists.
+        """
+        if screen_ids:
+            try:
+                from mcp_remote_control.core.screen_ops import (
+                    close_sessions_by_ids as _scr_close,
+                )
+
+                _scr_close(screen_ids)
+            except Exception:  # noqa: BLE001
+                pass
+        if ps_ids:
+            try:
+                from mcp_remote_control.core.ps_ops import (
+                    close_sessions_by_ids as _ps_close,
+                )
+
+                _ps_close(ps_ids)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _retire_stale_endpoint(self, stale_ep: Endpoint) -> None:
+        """Close a popped dead/stale endpoint's transport and its screen/ps.
+
+        Caller must have already removed *stale_ep* from ``_endpoints`` and
+        must NOT hold the main RLock. Snapshot session ids for the dying
+        generation before transport close, then ``close_ids`` only those -
+        concurrent same-name reopen sessions are not in the snapshot.
+
+        Used by reconnect pop (``open`` / ``ensure_connected``) and by
+        identity-pinned ``close_if_same`` (open dead-path). Explicit
+        ``close()`` does **not** use this path: ``close_endpoint`` owns the
+        snapshot/teardown for user-facing close so field counts
+        (screens_closed / ps_closed) stay accurate.
+        """
+        name = stale_ep.name
+        screen_ids, ps_ids = self._snapshot_attached_session_ids(name)
+        self._safe_close_transport(stale_ep)
+        self._close_attached_session_ids(screen_ids, ps_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -520,346 +998,3 @@ def _resolve_home_arg(home: Path | str | None) -> Path:
     if home is None:
         return resolve_home()
     return Path(home).expanduser().resolve()
-
-
-def _truthy(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    return text in ("1", "true", "yes", "on", "enable", "enabled")
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _build_winrm_transport(
-    profile: Profile,
-    *,
-    connector: WinRMConnector | None,
-) -> WinRMTransport:
-    """Map a WinRM profile (incl. enterprise auth) → WinRMTransport."""
-    if not profile.host or not profile.username:
-        raise TransportError(
-            "CONNECT_FAILED",
-            "winrm profile missing host or username",
-        )
-    winrm_cfg = profile.winrm or {}
-    port = profile.port or 5985
-    scheme = str(winrm_cfg.get("scheme") or "http").lower()
-    ssl = scheme in ("https", "ssl", "true", "1") or bool(
-        winrm_cfg.get("ssl", False)
-    )
-    # Port default: 5986 for https when profile port was the winrm default.
-    if profile.port is None and ssl:
-        port = 5986
-
-    auth_protocol = _resolve_winrm_auth_protocol(profile, winrm_cfg)
-
-    cert_validation = True
-    scv = winrm_cfg.get("server_cert_validation")
-    if scv is not None:
-        cert_validation = str(scv).lower() not in (
-            "ignore",
-            "false",
-            "0",
-            "no",
-        )
-    elif "cert_validation" in winrm_cfg:
-        cert_validation = bool(winrm_cfg.get("cert_validation"))
-
-    timeout_ms = 15000
-    raw_timeout = winrm_cfg.get("connect_timeout_ms")
-    if raw_timeout is not None:
-        try:
-            timeout_ms = int(raw_timeout)
-        except (TypeError, ValueError):
-            pass
-
-    encryption = str(
-        winrm_cfg.get("message_encryption")
-        or winrm_cfg.get("encryption")
-        or "auto"
-    )
-
-    operation_timeout_s = _optional_int(winrm_cfg.get("operation_timeout_s"))
-    read_timeout_s = _optional_int(winrm_cfg.get("read_timeout_s"))
-
-    password = _resolve_password(profile)
-    auth = profile.auth
-
-    # Certificate paths (string form for pypsrp); never load PEM bodies here.
-    certificate_pem: str | None = None
-    certificate_key_pem: str | None = None
-    certificate_key_password: str | None = None
-    spn: str | None = None
-    negotiate_hostname_override: str | None = None
-    negotiate_service: str | None = None
-    negotiate_delegate: bool | None = None
-    credssp_auth_mechanism: str | None = None
-    credssp_disable_tlsv1_2: bool | None = None
-    credssp_minimum_version: int | None = None
-
-    if auth is not None:
-        if auth.cert_path is not None:
-            certificate_pem = str(auth.cert_path)
-        if auth.cert_key_path is not None:
-            certificate_key_pem = str(auth.cert_key_path)
-        if auth.cert_key_password_path is not None:
-            certificate_key_password = _read_secret_file_first_line(
-                auth.cert_key_password_path
-            )
-        spn = auth.spn
-        negotiate_hostname_override = auth.negotiate_hostname_override
-        negotiate_service = auth.negotiate_service
-        negotiate_delegate = auth.negotiate_delegate
-        credssp_auth_mechanism = auth.credssp_auth_mechanism
-        credssp_disable_tlsv1_2 = auth.credssp_disable_tlsv1_2
-        credssp_minimum_version = auth.credssp_minimum_version
-
-    # Optional [winrm.credssp] table overlays profile auth fields when unset.
-    credssp_tbl = winrm_cfg.get("credssp")
-    if isinstance(credssp_tbl, dict):
-        if credssp_auth_mechanism is None and credssp_tbl.get("auth_mechanism"):
-            credssp_auth_mechanism = str(credssp_tbl.get("auth_mechanism"))
-        if credssp_disable_tlsv1_2 is None and "disable_tlsv1_2" in credssp_tbl:
-            credssp_disable_tlsv1_2 = bool(credssp_tbl.get("disable_tlsv1_2"))
-        if credssp_minimum_version is None and "minimum_version" in credssp_tbl:
-            credssp_minimum_version = _optional_int(credssp_tbl.get("minimum_version"))
-
-    return WinRMTransport(
-        host=profile.host,
-        port=int(port),
-        username=profile.username,
-        password=password,
-        auth=auth_protocol,
-        ssl=ssl,
-        cert_validation=cert_validation,
-        connect_timeout_ms=timeout_ms,
-        operation_timeout_s=operation_timeout_s,
-        read_timeout_s=read_timeout_s,
-        encryption=encryption,
-        connector=connector,
-        certificate_pem=certificate_pem,
-        certificate_key_pem=certificate_key_pem,
-        certificate_key_password=certificate_key_password,
-        spn=spn,
-        negotiate_hostname_override=negotiate_hostname_override,
-        negotiate_service=negotiate_service,
-        negotiate_delegate=negotiate_delegate,
-        credssp_auth_mechanism=credssp_auth_mechanism,
-        credssp_disable_tlsv1_2=credssp_disable_tlsv1_2,
-        credssp_minimum_version=credssp_minimum_version,
-    )
-
-
-def _resolve_winrm_auth_protocol(
-    profile: Profile, winrm_cfg: dict[str, Any]
-) -> str:
-    """Resolve pypsrp auth protocol from [winrm].auth and [auth].method."""
-    explicit = winrm_cfg.get("auth") or winrm_cfg.get("auth_method")
-    if explicit is not None and str(explicit).strip():
-        return str(explicit).strip().lower()
-
-    if profile.auth is not None:
-        method = profile.auth.method
-        if method == "password":
-            return "ntlm"
-        if method in (
-            "ntlm",
-            "basic",
-            "negotiate",
-            "kerberos",
-            "credssp",
-            "certificate",
-        ):
-            return method
-    return "ntlm"
-
-
-def _resolve_password(profile: Profile) -> str | None:
-    """Resolve password: inline first, then password_env, then password_path.
-
-    Inline profile passwords are supported (not treated as private). File/env
-    paths remain optional. Missing material surfaces as AUTH_FAILED at connect
-    when the connector needs credentials.
-    """
-    auth = profile.auth
-    if auth is None:
-        return None
-
-    if auth.password is not None and str(auth.password) != "":
-        return str(auth.password)
-
-    if auth.password_env:
-        env_name = str(auth.password_env).strip()
-        if env_name:
-            val = os.environ.get(env_name)
-            if val is not None:
-                return val
-
-    if auth.password_path is not None:
-        return _read_secret_file_first_line(auth.password_path)
-
-    return None
-
-
-def _read_secret_file_first_line(path: Path | str) -> str | None:
-    """Read first line of a secret file; never raise (defer to connect)."""
-    p = Path(path).expanduser()
-    try:
-        if p.is_file():
-            text = p.read_text(encoding="utf-8", errors="replace")
-            line = text.splitlines()[0] if text.splitlines() else text
-            return line.rstrip("\r\n")
-    except OSError:
-        return None
-    return None
-
-
-def _ssh_known_hosts(ssh_table: dict[str, Any]) -> Any:
-    """Map profile [ssh] known_hosts to asyncssh value.
-
-    - missing → None (asyncssh default / system)
-    - "none" / false / "off" → () disable checking (lab only)
-    - path string → path
-    """
-    if "known_hosts" not in ssh_table:
-        return None
-    raw = ssh_table.get("known_hosts")
-    if raw is None:
-        return None
-    if isinstance(raw, bool):
-        return () if not raw else None
-    text = str(raw).strip()
-    if not text:
-        return None
-    if text.lower() in ("none", "off", "false", "0", "disable", "disabled"):
-        return ()
-    return text
-
-
-def _seed_cwd(profile: Profile, transport: BaseTransport) -> str | None:
-    """Default cwd seed: profile defaults.cwd → transport.cwd → local getcwd.
-
-    A leading ``~`` is expanded against the LOCAL home only for the local
-    transport. For ssh/winrm, ``Path.expanduser`` would substitute the local
-    ``$HOME`` (e.g. ``/Users/shiharu``) which does not exist remotely; the
-    tilde is returned verbatim so the remote shell resolves it against the
-    remote user's home.
-    """
-    raw = None
-    if profile.defaults:
-        raw = profile.defaults.get("cwd")
-    if isinstance(raw, str) and raw.strip():
-        text = str(raw).strip()
-        if text.startswith("~"):
-            # Only expand ~ for local; remote shells resolve ~ themselves.
-            if profile.transport == "local":
-                return str(Path(text).expanduser())
-            return text
-        return text
-    # Reject bool/str(True) probe-cap bleed-through (cwd must be path-like).
-    seeded = coerce_cwd_path(transport.cwd)
-    if seeded:
-        return seeded
-    if profile.transport == "local":
-        return os.getcwd()
-    return None
-
-
-def _light_probe(profile: Profile, transport: BaseTransport) -> dict[str, Any]:
-    """Lightweight open-time probe. Failure yields partial status; never raises."""
-    data: dict[str, Any] = {
-        "status": "ok",
-        "transport": profile.transport,
-    }
-    if transport.home:
-        data["home"] = transport.home
-    if transport.cwd:
-        data["pwd"] = transport.cwd
-    if profile.transport == "local":
-        data["user"] = os.environ.get("USER") or os.environ.get("USERNAME")
-        # Local open-summary seeds (shell / uname / locale).
-        shell_path = os.environ.get("SHELL")
-        if shell_path:
-            data["shell_path"] = shell_path
-            base = shell_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-            if base:
-                data["shell_base"] = base
-        try:
-            import platform
-
-            data["uname"] = f"{platform.system()}-{platform.machine()}"
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            import locale as _locale
-
-            enc = _locale.getpreferredencoding(False) or ""
-            if enc:
-                data["text_encoding"] = enc
-        except Exception:  # noqa: BLE001
-            pass
-    if profile.host:
-        data["host"] = profile.host
-
-    # Merge transport.meta seeds when present (os / shell / ps_version / …).
-    meta = getattr(transport, "meta", None) or {}
-    for key in ("os", "shell", "ps_version", "auth", "dialect", "shell_base", "shell_path"):
-        if key in meta and meta[key] is not None:
-            data[key] = meta[key]
-
-    # Transport-specific best-effort probe (e.g. WinRM collect_probe).
-    collector = getattr(transport, "collect_probe", None)
-    if callable(collector):
-        try:
-            extra = collector() or {}
-            if isinstance(extra, dict):
-                # Keep outer status=ok unless extra marks partial/fail.
-                status = extra.pop("status", None)
-                data.update(extra)
-                if status in ("partial", "fail", "error"):
-                    data["status"] = status
-                elif "error" in data and data.get("status") == "ok":
-                    data["status"] = "partial"
-        except Exception as exc:  # noqa: BLE001 — probe must not fail open
-            data["status"] = "partial"
-            data["error"] = _short_probe_err(exc)
-
-    if meta.get("probe_status") == "partial":
-        data["status"] = "partial"
-        if meta.get("probe_error") and "error" not in data:
-            data["error"] = meta["probe_error"]
-
-    # Ensure dialect is present for screen/exec wiring.
-    if "dialect" not in data or not data.get("dialect"):
-        try:
-            from mcp_remote_control.shell.dialect import resolve_dialect
-
-            data["dialect"] = resolve_dialect(
-                shell_base=str(data.get("shell_base") or "") or None,
-                shell_path=str(data.get("shell_path") or "") or None,
-                shell_family=str(data.get("shell_family") or "") or None,
-                busybox=bool(data.get("busybox")),
-                flags=data,
-                os_name=str(data.get("os") or "") or None,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    return data
-
-
-def _short_probe_err(exc: BaseException, limit: int = 120) -> str:
-    text = " ".join(str(exc).split()) or type(exc).__name__
-    if len(text) > limit:
-        return text[: limit - 3] + "..."
-    return text

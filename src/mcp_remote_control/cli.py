@@ -60,7 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.print_help()
             return EXIT_OK
         parser.error(f"unknown command: {args.command}")
-        return EXIT_USAGE  # pragma: no cover — parser.error exits
+        return EXIT_USAGE  # pragma: no cover - parser.error exits
 
     return int(handler(args))
 

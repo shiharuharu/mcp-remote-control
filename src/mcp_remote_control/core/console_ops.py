@@ -1,6 +1,6 @@
 """Console Core ops (agent prefix ``console_``): list|open|send|views|close|sessions.
 
-Model: buffered console session — send writes the link; views queries the
+Model: buffered console session - send writes the link; views queries the
 capture buffer. Background CapturePump always fills the buffer while the
 session is open (independent of agent views/send cadence).
 """
@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import base64
 import re
+import time
 from typing import Any
 
+from mcp_remote_control.codec.text_codec import encode_for_remote
 from mcp_remote_control.core.result import OpResult
-from mcp_remote_control.serial.buffer import BufLine, LineRingBuffer
+from mcp_remote_control.serial.buffer import (
+    BufLine,
+    LineRingBuffer,
+    resolve_text_codec,
+    text_codec_known,
+)
 from mcp_remote_control.serial.handle import SerialConsole
 from mcp_remote_control.serial.ports import list_serial_consoles
 from mcp_remote_control.serial.registry import (
+    DeviceBusyError,
     SerialSession,
     get_serial_registry,
 )
@@ -30,8 +38,8 @@ VALID_OPS: frozenset[str] = frozenset(
     {"list", "open", "send", "views", "close", "sessions"}
 )
 
-# Device-name allowlist for console_open. This is a name-shape check only
-# (not a /dev scan — enumeration stays in ports.py). It prevents open() from
+# Device-name allowlist for console open. This is a name-shape check only
+# (not a /dev scan - enumeration stays in ports.py). It prevents open() from
 # attaching the capture pump to the controlling terminal (/dev/tty), a shared
 # PTY (/dev/pts/N), or other non-serial char devices that answer termios and
 # would let the pump exfiltrate or inject on the wrong byte stream.
@@ -41,23 +49,48 @@ VALID_OPS: frozenset[str] = frozenset(
 # host, and the name-shape guard already excludes the dangerous cases.
 #
 # Linux UART/USB-serial: ``/dev/tty`` + uppercase letter prefix + digits
-# (``ttyS``, ``ttyUSB``, ``ttyACM``, ``ttyAMA``, ``ttyXRUSB``, ``ttyGS``, …).
+# (``ttyS``, ``ttyUSB``, ``ttyACM``, ``ttyAMA``, ``ttyXRUSB``, ``ttyGS``, ...).
 # Anchored form rejects ``/dev/tty`` (no prefix+digits), ``/dev/pts/3``,
 # ``/dev/null``, bare ``ttyS0``, and ``/dev/ttyUSB`` (no digit). ``/`` is
 # excluded from character classes so there is no path traversal.
+#
+# Windows COM: match after ``_normalize_serial_port_name`` so agents may pass
+# ``com3`` / ``COM3`` / ``\\.\COM10`` equivalently (prefix stripped, COM
+# uppercased). Linux/macOS paths are left unchanged.
 _SERIAL_PORT_RE = re.compile(
     r"^(?:"
     r"/dev/tty[A-Z]+[0-9]+"  # Linux UART / USB-serial (any uppercase prefix)
     r"|/dev/cu\.[\w.-]+"  # macOS cu.* (USB / Bluetooth)
     r"|/dev/cua[0-9]+"  # legacy FreeBSD/Solaris callout
     r"|/dev/rfcomm[0-9]+"  # Linux Bluetooth SPP
-    r"|COM[0-9]+"  # Windows
+    r"|COM[0-9]+"  # Windows (post-normalize)
     r")$"
 )
 
+# Windows extended device path prefix (``\\.\`` -> four chars: \ \ . \).
+_WIN_DEVICE_PREFIX = "\\\\.\\"
+_WIN_COM_BARE_RE = re.compile(r"^COM[0-9]+$", re.IGNORECASE)
+
+
+def _normalize_serial_port_name(port: str) -> str:
+    """Normalize Windows COM device names for allowlist check and open.
+
+    ``\\.\\COMn`` -> ``COMn``; bare ``comN``/``ComN`` -> ``COMN``. Other paths
+    (Linux ``/dev/tty*``, macOS ``/dev/cu.*``, ...) are returned unchanged.
+    """
+    p = port.strip()
+    if p.startswith(_WIN_DEVICE_PREFIX):
+        rest = p[len(_WIN_DEVICE_PREFIX) :]
+        if _WIN_COM_BARE_RE.fullmatch(rest):
+            return rest.upper()
+        return p
+    if _WIN_COM_BARE_RE.fullmatch(p):
+        return p.upper()
+    return p
+
 
 def _is_serial_port_name(port: str) -> bool:
-    return bool(_SERIAL_PORT_RE.match(port))
+    return bool(_SERIAL_PORT_RE.match(_normalize_serial_port_name(port)))
 
 
 def _brief_pump(sess: SerialSession) -> None:
@@ -79,7 +112,7 @@ def _brief_pump(sess: SerialSession) -> None:
 
 
 def _pump_fields(sess: SerialSession) -> dict[str, Any]:
-    """Pump status for open/views/sessions — surface errors and link death.
+    """Pump status for open/views/sessions - surface errors and link death.
 
     Persistent read failure or an externally closed link can leave the pump
     looking alive while no data flows. Surface ``pump_error`` / ``link_closed``
@@ -95,6 +128,21 @@ def _pump_fields(sess: SerialSession) -> dict[str, Any]:
     if stats.get("link_closed"):
         fields["link_closed"] = 1
     return fields
+
+
+def _codec_fields(sess: SerialSession) -> dict[str, Any]:
+    """Which codec read this session's buffer text.
+
+    A non-default codec reads the same bytes as different text, so every row
+    that carries decoded console text must let a reader tell the readings
+    apart - the session id alone cannot say which codec produced the body.
+    Omitted on the historic path (utf-8) so routine rows keep their token
+    count. Mirrors the screen boundary's ``_codec_fields``.
+    """
+    codec = sess.text_encoding or sess.buffer.text_encoding
+    if codec != "utf-8":
+        return {"encoding": codec}
+    return {}
 
 
 def list_consoles(**_kwargs: Any) -> OpResult:
@@ -127,7 +175,7 @@ def list_consoles(**_kwargs: Any) -> OpResult:
             "ports": [p.to_dict() for p in ports],
         },
         body="\n".join(lines) if lines else None,
-        hint="use device= from list with console_open; do not scan /dev or drivers",
+        hint="use device= from list with console op=open; do not scan /dev or drivers",
     )
 
 
@@ -138,21 +186,31 @@ def open_console(
     baud: int | None = None,
     label: str | None = None,
     max_lines: int | None = None,
+    encoding: str | None = None,
     **_kwargs: Any,
 ) -> OpResult:
-    port = (path or device or "").strip()
+    """Open *path*/*device* and start background capture.
+
+    *encoding* is the peer console's text codec (a Python codec name such as
+    ``gb18030``) for a device that does not speak utf-8: a serial device has
+    no profile and nothing to probe, so the operator supplies it here. Unset
+    keeps the historic utf-8/replace read.
+    """
+    # Normalize Windows COM (com3 / \\.\COM10 -> COM3 / COM10) before
+    # allowlist + open so case and device-namespace forms are equivalent.
+    port = _normalize_serial_port_name(path or device or "")
     if not port:
         return OpResult(
             kind="console",
             status="error",
             code="MISSING_ARG",
             fields={"op": "open", "msg": "path/device required"},
-            hint="console_list first → console_open path=<device>",
+            hint="console op=list first \u2192 console op=open path=<device>",
         )
     # Name-shape guard: reject non-serial devices (controlling terminal,
-    # PTY, …) that would answer termios and mis-route the capture pump.
-    # console_list (ports.py) enumerates real devices; this blocks arbitrary
-    # paths from bypassing that list.
+    # PTY, ...) that would answer termios and mis-route the capture pump.
+    # console op=list (ports.py) enumerates real devices; this blocks
+    # arbitrary paths from bypassing that list.
     if not _is_serial_port_name(port):
         return OpResult(
             kind="console",
@@ -165,16 +223,38 @@ def open_console(
                     "not a serial device name; expected "
                     "/dev/tty<UPPERCASE><N> (e.g. /dev/ttyS0, /dev/ttyUSB0, "
                     "/dev/ttyXRUSB0) or /dev/cu.* or /dev/cua<N> or "
-                    "/dev/rfcomm<N> or COM<N>"
+                    "/dev/rfcomm<N> or COM<N> (case-insensitive; \\\\.\\COMn ok)"
                 ),
             },
-            hint="console_list → console_open path=<device> from that list",
+            hint="console op=list \u2192 console op=open path=<device> from that list",
         )
     reg = get_serial_registry()
+    # Per-device exclusivity: two CapturePumps on the same path would split
+    # RX. Fast-path reject before opening hardware (process-local index).
+    # Concurrent open races still hit DeviceBusyError in reg.add below.
+    existing = reg.get_by_path(port)
+    if existing is not None:
+        return OpResult(
+            kind="console",
+            status="error",
+            code="CONSOLE_IN_USE",
+            fields={
+                "op": "open",
+                "path": port,
+                "id": existing.id,
+                "msg": f"device already open as {existing.id}",
+            },
+            hint=(
+                f"use existing id={existing.id} (views/send/close); "
+                "close it before reopening this path"
+            ),
+        )
     try:
-        # Coerce numerics: bad baud/max_lines → INVALID_ARG, not a raw raise.
+        # Coerce numerics: bad baud/max_lines -> INVALID_ARG, not a raw raise.
         rate = int(baud) if baud is not None else 115200
         cap = int(max_lines) if max_lines is not None else DEFAULT_MAX_LINES
+        # exclusive=True (SerialConsole default): OS-level TTY lock on POSIX
+        # so a second process cannot open the same device either.
         console = SerialConsole(port, baudrate=rate)
     except (TypeError, ValueError) as exc:
         return OpResult(
@@ -207,7 +287,23 @@ def open_console(
             },
         )
 
-    buf = LineRingBuffer(max_lines=cap)
+    # Peer text codec for the byte->text boundary. Resolved once here, at
+    # open: unlike an endpoint a serial device has no profile and nothing to
+    # probe, so the operator supplies it, and the ring's incremental decoder
+    # is pinned for the session - a value that arrived later could not be
+    # switched in without corrupting the character in flight. Validation is
+    # this resolver's job (shared with the screen boundary): a name that is
+    # not a byte-stream decoder warns and leaves utf-8 in force, so a typo
+    # degrades the read instead of breaking the capture at its first byte.
+    peer_codec = resolve_text_codec(encoding)
+    unknown_peer_codec = (
+        f"unusable text codec {str(encoding)!r}; console views are decoded as "
+        "utf-8 (pass a Python codec name such as gb18030 in encoding=)"
+        if encoding is not None and not text_codec_known(encoding)
+        else None
+    )
+
+    buf = LineRingBuffer(max_lines=cap, text_encoding=peer_codec)
     con_id = reg.allocate_id()
     sess = SerialSession(
         id=con_id,
@@ -216,13 +312,36 @@ def open_console(
         baud=rate,
         buffer=buf,
         label=label,
+        text_encoding=peer_codec,
         meta={"max_lines": cap},
     )
-    # add() starts CapturePump — continuous RX → buffer
-    reg.add(sess)
+    # add() starts CapturePump - continuous RX -> buffer. Path exclusivity is
+    # enforced under the registry lock (closes the get_by_path->add race).
+    try:
+        reg.add(sess)
+    except DeviceBusyError as exc:
+        # Concurrent open won the path; close the unused handle so the port
+        # is not left held without a registry entry.
+        try:
+            console.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return OpResult(
+            kind="console",
+            status="error",
+            code="CONSOLE_IN_USE",
+            fields={
+                "op": "open",
+                "path": port,
+                "id": exc.existing_id,
+                "msg": f"device already open as {exc.existing_id}",
+            },
+            hint=(
+                f"use existing id={exc.existing_id} (views/send/close); "
+                "close it before reopening this path"
+            ),
+        )
     # Short settle so the first views call often sees already-pending bytes.
-    import time
-
     time.sleep(0.05)
     _brief_pump(sess)
     meta = buf.snapshot_meta()
@@ -238,10 +357,13 @@ def open_console(
         "latest_seq": meta["latest_seq"],
         "dropped_lines": meta["dropped_lines"],
     }
+    fields.update(_codec_fields(sess))
+    if unknown_peer_codec:
+        fields["warning"] = unknown_peer_codec
     fields.update(_pump_fields(sess))
     hint = (
         "background capture is on (RX always buffered). "
-        "console_send to write; console_views to observe (tail|since|contains)"
+        "console op=send to write; console op=views to observe (tail|since|contains)"
     )
     if "pump_error" in fields or "link_closed" in fields:
         hint = (
@@ -276,17 +398,31 @@ def send_console(
             fields={"op": "send", "id": sid, "msg": f"console not open: {sid}"},
         )
     if data_b64:
+        # validate=True rejects non-alphabet / truncated padding. Without it,
+        # garbage like "@@@" silently decodes to b"" and hits the empty-payload
+        # ok branch - agents then treat junk input as a successful no-op send.
         try:
-            raw = base64.b64decode(data_b64)
+            raw = base64.b64decode(data_b64, validate=True)
         except Exception as exc:  # noqa: BLE001
             return OpResult(
                 kind="console",
                 status="error",
                 code="INVALID_ARG",
                 fields={"op": "send", "msg": f"bad data_b64: {exc}"},
+                hint=(
+                    "data_b64 must be standard base64 (alphabet + padding); "
+                    "console op=send id=<id> data=... or data_b64=<b64>"
+                ),
             )
     elif data is not None:
-        raw = data.encode("utf-8", errors="replace")
+        # Literal operator text goes out in the codec this console reads with:
+        # the capture ring decodes the device with it (``encoding=``), so the
+        # peer's console reads back the same code page. A character the codec
+        # cannot represent is replaced, never raised (see
+        # ``codec.text_codec.encode_for_remote``). ``data_b64`` above is already
+        # wire bytes and is never re-encoded.
+        peer_codec = sess.text_encoding or sess.buffer.text_encoding
+        raw = encode_for_remote(data, peer_codec or "utf-8")
     else:
         return OpResult(
             kind="console",
@@ -294,15 +430,16 @@ def send_console(
             code="MISSING_ARG",
             fields={"op": "send", "msg": "data or data_b64 required"},
         )
-    # ``newline`` applies to both ``data`` and ``data_b64``.
+    # ``newline`` applies to both ``data`` and ``data_b64``. The terminator is
+    # the send verb's own control byte, not operator text: it stays a raw LF in
+    # every code page, like the screen side's submit key stays a raw CR. Only
+    # the payload follows ``peer_codec``.
     if newline and not raw.endswith(b"\n"):
         raw += b"\n"
 
-    import time
-
     # Brief pre-write yield so the background pump can drain pending RX and
     # latest_seq in the response reflects recent capture (not a post-write
-    # echo wait — write happens below).
+    # echo wait - write happens below).
     time.sleep(0.02)
     meta = sess.buffer.snapshot_meta()
     expected = len(raw)
@@ -333,7 +470,7 @@ def send_console(
             status="error",
             code="CONSOLE_CLOSED",
             fields={**base_fields, "bytes": 0, "msg": "console link is not alive"},
-            hint="reopen the console (console_close then console_open)",
+            hint="reopen the console (console op=close then console op=open)",
         )
     try:
         n = sess.console.write(raw)
@@ -456,8 +593,6 @@ def views_console(
 
     # Optional short settle so just-sent echo lands (pump is primary).
     if settle_i > 0:
-        import time
-
         time.sleep(min(0.5, settle_i / 1000.0))
         _brief_pump(sess)
 
@@ -492,7 +627,7 @@ def views_console(
     elif m == "contains":
         pat = contains or ""
         lines_out, hits_total = buf.view_contains(pat, context=context_i)
-        # contains has no synthetic partial — no cursor drop. Use
+        # contains has no synthetic partial - no cursor drop. Use
         # snapshot_meta for latest_seq (current state); cursor stays at the
         # last matched committed seq.
         latest_at_view = buf.snapshot_meta()["latest_seq"]
@@ -541,6 +676,10 @@ def views_console(
         "path": sess.path,
         "capture": "background",
     }
+    # Same codec evidence as the open row: this body was decoded by the
+    # session's pinned codec, and a reader holding only the id must be able
+    # to tell a legacy-console reading from a utf-8 one.
+    fields.update(_codec_fields(sess))
     fields.update(_pump_fields(sess))
     if truncated:
         fields["truncated"] = 1
@@ -585,7 +724,7 @@ def close_console(*, id: str | None = None, **_kwargs: Any) -> OpResult:
             code="CONSOLE_NOT_FOUND",
             fields={"op": "close", "id": sid, "msg": f"console not open: {sid}"},
         )
-    # SerialRegistry.remove does best-effort stop_capture → flush_partial →
+    # SerialRegistry.remove does best-effort stop_capture -> flush_partial ->
     # console.close and collects per-step failures on removed.close_errors
     # (empty on success; never raises). Surface them so the agent knows the
     # port may still be busy. The registry entry is gone either way, so
@@ -605,7 +744,7 @@ def close_console(*, id: str | None = None, **_kwargs: Any) -> OpResult:
             fields=fields,
             hint=(
                 "console removed but a close step failed (see close_error); "
-                "the next open may report 'device busy' — reopen or retry"
+                "the next open may report 'device busy' \u2014 reopen or retry"
             ),
         )
     return OpResult(kind="console", status="ok", fields=fields)
@@ -638,7 +777,7 @@ def list_sessions(**_kwargs: Any) -> OpResult:
 
 
 def run(op: str, **kwargs: Any) -> OpResult:
-    """Dispatch console op. Accept bare names (list|open|…) or console_* prefix."""
+    """Dispatch console op. Accept bare names (list|open|...) or console_* prefix."""
     op_norm = (op or "").strip().lower().replace("-", "_")
     if op_norm.startswith("console_"):
         op_norm = op_norm.removeprefix("console_")
@@ -651,7 +790,7 @@ def run(op: str, **kwargs: Any) -> OpResult:
                 "op": op_norm or op,
                 "msg": "unknown console op (want list|open|send|views|close|sessions)",
             },
-            hint="console_list → console_open → console_send / console_views → console_close",
+            hint="console op=list|open|send|views|close|sessions",
         )
     dispatch = {
         "list": list_consoles,

@@ -39,9 +39,16 @@ _META_KEYS: frozenset[str] = frozenset(
         "note",
         "resolved_from",
         "redacted",
-        # Free-text messages: spaces preserved on the meta line (not header).
+        # Free-text values whose spaces carry meaning: prose messages, prose
+        # failure detail, and documented machine tokens the caller matches
+        # literally. Header tokens are space-free, so folding one here would
+        # hand back a string the caller never wrote and cannot match.
         "msg",
         "message",
+        "warning",
+        "reopen_hint",
+        "pump_error",
+        "close_error",
         # Adaptive geometry open meta (grouped or omitted below).
         "fit",
         "steps",
@@ -64,10 +71,22 @@ _META_KEYS: frozenset[str] = frozenset(
     }
 )
 
-# Geometry keys merged into ``| geom=…`` or omitted when trivial.
+# Path-valued fields. A spaced path spelled with underscores names a different
+# file, so a whitespace-bearing value moves to the meta line where spaces
+# survive; a space-free value stays a header token (same line, no ``|`` line).
+# ``cwd`` shares this rule but arrives as its own argument, not a field.
+# ``cwd_arg`` is the caller-supplied cwd echoed back on the INVALID_CWD error
+# path (exec_ops); a caller retries from it, so folding it would aim the retry
+# at a directory the caller never named.
+_PATH_FIELD_KEYS: tuple[str, ...] = ("path", "local", "target", "cwd_arg")
+
+# Meta keys that keep spaces verbatim (only CR/LF are flattened).
+_PATH_META_KEYS: frozenset[str] = frozenset((*_PATH_FIELD_KEYS, "cwd"))
+
+# Geometry keys merged into ``| geom=...`` or omitted when trivial.
 _GEOM_META_KEYS: tuple[str, ...] = ("fit", "steps", "seed", "class", "cmd")
 
-# Probe summary keys merged into one ``| shell=… dialect=… ps_*=…`` line.
+# Probe summary keys merged into one ``| shell=... dialect=... ps_*=...`` line.
 _PROBE_META_KEYS: tuple[str, ...] = (
     "shell",
     "dialect",
@@ -117,7 +136,7 @@ _HEADER_ORDER: tuple[str, ...] = (
     "via",
 )
 
-# Boolean-ish flags rendered as bare tokens when true (``idle``, ``busy``, …).
+# Boolean-ish flags render as bare tokens when true (``idle``, ``busy``, ...).
 # Single source of truth: the tuple fixes emission order on the status line
 # and the derived set drives membership checks. Add a flag only here so both
 # stay in sync (a set-only entry would be silently dropped from Agent output).
@@ -152,6 +171,7 @@ def _format_scalar(value: Any) -> str:
     s = str(value)
     # Header tokens must be space-free so the status line stays one token stream.
     # Free-text msg/message is routed to the meta line (spaces preserved there).
+    # cwd/path with whitespace are also routed to | meta (not rewritten here).
     if " " in s or "\n" in s or "\t" in s:
         s = " ".join(s.split())
         s = s.replace(" ", "_")
@@ -171,6 +191,45 @@ def _format_meta_value(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return ",".join(_format_meta_value(v) for v in value)
     return " ".join(str(value).split())
+
+
+def _header_would_rewrite(value: Any) -> bool:
+    """True when ``_format_scalar`` would collapse or underscore the value."""
+    s = str(value)
+    return " " in s or "\n" in s or "\t" in s
+
+
+def _format_path_meta(value: Any) -> str:
+    """Emit cwd/path on a meta line: keep spaces, flatten CR/LF only."""
+    if value is None:
+        return ""
+    s = str(value)
+    if "\n" in s or "\r" in s:
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        s = " ".join(s.split("\n"))
+    return s
+
+
+def _route_spaced_paths(
+    header: dict[str, Any],
+    meta: dict[str, Any],
+    cwd: str | None,
+) -> str | None:
+    """Move whitespace-bearing path values onto | meta so they stay verbatim.
+
+    Header tokens are space-free, and ``_format_scalar`` makes them so by
+    underscoring whitespace - which invents a filesystem path that does not
+    exist. Each entry of ``_PATH_FIELD_KEYS`` is routed only when the value
+    would be rewritten, so the common space-free case keeps costing one token.
+    """
+    for key in _PATH_FIELD_KEYS:
+        val = header.get(key)
+        if val is not None and _header_would_rewrite(val):
+            meta.setdefault(key, header.pop(key))
+    if cwd is not None and _header_would_rewrite(cwd):
+        meta.setdefault("cwd", cwd)
+        return None
+    return cwd
 
 
 def _format_cur(cur: Any) -> str | None:
@@ -224,10 +283,11 @@ def _dedupe_screen_id(header: dict[str, Any]) -> None:
 
 
 def _collapse_geometry_meta(meta: dict[str, Any]) -> None:
-    """Omit trivial geometry meta, else merge into one ``| geom=…`` line.
+    """Omit trivial geometry meta, else merge into one ``| geom=...`` line.
 
-    When ``fit=ok`` and ``steps`` is 0/None, drop fit/steps/seed/class/cmd
-    (common healthy shell open). Non-trivial cases become::
+    When ``fit=ok`` and ``steps`` is 0/None, drop fit/steps/seed/class
+    (common healthy shell open) but keep a non-empty ``cmd`` so agents see
+    the opened command. Non-trivial cases become::
 
         | geom=ok steps=1 seed=100x30 class=tui
     """
@@ -249,7 +309,9 @@ def _collapse_geometry_meta(meta: dict[str, Any]) -> None:
     fit_s = str(fit).strip().lower() if fit is not None else ""
     trivial_ok = fit_s in ("ok", "") and (steps_n is None or steps_n == 0)
     if trivial_ok and fit_s == "ok":
-        # Healthy open: seed/class are noise for agents.
+        # Healthy open: seed/class are noise for agents; keep cmd visible.
+        if cmd is not None and str(cmd) != "":
+            meta["geom"] = f"cmd={_format_meta_value(cmd)}"
         return
     if trivial_ok and fit_s == "" and steps_n in (None, 0):
         if seed is None and cmd_class is None and cmd is None:
@@ -344,7 +406,7 @@ def _build_status_tokens(
 ) -> list[str]:
     tokens: list[str] = [f"@{kind}"]
 
-    # fs embeds op between kind and status: `@fs put ok …`
+    # fs embeds op between kind and status: `@fs put ok ...`
     op = header.get("op")
     if kind == "fs" and op is not None:
         tokens.append(_format_scalar(op))
@@ -416,10 +478,10 @@ def render_agent_text(
 
     Layout::
 
-        @<kind> <status> <tokens…>          # status header (required)
+        @<kind> <status> <tokens...>          # status header (required)
         | <meta>                            # optional meta lines
                                             # blank line only when body present
-        <body>                              # optional body (stdout/frame/…)
+        <body>                              # optional body (stdout/frame/...)
         @hint <text>                        # optional trailing hint
     """
     kind = kind.strip().lower()
@@ -428,6 +490,7 @@ def render_agent_text(
     cwd, code, fields, body, hint = _redact_inputs(cwd, code, fields, body, hint)
 
     header, meta = _split_fields(fields)
+    cwd = _route_spaced_paths(header, meta, cwd)
     _dedupe_screen_id(header)
     _collapse_geometry_meta(meta)
     probe_tokens = _collapse_probe_meta(meta)
@@ -447,17 +510,20 @@ def render_agent_text(
             continue
         if is_sensitive_key(mk):
             head_lines.append(f"| {mk}={REDACTED}")
-        else:
-            # Meta may contain spaces (msg, cursor_line, geom payload).
-            if isinstance(mv, str):
-                text = _format_meta_value(redact_string(mv))
-            else:
-                text = _format_meta_value(mv)
-            head_lines.append(f"| {mk}={text}")
+            continue
+        raw = redact_string(mv) if isinstance(mv, str) else mv
+        # Path fields keep spaces (a rewritten path is a different path).
+        # Other meta may contain spaces (msg, cursor_line, geom payload).
+        text = (
+            _format_path_meta(raw)
+            if mk in _PATH_META_KEYS
+            else _format_meta_value(raw)
+        )
+        head_lines.append(f"| {mk}={text}")
 
     parts: list[str] = ["\n".join(head_lines)]
 
-    # Blank-line separator only when a body is present (empty body → no gap).
+    # Blank-line separator only when a body is present (empty body -> no gap).
     if body is not None and body != "":
         parts.append(body.rstrip("\n"))
 

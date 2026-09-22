@@ -1,4 +1,4 @@
-"""``mcp-remote-control-cli selftest`` — offline smoke checks (no network).
+"""``mcp-remote-control-cli selftest`` - offline smoke checks (no network).
 
 Exercises render roundtrip and config fixture load so a checkout can prove
 basic health without transports or a live MCP host.
@@ -53,7 +53,7 @@ class SelftestReport:
 def locate_package_fixture_home() -> Path | None:
     """Locate ``tests/fixtures/config`` relative to a source/editable checkout.
 
-    From this file under ``…/src/mcp_remote_control/cli_cmds/``, the package
+    From this file under ``.../src/mcp_remote_control/cli_cmds/``, the package
     root is three parents up; also walks ancestors for non-src layouts.
     """
     here = Path(__file__).resolve()
@@ -206,15 +206,36 @@ def format_report(report: SelftestReport) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_report_json(report: SelftestReport) -> str:
+    """Compact machine-track JSON for ``--json selftest`` (no indent)."""
+    payload: dict[str, Any] = {
+        "kind": "selftest",
+        "status": "ok" if report.ok else "fail",
+        "steps": [
+            {
+                "name": s.name,
+                "ok": s.ok,
+                "detail": s.detail,
+            }
+            for s in report.steps
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
 def cmd_selftest(
     *,
     env: Mapping[str, str] | None = None,
+    as_json: bool = False,
     stdout: TextIO | None = None,
 ) -> int:
     """CLI entry for ``mcp-remote-control-cli selftest``. Returns exit code."""
     out = stdout if stdout is not None else sys.stdout
     report = run_selftest(env=env)
-    out.write(format_report(report))
+    if as_json:
+        out.write(format_report_json(report))
+    else:
+        out.write(format_report(report))
     return report.exit_code()
 
 
@@ -223,8 +244,15 @@ def add_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "selftest",
         help="offline smoke: render roundtrip + config fixture load",
     )
+    # SUPPRESS so local --json does not overwrite a parent ``--json`` already True.
+    p.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="print compact machine-track JSON instead of human lines",
+    )
     p.set_defaults(_handler=_handle_selftest)
 
 
-def _handle_selftest(_args: argparse.Namespace) -> int:
-    return cmd_selftest()
+def _handle_selftest(args: argparse.Namespace) -> int:
+    return cmd_selftest(as_json=bool(getattr(args, "json", False)))

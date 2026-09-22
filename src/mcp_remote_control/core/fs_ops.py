@@ -15,9 +15,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp_remote_control.config import ProfileInvalid, ProfileNotFound, resolve_home
-from mcp_remote_control.core.result import OpResult
-from mcp_remote_control.endpoint.registry import ensure_endpoint
+from mcp_remote_control.config import ProfileInvalid, ProfileNotFound
+from mcp_remote_control.core.result import OpResult, _home, _short
+from mcp_remote_control.endpoint.registry import (
+    connect_failure_fields,
+    ensure_endpoint,
+    retire_refused_link,
+)
 from mcp_remote_control.fs.service import backend_for_endpoint
 from mcp_remote_control.fs.types import (
     FsBackend,
@@ -30,6 +34,7 @@ from mcp_remote_control.fs.types import (
     WriteResult,
 )
 from mcp_remote_control.transport import TransportError
+from mcp_remote_control.transport.base import BaseTransport
 from mcp_remote_control.transport.ssh import SSHConnector
 
 VALID_OPS: frozenset[str] = frozenset(
@@ -37,6 +42,17 @@ VALID_OPS: frozenset[str] = frozenset(
 )
 
 __all__ = ["VALID_OPS", "run"]
+
+# Stable reopen guidance token, same text the exec/ps rows carry: an fs link
+# failure is retired, not replayed (README:454), so the only remedy is a reopen.
+_REOPEN_HINT = "endpoint close then open"
+
+# Transport dead_reason for a lost link (``WinRMTransport._mark_link_dead``).
+_LINK_LOST_REASON = "link lost"
+
+# Field carrying the backend's own node path when it differs from the caller's
+# (see ``_node_path_field``).
+_NODE_PATH_FIELD = "node_path"
 
 
 def run(
@@ -91,6 +107,28 @@ def run(
                 hint="pass ep=<profile> (lazy connect)",
             )
         ep_name = str(ep).strip()
+    else:
+        ep_name = str(ep).strip() if ep else None
+
+    # Path/content/local do not depend on the remote. Reject before lazy
+    # connect so a connect fault cannot mask a missing argument.
+    arg_err = _validate_args(
+        op_norm,
+        path=path,
+        content=content,
+        local=local,
+        ep=ep_name,
+    )
+    if arg_err is not None:
+        return arg_err
+
+    # Set on the lazy-connect path; the failure rows read its recorded link
+    # state. Stays None when a backend is injected (no endpoint in play).
+    transport: BaseTransport | None = None
+
+    if backend is None:
+        # ep was required and stripped non-empty in the connect path above.
+        assert ep_name is not None
         home_path = _home(home)
         try:
             endpoint = ensure_endpoint(
@@ -115,12 +153,18 @@ def run(
                 path=path,
             )
         except TransportError as exc:
+            # A failed lazy connect is either "nothing answered" or "something
+            # answered and rejected the request". The registry classifies it
+            # (``_open_failure_tokens``); mirror those tokens so an Agent can
+            # tell a refused reconnect from an unreachable host without
+            # parsing the prose.
             return _err(
                 op_norm,
                 exc.code or "CONNECT_FAILED",
                 exc.msg,
                 ep=ep_name,
                 path=path,
+                extra=_connect_failure_fields(exc),
             )
         except Exception as exc:  # noqa: BLE001
             return _err(
@@ -143,12 +187,18 @@ def run(
 
         transport = endpoint.transport
         if transport is None or not transport.is_connected():
+            # The recorded death cause beats the generic text (ps
+            # ``_dead_transport_msg``): it names why the link is gone and
+            # matches the dead_reason= token endpoint list/open report. The
+            # link tokens keep "retired by a link failure" distinguishable
+            # from "never opened".
             return _err(
                 op_norm,
                 "NOT_CONNECTED",
-                "endpoint transport not connected",
+                _dead_transport_msg(transport),
                 ep=ep_name,
                 path=path,
+                extra=_dead_link_fields(transport),
             )
 
         try:
@@ -164,21 +214,11 @@ def run(
                 exc.msg,
                 ep=ep_name,
                 path=path,
+                extra=_dead_link_fields(transport),
             )
         cwd = endpoint.cwd or transport.cwd
     else:
-        ep_name = str(ep).strip() if ep else None
         cwd = getattr(backend, "_cwd", None)
-
-    arg_err = _validate_args(
-        op_norm,
-        path=path,
-        content=content,
-        local=local,
-        ep=ep_name,
-    )
-    if arg_err is not None:
-        return arg_err
 
     t0 = time.monotonic()
     try:
@@ -193,6 +233,10 @@ def run(
             progress=progress,
         )
     except FsError as exc:
+        # A refused link (e.g. a WSMan 401 from an authenticated session) is a
+        # dead endpoint, not a remote path verdict: retire it here so the next
+        # call reconnects instead of handing back the same refused session.
+        retire_refused_link(transport, exc)
         hint = None
         if exc.code == "UNSUPPORTED":
             hint = (
@@ -204,11 +248,17 @@ def run(
             exc.code,
             exc.msg,
             ep=ep_name,
-            path=exc.details.get("path") or path,
+            # The caller's path is what the failure is attributed to; the node
+            # the op happened to be at (a put's parent dir, a temp file) is
+            # kept beside it instead of replacing it. Only an omitted or empty
+            # caller path defers to the node.
+            path=path if not _omitted_or_empty(path) else exc.details.get("path"),
             cwd=cwd,
             hint=hint,
+            extra=_dead_link_fields(transport) | _node_path_field(exc, path),
         )
     except TransportError as exc:
+        retire_refused_link(transport, exc)
         return _err(
             op_norm,
             exc.code or "FS_ERROR",
@@ -216,8 +266,11 @@ def run(
             ep=ep_name,
             path=path,
             cwd=cwd,
+            extra=_dead_link_fields(transport),
         )
     except Exception as exc:  # noqa: BLE001
+        # Not a link verdict by itself: the transport decides, and only a
+        # recorded death raises the tokens (a remote script failure must not).
         return _err(
             op_norm,
             "FS_ERROR",
@@ -225,6 +278,7 @@ def run(
             ep=ep_name,
             path=path,
             cwd=cwd,
+            extra=_dead_link_fields(transport),
         )
     ms = int((time.monotonic() - t0) * 1000)
 
@@ -239,6 +293,16 @@ def run(
     )
 
 
+def _omitted_or_empty(value: str | None) -> bool:
+    """True only for a value that was omitted or is the empty string.
+
+    Whitespace is part of a name: a whitespace-only path is the caller's own
+    string, resolved (or refused) by the backend that owns the name, never
+    dropped by a ``strip`` on the way there.
+    """
+    return value is None or not str(value)
+
+
 def _validate_args(
     op: str,
     *,
@@ -248,7 +312,10 @@ def _validate_args(
     ep: str | None,
 ) -> OpResult | None:
     needs_path = op in {"list", "stat", "read", "write", "put", "get", "mkdir", "rm"}
-    if needs_path and (path is None or not str(path).strip()):
+    # Only omission and the empty string are a missing argument: whitespace is
+    # part of a name, so a whitespace-only path is the backend's to resolve
+    # (its own empty check is the last word on what a path may be).
+    if needs_path and _omitted_or_empty(path):
         # put: path is remote destination; get: path is remote source.
         return _err(
             op,
@@ -308,7 +375,25 @@ def _dispatch(
         return backend.mkdir(path, parents=True)
     if op == "rm":
         return backend.rm(path, recursive=recursive)
-    raise FsError("INVALID_OP", f"unknown fs op: {op}")
+    # Single gate: run() rejects unknown ops via VALID_OPS before _dispatch.
+    raise AssertionError(f"unhandled fs op after VALID_OPS gate: {op!r}")
+
+
+def _image_mime(data: bytes) -> str | None:
+    """Return PNG/JPEG/GIF/WebP MIME from magic bytes, else None.
+
+    Header match only; the payload is not decoded. Extension is ignored so a
+    ``.png`` name is not enough and a header without a suffix still matches.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _ok_result(
@@ -325,6 +410,7 @@ def _ok_result(
     if ep is not None:
         fields["ep"] = ep
     body: str | None = None
+    image_data: bytes | None = None
     out_cwd = cwd
     path_abs: str | None = None
 
@@ -350,25 +436,49 @@ def _ok_result(
         path_abs = result.path
         fields["path"] = path_abs
         fields["bytes"] = len(result.data)
-        if result.truncated:
-            fields["truncated"] = True
-        if result.is_text:
-            fields["type"] = "text"
-            text = result.data.decode(result.encoding or "utf-8", errors="replace")
-            if text:
-                fields["lines"] = text.count("\n") + (0 if text.endswith("\n") else 1)
-            else:
-                fields["lines"] = 0
-            body = text
-            if result.encoding:
-                fields["encoding"] = result.encoding
+        mime = _image_mime(result.data)
+        if mime is not None:
+            # Identified images that hit the read budget are an error, not a
+            # partial image. Construct the row here: this helper is outside
+            # run()'s FsError catch and must not raise.
+            if result.truncated:
+                return _err(
+                    op,
+                    "READ_LIMIT_EXCEEDED",
+                    "image exceeds read budget; increase max_bytes",
+                    ep=ep,
+                    path=path_abs,
+                    cwd=cwd,
+                    hint="increase max_bytes to read the full image",
+                    extra={
+                        "bytes": len(result.data),
+                        "truncated": True,
+                        "mime_type": mime,
+                    },
+                )
+            fields["type"] = "image"
+            fields["mime_type"] = mime
+            image_data = result.data
         else:
-            fields["type"] = "binary"
-            digest = hashlib.sha256(result.data).hexdigest()[:12]
-            fields["sha256"] = digest
-            body = None
-            # Binary content is omitted from the agent body (sha256 only).
-            fields["note"] = "content omitted; binary or non-utf8"
+            if result.truncated:
+                fields["truncated"] = True
+            if result.is_text:
+                fields["type"] = "text"
+                text = result.data.decode(result.encoding or "utf-8", errors="replace")
+                if text:
+                    fields["lines"] = text.count("\n") + (0 if text.endswith("\n") else 1)
+                else:
+                    fields["lines"] = 0
+                body = text
+                if result.encoding:
+                    fields["encoding"] = result.encoding
+            else:
+                fields["type"] = "binary"
+                digest = hashlib.sha256(result.data).hexdigest()[:12]
+                fields["sha256"] = digest
+                body = None
+                # Binary content is omitted from the agent body (sha256 only).
+                fields["note"] = "content omitted; binary or non-utf8"
     elif op == "write" and isinstance(result, WriteResult):
         path_abs = result.path
         fields["path"] = path_abs
@@ -408,6 +518,7 @@ def _ok_result(
         cwd=out_cwd if out_cwd else None,
         fields=fields,
         body=body,
+        image_data=image_data,
     )
 
 
@@ -419,6 +530,79 @@ def _format_list_body(result: ListResult) -> str:
         size = e.size
         lines.append(f"{e.kind} mode={mode} size={size} {e.name}")
     return "\n".join(lines)
+
+
+def _dead_link_fields(transport: BaseTransport | None) -> dict[str, Any]:
+    """Link-death tokens for a failed fs row, or ``{}``.
+
+    The transport owns the verdict (it marks the link dead and records why);
+    Core only mirrors the tokens so an Agent branches on fields instead of
+    parsing pypsrp's English - the same contract ps rows carry
+    (``ps_ops._link_lost_fields``). A healthy transport and an ordinary remote
+    error gain no key.
+    """
+    meta = getattr(transport, "meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    link_lost = meta.get("link_lost") is True or (
+        str(meta.get("dead_reason") or "").strip() == _LINK_LOST_REASON
+    )
+    if not link_lost:
+        return {}
+    out: dict[str, Any] = {"link_lost": 1}
+    if meta.get("marked_dead") is True:
+        out["marked_dead"] = True
+    reopen_hint = meta.get("reopen_hint")
+    out["reopen_hint"] = (
+        str(reopen_hint).strip()
+        if reopen_hint and str(reopen_hint).strip()
+        else _REOPEN_HINT
+    )
+    return out
+
+
+def _node_path_field(exc: FsError, path: str | None) -> dict[str, Any]:
+    """``node_path`` when the backend failed at a node other than the caller's.
+
+    A multi-round-trip op fails at whichever node it had reached - a put's
+    parent-dir stat inside ``mkdir_p``, a temp file, a resolved link. Without
+    this the row's ``path`` (the caller's destination/source) is the only
+    attribution an Agent gets, and a failed ``put`` could not even be tied to
+    the file it was asked to write. The comparison is exact: spellings that
+    differ only in whitespace are different names, so the node is reported
+    rather than folded into the caller's string.
+    """
+    node = exc.details.get("path")
+    if node is None or not str(node).strip():
+        return {}
+    node_text = str(node)
+    if path is not None and str(path) == node_text:
+        return {}
+    return {_NODE_PATH_FIELD: node_text}
+
+
+def _connect_failure_fields(exc: TransportError) -> dict[str, Any]:
+    """Classified connect-failure tokens from a lazy-connect ``TransportError``.
+
+    Delegates to the registry so the fs row's vocabulary stays in step with
+    every other surface that reports the same failure.
+    """
+    return connect_failure_fields(exc)
+
+
+def _dead_transport_msg(transport: BaseTransport | None) -> str:
+    """``msg`` for an op pre-checked against an already-dead transport.
+
+    Prefer the transport's own recorded reason ("link lost", "peer_reset", ...)
+    over generic text: it names why the link is gone and matches the
+    ``dead_reason=`` token endpoint list/open report (ps ``_dead_transport_msg``).
+    """
+    meta = getattr(transport, "meta", None)
+    if isinstance(meta, dict):
+        reason = meta.get("dead_reason")
+        if reason is not None and str(reason).strip():
+            return _short(str(reason))
+    return "endpoint transport not connected"
 
 
 def _err(
@@ -435,7 +619,7 @@ def _err(
     fields: dict[str, Any] = {"op": op, "msg": msg}
     if ep is not None:
         fields["ep"] = ep
-    if path is not None and str(path).strip():
+    if not _omitted_or_empty(path):
         fields["path"] = path
     if extra:
         fields.update(extra)
@@ -449,14 +633,3 @@ def _err(
     )
 
 
-def _home(home: Path | str | None) -> Path:
-    if home is None:
-        return resolve_home()
-    return Path(home).expanduser().resolve()
-
-
-def _short(msg: str, limit: int = 200) -> str:
-    text = " ".join(str(msg).split())
-    if len(text) > limit:
-        return text[: limit - 3] + "..."
-    return text

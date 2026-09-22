@@ -1,13 +1,14 @@
 """CLI shells isomorphic to the MCP tools.
 
 Subcommands: ``endpoint|exec|fs|screen|ps|console|config``. Each path is
-parse argv → Core op → render (Agent text or ``--json``). No business logic
+parse argv -> Core op -> render (Agent text or ``--json``). No business logic
 beyond argument shaping lives here.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from typing import Any, TextIO
 
@@ -52,9 +53,28 @@ def _exit_for(result: OpResult) -> int:
     return EXIT_VALIDATION
 
 
+def _write_text(stdout: TextIO, text: str) -> None:
+    """Write *text*, degrading to escapes when *stdout* cannot encode it.
+
+    Text decoded from a peer console carries CJK whenever the device speaks a
+    non-utf-8 codec, so an ASCII-only stdout (``PYTHONIOENCODING=ascii``, a
+    C-locale pipe) must degrade the body instead of killing the command with a
+    traceback. Escapes keep the codepoints an agent reader needs; the strict
+    write raises before emitting anything, so the escaped text replaces it
+    rather than appending to a partial line.
+    """
+    try:
+        stdout.write(text)
+    except UnicodeEncodeError:
+        enc = getattr(stdout, "encoding", None) or "utf-8"
+        stdout.write(
+            text.encode(enc, errors="backslashreplace").decode(enc, errors="replace")
+        )
+
+
 def _emit(result: OpResult, args: argparse.Namespace, stdout: TextIO) -> int:
     text = render_result(result, as_json=_want_json(args))
-    stdout.write(text)
+    _write_text(stdout, text)
     if not text.endswith("\n"):
         stdout.write("\n")
     return _exit_for(result)
@@ -164,6 +184,14 @@ def add_console_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         default=None,
         help="capture buffer lines (default 99999)",
     )
+    p_open.add_argument(
+        "--encoding",
+        default=None,
+        help=(
+            "peer console text codec (Python codec name, e.g. gb18030) for a "
+            "console that is not UTF-8; unknown names warn and read UTF-8"
+        ),
+    )
     p_open.add_argument("--label", default=None)
     p_open.set_defaults(_handler=_handle_console, console_op="open")
 
@@ -181,7 +209,7 @@ def add_console_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     p_views = sub.add_parser(
         "views",
-        help="query capture buffer (tail|since|contains) — not raw driver recv",
+        help="query capture buffer (tail|since|contains) \u2014 not raw driver recv",
     )
     _add_json_flag(p_views)
     p_views.add_argument("--id", required=True)
@@ -194,8 +222,19 @@ def add_console_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     p_views.add_argument("--since", type=int, default=None, help="seq exclusive")
     p_views.add_argument("--contains", default=None, help="substring filter")
     p_views.add_argument("--context", type=int, default=3)
-    p_views.add_argument("--settle-ms", type=int, default=50)
+    p_views.add_argument(
+        "--settle-ms",
+        type=int,
+        default=None,
+        help="ms to wait before reading the capture buffer (omit = 0)",
+    )
     p_views.add_argument("--with-seq", action="store_true")
+    p_views.add_argument(
+        "--max-lines",
+        type=int,
+        default=None,
+        help="views body hard cap (default 2000; raise for large buffers)",
+    )
     p_views.set_defaults(_handler=_handle_console, console_op="views")
 
     p_close = sub.add_parser("close", help="close open console")
@@ -229,6 +268,7 @@ def _handle_console(args: argparse.Namespace) -> int:
         path=getattr(args, "path", None),
         baud=getattr(args, "baud", None),
         max_lines=getattr(args, "max_lines", None),
+        encoding=getattr(args, "encoding", None),
         label=getattr(args, "label", None),
         id=getattr(args, "id", None),
         data=getattr(args, "data", None),
@@ -239,7 +279,8 @@ def _handle_console(args: argparse.Namespace) -> int:
         since=getattr(args, "since", None),
         contains=getattr(args, "contains", None),
         context=getattr(args, "context", None),
-        settle_ms=getattr(args, "settle_ms", 50),
+        # omit/None: Core treats settle as 0 (same as MCP).
+        settle_ms=getattr(args, "settle_ms", None),
         with_seq=bool(getattr(args, "with_seq", False)),
     )
     return _emit(result, args, sys.stdout)
@@ -253,7 +294,10 @@ def _handle_console(args: argparse.Namespace) -> int:
 def add_exec_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     p = subparsers.add_parser(
         "exec",
-        help="remote non-interactive exec (MCP tool isomorphic)",
+        help=(
+            "remote non-interactive exec (MCP tool isomorphic); "
+            "timeout= local wait wall-clock, not remote kill"
+        ),
     )
     _add_json_flag(p)
     p.add_argument("--ep", default=None, help="endpoint / profile name")
@@ -262,7 +306,12 @@ def add_exec_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--timeout",
         type=float,
         default=None,
-        help="timeout seconds",
+        help=(
+            "wall-clock timeout seconds (local wait only; "
+            "omit/None = unlimited; 0 is INVALID_ARG; "
+            "WinRM cannot guarantee remote cancel; "
+            "repeated timeouts \u2192 endpoint close then open / close+reopen)"
+        ),
     )
     p.add_argument(
         "--command",
@@ -293,7 +342,7 @@ def add_exec_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     p.add_argument(
         "--runtime",
         default=None,
-        help="script runtime: auto|bash|sh|python|pwsh|…",
+        help="script runtime: auto|bash|sh|python|pwsh|\u2026",
     )
     p.add_argument(
         "--script-arg",
@@ -314,7 +363,12 @@ def add_exec_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
 
 def _handle_exec(args: argparse.Namespace) -> int:
-    command, argv, script, script_path = _parse_exec_forms(args)
+    try:
+        command, argv, script, script_path = _parse_exec_forms(args)
+    except ValueError as exc:
+        # Form-flag + leftover positionals (and any other form usage errors).
+        print(f"mcp-remote-control-cli exec: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     result = exec_ops.run(
         ep=args.ep,
         command=command,
@@ -339,6 +393,10 @@ def _parse_exec_forms(
         mcp-remote-control-cli exec --ep local -- command 'echo hello'
         mcp-remote-control-cli exec --ep local -- argv /bin/echo hello
         mcp-remote-control-cli exec --ep local -- script 'echo hello'
+
+    Raises:
+        ValueError: form flag already set and trailing form_words remain
+            (must not silently drop critical path args).
     """
     command = getattr(args, "exec_command", None)
     argv = getattr(args, "exec_argv", None)
@@ -356,15 +414,24 @@ def _parse_exec_forms(
         elif form == "argv":
             argv = rest if rest else None
         elif form == "script":
-            # `script <body…>` or `script -- path` is not special-cased;
+            # `script <body...>` or `script -- path` is not special-cased;
             # body is the remaining words joined (use --script-file for paths).
             script = " ".join(rest) if rest else None
         else:
-            # Bare words without form keyword → shell command string.
+            # Bare words without form keyword -> shell command string.
             command = " ".join(words)
     elif words and flag_set:
-        # Flags already chose a form; leftover positionals are ignored.
-        pass
+        # Flags already chose a form; leftover positionals must not be dropped
+        # (e.g. `exec --command 'rm -rf /tmp/x' /important` must not ignore
+        # `/important` and succeed - critical args vanishing silently).
+        raise ValueError(
+            "unexpected trailing positional(s) "
+            f"{words!r} while a form flag "
+            "(--command/--argv/--script/--script-file) is set; "
+            "hint: remove the leftover trailing words, or use form "
+            "keywords after -- without form flags "
+            "(e.g. exec --ep local -- command 'echo hi')"
+        )
 
     return command, argv, script, script_path
 
@@ -375,9 +442,17 @@ def _parse_exec_forms(
 
 
 def add_fs_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
+    _fs_timeout_note = (
+        "WinRM oneshot: wall-clock wait, remote cancel not guaranteed; "
+        "repeated timeouts \u2192 close+reopen endpoint"
+    )
     p = subparsers.add_parser(
         "fs",
-        help="filesystem ops: list|stat|read|write|put|get|mkdir|rm",
+        help=f"filesystem ops: list|stat|read|write|put|get|mkdir|rm ({_fs_timeout_note})",
+        description=(
+            "Filesystem ops on an open endpoint: list|stat|read|write|put|get|mkdir|rm. "
+            f"{_fs_timeout_note}."
+        ),
     )
     _add_json_flag(p)
     sub = p.add_subparsers(dest="fs_op", metavar="OP")
@@ -402,6 +477,13 @@ def add_fs_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 default=False,
                 help="print transfer progress lines to stderr",
             )
+        if name == "read":
+            sp.add_argument(
+                "--max-bytes",
+                type=int,
+                default=None,
+                help="read budget in bytes (default 1MiB; raise for large files)",
+            )
         sp.set_defaults(_handler=_handle_fs, fs_op=name)
         return sp
 
@@ -410,8 +492,8 @@ def add_fs_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         ("stat", "stat path"),
         ("read", "read file text"),
         ("write", "write file text"),
-        ("put", "upload local → remote"),
-        ("get", "download remote → local"),
+        ("put", "upload local \u2192 remote"),
+        ("get", "download remote \u2192 local"),
         ("mkdir", "create directory"),
         ("rm", "remove path"),
     ):
@@ -447,6 +529,7 @@ def _handle_fs(args: argparse.Namespace) -> int:
         content=getattr(args, "content", None),
         local=getattr(args, "local", None),
         recursive=bool(getattr(args, "recursive", False)) or None,
+        max_bytes=getattr(args, "max_bytes", None),
         progress=progress,
     )
     return _emit(result, args, sys.stdout)
@@ -477,6 +560,14 @@ def add_screen_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     p_open = sub.add_parser("open", help="open interactive screen on ep")
     _add_json_flag(p_open)
     p_open.add_argument("--ep", default=None, help="endpoint / profile")
+    p_open.add_argument("--cwd", default=None, help="working directory for PTY")
+    p_open.add_argument("--cols", type=int, default=None, help="terminal columns")
+    p_open.add_argument("--rows", type=int, default=None, help="terminal rows")
+    p_open.add_argument(
+        "--shell",
+        default=None,
+        help="shell path (default from profile/system)",
+    )
     p_open.set_defaults(_handler=_handle_screen, screen_op="open")
 
     p_send = sub.add_parser("send", help="send actions to screen")
@@ -574,6 +665,10 @@ def _handle_screen(args: argparse.Namespace) -> int:
         actions=actions,
         wait=wait,
         shot=shot,
+        cwd=getattr(args, "cwd", None),
+        cols=getattr(args, "cols", None),
+        rows=getattr(args, "rows", None),
+        shell=getattr(args, "shell", None),
     )
     return _emit(result, args, sys.stdout)
 
@@ -584,25 +679,78 @@ def _handle_screen(args: argparse.Namespace) -> int:
 
 
 def add_ps_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
+    # Sessions live in the process-local PS registry only. A separate CLI
+    # process cannot see ids from a prior `ps open` (always PS_NOT_FOUND).
+    _ps_process_local = (
+        "session is process-local (same process only; "
+        "a new CLI process always gets PS_NOT_FOUND \u2014 no daemon)"
+    )
     p = subparsers.add_parser(
         "ps",
-        help="persistent PowerShell session: open | invoke | close",
+        help=(
+            "persistent PowerShell session: open | invoke | close "
+            f"({_ps_process_local})"
+        ),
+        description=(
+            "Persistent PowerShell runspace on a WinRM endpoint: "
+            "open | invoke | close. "
+            "Session is process-local (same process only; "
+            "a new CLI process always gets PS_NOT_FOUND \u2014 no daemon)."
+        ),
     )
     _add_json_flag(p)
     sub = p.add_subparsers(dest="ps_op", metavar="OP")
 
-    p_open = sub.add_parser("open", help="open PS runspace on ep")
+    p_open = sub.add_parser(
+        "open",
+        help=f"open PS runspace on ep ({_ps_process_local})",
+        description=(
+            "Open a persistent PowerShell runspace on a WinRM endpoint. "
+            "Session is process-local (same process only; "
+            "a new CLI process always gets PS_NOT_FOUND \u2014 no daemon). "
+            "Chain open\u2192invoke\u2192close in one process (or use MCP in-process)."
+        ),
+    )
     _add_json_flag(p_open)
     p_open.add_argument("--ep", default=None, help="endpoint / profile (winrm)")
     p_open.set_defaults(_handler=_handle_ps, ps_op="open")
 
-    p_invoke = sub.add_parser("invoke", help="invoke script in session")
+    p_invoke = sub.add_parser(
+        "invoke",
+        help=f"invoke script in session ({_ps_process_local})",
+        description=(
+            "Run a PowerShell script in an open process-local PS session. "
+            "Session is process-local (same process only; "
+            "a new CLI process always gets PS_NOT_FOUND \u2014 no daemon). "
+            "Id must come from `ps open` in this same process."
+        ),
+    )
     _add_json_flag(p_invoke)
     p_invoke.add_argument("--id", dest="session_id", default=None, help="session id")
     p_invoke.add_argument("--script", default=None, help="PowerShell script body")
+    p_invoke.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "wall-clock timeout seconds for invoke (local wait; "
+            "best-effort pipeline stop; omit/None = unlimited; "
+            "0 is INVALID_ARG; "
+            "WinRM cannot guarantee remote cancel; "
+            "repeated timeouts \u2192 endpoint close then open / close+reopen)"
+        ),
+    )
     p_invoke.set_defaults(_handler=_handle_ps, ps_op="invoke")
 
-    p_close = sub.add_parser("close", help="close PS session")
+    p_close = sub.add_parser(
+        "close",
+        help=f"close PS session ({_ps_process_local})",
+        description=(
+            "Close and invalidate a process-local PS session. "
+            "Session is process-local (same process only; "
+            "a new CLI process always gets PS_NOT_FOUND \u2014 no daemon)."
+        ),
+    )
     _add_json_flag(p_close)
     p_close.add_argument("--id", dest="session_id", default=None, help="session id")
     p_close.set_defaults(_handler=_handle_ps, ps_op="close")
@@ -623,11 +771,26 @@ def _handle_ps_root(args: argparse.Namespace) -> int:
 
 def _handle_ps(args: argparse.Namespace) -> int:
     op = args.ps_op
+    # argparse type=float accepts "nan"/"inf"; reject non-finite before Core
+    # so a bogus deadline never reaches the invoke stop pipeline.
+    timeout = getattr(args, "timeout", None)
+    if timeout is not None and not math.isfinite(timeout):
+        result = OpResult(
+            kind="ps",
+            status="error",
+            code="INVALID_ARG",
+            fields={
+                "op": op,
+                "msg": f"timeout must be a finite number, got {timeout!r}",
+            },
+        )
+        return _emit(result, args, sys.stdout)
     result = ps_ops.run(
         op=op,
         ep=getattr(args, "ep", None),
         id=getattr(args, "session_id", None),
         script=getattr(args, "script", None),
+        timeout=timeout,
     )
     return _emit(result, args, sys.stdout)
 
@@ -637,7 +800,8 @@ def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "config",
         help=(
             "self-config (no shell/TOML edit): home|ensure-home|help|get|"
-            "list-profiles|get-profile|put-profile|delete-profile|put-secret|list-secrets"
+            "list-profiles|get-profile|put-profile|delete-profile|"
+            "put-secret|list-secrets|notes"
         ),
     )
     _add_json_flag(p)
@@ -646,7 +810,11 @@ def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     for op, help_t in (
         ("home", "config root readiness (no need to browse filesystem)"),
         ("ensure_home", "create layout + default config.toml"),
-        ("help", "auth/bootstrap recipes for agents"),
+        (
+            "help",
+            "password-first auth recipes (ssh_agent, password_env, cert, "
+            "CredSSP; put_secret optional for keys/cert PEMs)",
+        ),
         ("get", "summary counts (profiles/secrets)"),
         ("list_profiles", "list profile names"),
         ("list_secrets", "list secret filenames (no bodies)"),
@@ -672,7 +840,13 @@ def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--auth-json",
         dest="auth",
         default=None,
-        help='JSON object e.g. {"method":"private_key_path","key_path":"secrets/k"}',
+        help=(
+            'JSON auth (prefer plain password): '
+            '{"method":"password","password":"<plain>"}; '
+            "also password_env / ssh_agent / private_key_path / "
+            "credssp / certificate (cert_path+cert_key_path); "
+            "keys/certs: put-secret then path=secrets/<id> \u2014 see config help"
+        ),
     )
     p_put.add_argument("--ssh-json", dest="ssh", default=None)
     p_put.add_argument(
@@ -701,7 +875,13 @@ def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     p_del.add_argument("--name", required=True)
     p_del.set_defaults(_handler=_handle_config, config_op="delete_profile")
 
-    p_sec = sub.add_parser("put-secret", help="write secrets/<name> (body not echoed)")
+    p_sec = sub.add_parser(
+        "put-secret",
+        help=(
+            "optional: write secrets/<name> for SSH keys / password_path compat "
+            "(body not echoed; prefer inline password for auth.password)"
+        ),
+    )
     _add_json_flag(p_sec)
     p_sec.add_argument("--name", required=True)
     src = p_sec.add_mutually_exclusive_group()
@@ -709,7 +889,7 @@ def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--content",
         default=None,
         help=(
-            "secret body — INSECURE: visible in process argv (ps -ef) and "
+            "secret body \u2014 INSECURE: visible in process argv (ps -ef) and "
             "shell history; prefer --content-stdin or --content-file"
         ),
     )
@@ -725,6 +905,31 @@ def add_config_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     )
     p_sec.set_defaults(_handler=_handle_config, config_op="put_secret")
 
+    p_notes = sub.add_parser(
+        "notes",
+        help=(
+            "host notes: --action read|write|append|prepend|stat|rm "
+            "--name \u2026 [--content \u2026] (not fs on config home)"
+        ),
+    )
+    _add_json_flag(p_notes)
+    p_notes.add_argument(
+        "--action",
+        required=True,
+        choices=("read", "write", "append", "prepend", "stat", "rm"),
+        help=(
+            "read|write|append|prepend|stat|rm "
+            "(write empty string truncates; empty append/prepend rejected)"
+        ),
+    )
+    p_notes.add_argument("--name", required=True, help="profile name")
+    p_notes.add_argument(
+        "--content",
+        default=None,
+        help="notes body for write/append/prepend; write empty string truncates",
+    )
+    p_notes.set_defaults(_handler=_handle_config, config_op="notes")
+
     p.set_defaults(_handler=_handle_config_root)
 
 
@@ -732,7 +937,8 @@ def _handle_config_root(args: argparse.Namespace) -> int:
     if getattr(args, "config_op", None) is None:
         print(
             "usage: mcp-remote-control-cli config "
-            "{home,ensure_home,get,list_profiles,...} ...\n"
+            "{home,ensure-home,help,get,list-profiles,get-profile,"
+            "put-profile,delete-profile,put-secret,list-secrets,notes} ...\n"
             "mcp-remote-control-cli config: missing OP",
             file=sys.stderr,
         )
@@ -765,7 +971,7 @@ def _handle_config(args: argparse.Namespace) -> int:
             content = _resolve_secret_content(args)
         except (OSError, FileNotFoundError, PermissionError) as exc:
             # Surface unreadable --content-file as a structured Core error
-            # (INVALID_ARG → EXIT_VALIDATION), not a traceback from main.
+            # (INVALID_ARG -> EXIT_VALIDATION), not a traceback from main.
             result = OpResult(
                 kind="config",
                 status="error",
@@ -795,6 +1001,7 @@ def _handle_config(args: argparse.Namespace) -> int:
         caps=getattr(args, "caps", None),
         body=getattr(args, "body", None),
         content=content,
+        action=getattr(args, "action", None),
     )
     return _emit(result, args, sys.stdout)
 

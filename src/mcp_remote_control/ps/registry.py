@@ -38,6 +38,18 @@ class PsRegistry:
             self._sessions[session.id] = session
             return session
 
+    def pop(self, session_id: str) -> PsSession | None:
+        """Unregister *session_id* without closing the handle.
+
+        Used when the transport is already dead so prune does not wait on
+        a blackholed ``handle.close``. Caller owns teardown (typically
+        :meth:`PsSession.abandon`).
+        """
+        if not session_id:
+            return None
+        with self._lock:
+            return self._sessions.pop(str(session_id).strip(), None)
+
     def remove(self, session_id: str) -> PsSession | None:
         if not session_id:
             return None
@@ -59,13 +71,31 @@ class PsRegistry:
         name = str(ep).strip()
         return [s for s in self.list_open() if s.ep == name]
 
-    def close_for_endpoint(self, ep: str) -> int:
-        """Close all PS sessions attached to *ep*. Returns count closed."""
+    def ids_for_endpoint(self, ep: str) -> list[str]:
+        """Snapshot session ids attached to *ep* (under the registry lock)."""
+        name = str(ep).strip()
+        with self._lock:
+            return [sid for sid, s in self._sessions.items() if s.ep == name]
+
+    def close_ids(self, session_ids: Iterable[str]) -> int:
+        """Close only the given session ids if still registered.
+
+        Returns count closed. Sessions registered after the id list was built
+        (e.g. same-name endpoint reopen) are never touched.
+        """
         n = 0
-        for sess in list(self.list_for_endpoint(ep)):
-            self.remove(sess.id)
-            n += 1
+        for sid in session_ids:
+            if self.remove(sid) is not None:
+                n += 1
         return n
+
+    def close_for_endpoint(self, ep: str) -> int:
+        """Close all PS sessions attached to *ep* at call time. Returns count closed.
+
+        Snapshots ids under the lock then closes only those ids so a concurrent
+        registration after the snapshot is not torn down.
+        """
+        return self.close_ids(self.ids_for_endpoint(ep))
 
     def clear(self) -> None:
         with self._lock:

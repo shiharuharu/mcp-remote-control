@@ -1,4 +1,8 @@
-"""Endpoint lifecycle package: capability matrix, registry, lazy connect."""
+"""Endpoint lifecycle package: capability matrix, registry, lazy connect.
+
+Transport construction is ``connect``; open-time probe is ``probe``.
+``registry`` re-exports construction helpers tests import from that module.
+"""
 
 from __future__ import annotations
 

@@ -2,9 +2,9 @@
 
 Applied on every render path before text leaves Core. Field-name redaction
 covers known secret keys and underscore suffixes; free-form strings also
-strip PEM private keys, Bearer/Basic credentials, and ``password=…``-style
+strip PEM private keys, Bearer/Basic credentials, and ``password=...``-style
 assignments. Prefer under-redaction of concatenated names
-(``dbpassword``) over over-redacting benign fields — extend
+(``dbpassword``) over over-redacting benign fields - extend
 :data:`SENSITIVE_KEY_NAMES` when a schema needs more keys.
 """
 
@@ -49,14 +49,14 @@ _PEM_PRIVATE_KEY = re.compile(
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*")
 _BASIC_AUTH = re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/]+=*")
 
-# ``password=…`` / ``secret=…`` inline assignments. Quote branches are split
-# by quote character so the opposite quote is allowed inside the value
+# ``password=...`` / ``secret=...`` inline assignments. Quote branches are
+# split by quote character so the opposite quote is allowed inside the value
 # (``password="o'reilly"``). A single backreference class ``['"]`` would
 # exclude both quotes and miss that secret.
 #
 # Escaped same-quote inside a quoted value (``password="my \"secret\""``)
 # stops at the first inner quote; full escaped-quote parsing is out of scope.
-# Do not include password here — plain profile passwords are allowed in Agent text.
+# Do not include password here - plain profile passwords are allowed in Agent text.
 _INLINE_ASSIGN = re.compile(
     r"(?i)\b(secret|token|api_key|private_key|private_key_pem|passphrase)\s*[:=]\s*"
     r"(?:"
@@ -74,7 +74,7 @@ def is_sensitive_key(name: str) -> bool:
 
     Suffix match is underscore-joined only (``foo_password``, ``my_token``).
     Concatenated names without a separator (``dbpassword``, ``usertoken``)
-    are not auto-redacted — a broad contains-match would over-redact benign
+    are not auto-redacted - a broad contains-match would over-redact benign
     fields. Add such names to :data:`SENSITIVE_KEY_NAMES` when needed.
     """
     n = name.strip().lower().replace("-", "_")

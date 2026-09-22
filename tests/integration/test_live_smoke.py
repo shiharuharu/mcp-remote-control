@@ -101,9 +101,11 @@ def test_winrm_endpoint_exec_ps_if_configured(
         )
         assert ex.code not in ("AUTH_FAILED", "CONNECT_FAILED")
 
-        # screen must be unsupported
+        # screen must be denied (caps.screen=false on winrm)
         scr = screen_ops.run(op="open", ep=winrm_profile, home=home)
-        assert scr.code == "UNSUPPORTED" or scr.status == "error"
+        assert scr.code == "CAP_DENIED" or (
+            scr.status == "error" and scr.code != "ok"
+        )
 
         from mcp_remote_control.core import ps_ops
 

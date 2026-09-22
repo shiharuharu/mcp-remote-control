@@ -2,37 +2,85 @@
 
 Owns the agent loop for host shells (local/ssh): open a PTY with adaptive
 geometry, run ordered send actions with wait/shot, and tear down sessions.
-WinRM endpoints lack screen capability and return ``UNSUPPORTED``.
+Endpoints lacking ``caps.screen`` (e.g. WinRM) return ``CAP_DENIED``.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from mcp_remote_control.config import ProfileInvalid, ProfileNotFound, resolve_home
-from mcp_remote_control.core.result import OpResult
-from mcp_remote_control.endpoint.registry import ensure_endpoint
+from mcp_remote_control.config import ProfileInvalid, ProfileNotFound
+from mcp_remote_control.core.result import OpResult, _home, _short
+from mcp_remote_control.endpoint.registry import ensure_endpoint, get_registry
 from mcp_remote_control.screen.buffer import (
     DEFAULT_COLORTERM,
     DEFAULT_TERM,
 )
-from mcp_remote_control.screen.cwd_probe import probe_and_update_cwd
+from mcp_remote_control.screen.cwd_probe import (
+    probe_and_update_cwd,
+    refresh_session_surface,
+)
 from mcp_remote_control.screen.geometry import GeometryAdapter, GeometryMemory
-from mcp_remote_control.screen.local_pty import LocalPty
 from mcp_remote_control.screen.registry import get_screen_registry
 from mcp_remote_control.screen.send import execute_send
 from mcp_remote_control.screen.session import ScreenSession
 from mcp_remote_control.screen.ssh_pty import SshPty
+from mcp_remote_control.serial.buffer import resolve_text_codec, text_codec_known
 from mcp_remote_control.shell.dialect import resolve_dialect
 from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport.base import BaseTransport
+from mcp_remote_control.transport.shell_wrap import coerce_cwd_path
+
+if TYPE_CHECKING:
+    from mcp_remote_control.screen.local_pty import LocalPty
 
 VALID_OPS: frozenset[str] = frozenset({"open", "send", "close", "list"})
 
 # Brief settle so shell MOTD/prompt can paint before the first frame.
 _OPEN_SETTLE_S = 0.35
+
+# ``msg`` cap for a failed send. An action-loop failure carries a curated
+# remedy from ``screen/send.py`` - the longest today is the SGR no-tracking
+# advice (205 chars) behind the ``action_<i>_failed: `` prefix (17) - and that
+# text is what the caller acts on, so the cap must clear it whole. It still
+# bounds a runaway interpolated exception repr; it is not a display budget.
+_SEND_MSG_CHARS = 300
+
+# Elision marker for a capped send ``msg``; keeps the ``diagnosis; remedy``
+# shape readable across the cut.
+_SEND_MSG_ELISION = "...; "
+
+
+def _send_msg(msg: str, limit: int = _SEND_MSG_CHARS) -> str:
+    """Cap a failed-send ``msg`` without cutting its trailing remedy.
+
+    A caller-supplied value can sit *in front of* the curated remedy - an
+    unrecognised ``force_click`` value is interpolated into ``"<field> must be
+    a boolean, got <value!r>; <hint>"``, and ``value!r`` is unbounded - so a
+    plain head truncation spends the whole budget on the value and the remedy
+    never arrives. ``screen/send.py`` writes every remedy as the message's
+    last ``"; "`` clause, and the remedy is the part the caller acts on, so
+    the cut falls on the diagnosis instead: that clause is kept whole and only
+    the text before it is shortened.
+
+    Falls back to the plain head cut when the message has no such clause or
+    when keeping it would leave the diagnosis less than half the budget - the
+    field stays bounded either way, and a runaway repr with no remedy still
+    renders exactly as before.
+    """
+    text = " ".join(str(msg).split())
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("; ")
+    if cut > 0:
+        tail = text[cut + 2 :]
+        if tail and len(tail) * 2 <= limit:
+            room = limit - len(tail) - len(_SEND_MSG_ELISION)
+            return text[:room] + _SEND_MSG_ELISION + tail
+    return _short(text, limit=limit)
 
 
 def _frame_body(frame: object | None) -> str | None:
@@ -46,6 +94,23 @@ def _frame_body(frame: object | None) -> str | None:
     else:
         text = str(frame)
     return text if text else None
+
+
+def _codec_fields(session: ScreenSession) -> dict[str, Any]:
+    """Which codec read this frame, and whether its decode dropped bytes.
+
+    Every row that carries frame text needs this, not just ``open``: a send
+    draws its frame from the same pinned decoder, so an agent holding only the
+    session id has to be able to tell a legacy-console frame from a utf-8 one
+    without the open result. Both keys are omitted on the historic path
+    (utf-8, no replacements) so routine frames keep their token count.
+    """
+    out: dict[str, Any] = {}
+    if session.text_codec != "utf-8":
+        out["encoding"] = session.text_codec
+    if session.replaced_chars:
+        out["repl"] = 1
+    return out
 
 
 def open_screen(
@@ -67,7 +132,7 @@ def open_screen(
 ) -> OpResult:
     """Open an interactive shell PTY on *ep* (default: no business command).
 
-    Geometry is adaptive: class seed → settle health → limited grow. Pass both
+    Geometry is adaptive: class seed -> settle health -> limited grow. Pass both
     *cols* and *rows* to force size (skips grow). *fit=False* uses seed only
     without grow. The adapter never shrinks the PTY for token savings.
 
@@ -123,7 +188,7 @@ def open_screen(
         return OpResult(
             kind="screen",
             status="error",
-            code="UNSUPPORTED",
+            code="CAP_DENIED",
             fields={
                 "op": "open",
                 "ep": ep_name,
@@ -147,6 +212,22 @@ def open_screen(
             },
         )
 
+    # Peer text codec for the PTY byte->text boundary. The transport already
+    # carries it (profile ``encoding``, or the probe's charmap/chcp adoption),
+    # so a screen on a non-UTF-8 console decodes its own frames instead of
+    # rendering replacement characters for every non-ASCII glyph. Resolved once
+    # here, at open: an unusable name warns before the PTY exists and leaves
+    # utf-8 in force, and a later re-probe cannot switch it mid-session.
+    peer_encoding = getattr(transport, "text_encoding", None)
+    peer_codec = resolve_text_codec(peer_encoding)
+    unknown_peer_codec = (
+        f"unusable text codec {str(peer_encoding)!r}; screen frames are decoded "
+        "as utf-8 (set the profile encoding to a Python codec name such as "
+        "gb18030)"
+        if peer_encoding is not None and not text_codec_known(peer_encoding)
+        else None
+    )
+
     # Class seed + geometry memory; explicit cols+rows force size and skip grow.
     do_fit = True if fit is None else bool(fit)
     adapter = GeometryAdapter(memory=GeometryMemory.for_home(home_path))
@@ -161,11 +242,14 @@ def open_screen(
     )
     g_cols, g_rows = plan.cols, plan.rows
 
-    work_cwd = _resolve_open_cwd(
-        requested=cwd,
-        endpoint_cwd=endpoint.cwd,
-        transport=transport,
-    )
+    try:
+        work_cwd = _resolve_open_cwd(
+            requested=cwd,
+            endpoint_cwd=endpoint.cwd,
+            transport=transport,
+        )
+    except TransportError as exc:
+        return _transport_error(exc, op="open", ep=ep_name)
 
     open_mode = "shell"
     if command is not None or argv is not None:
@@ -209,6 +293,24 @@ def open_screen(
             },
         )
 
+    # Long PTY open may outlive concurrent close/retire. Re-pin
+    # generation + transport liveness before building a session.
+    if not get_registry().generation_still_open(endpoint):
+        try:
+            pty_handle.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return OpResult(
+            kind="screen",
+            status="error",
+            code="NOT_CONNECTED",
+            fields={
+                "op": "open",
+                "ep": ep_name,
+                "msg": "endpoint closed or transport died during screen open",
+            },
+        )
+
     reg = get_screen_registry()
     sid = reg.allocate_id()
     dialect, shell_path_hint, caps, meta = _dialect_from_endpoint(
@@ -229,20 +331,147 @@ def open_screen(
         shell_caps=caps,
         cwd_src="open" if (work_cwd or getattr(pty_handle, "cwd", None)) else None,
         meta=meta,
+        text_encoding=peer_codec,
     )
-    reg.add(session)
 
+    # Ready fence + serial open probe.
+    # Hold serial_ops across settle/adapt and multi-step cwd probe so a
+    # concurrent send cannot interleave writes (ctrl+u -> cmd -> enter -> drain).
+    # Delay reg.add until mark_ready so mid-open send gets SCREEN_NOT_FOUND
+    # (predictable) instead of polluting probe markers / the first frame.
     settle = _OPEN_SETTLE_S if settle_s is None else float(settle_s)
+    out_cwd = session.cwd
     try:
-        fit_result, shot = adapter.adapt(
-            session,
-            plan,
-            settle_s=settle,
-            endpoint_id=ep_name,
-            surface=session.surface,
-        )
+        with session.serial_ops():
+            session.mark_not_ready()
+            try:
+                fit_result, shot = adapter.adapt(
+                    session,
+                    plan,
+                    settle_s=settle,
+                    endpoint_id=ep_name,
+                    surface=session.surface,
+                )
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    session.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return OpResult(
+                    kind="screen",
+                    status="error",
+                    code="EXEC_FAILED",
+                    fields={
+                        "op": "open",
+                        "ep": ep_name,
+                        "msg": _short(
+                            f"settle/shot failed: {type(exc).__name__}: {exc}"
+                        ),
+                    },
+                )
+
+            # Prefer absolute cwd for Agent output; silent probe when still shell.
+            out_cwd = session.cwd
+            if out_cwd and transport.name == "local":
+                try:
+                    out_cwd = str(Path(out_cwd).expanduser().resolve())
+                except OSError:
+                    pass
+            session.cwd = out_cwd
+            # Refresh surface from live pyte modes (alt-screen / mouse)
+            # before deciding whether to inject a silent cwd probe.
+            try:
+                refresh_session_surface(session)
+            except Exception:  # noqa: BLE001
+                pass
+            if open_mode == "shell" and session.surface == "shell":
+                try:
+                    probed = probe_and_update_cwd(session, timeout_s=1.2)
+                    # probe_and_update_cwd returns the prior cwd on failure;
+                    # only cwd_src=probe means the requested path was confirmed.
+                    if session.cwd_src == "probe" and probed:
+                        out_cwd = probed
+                        # Re-shot so the Agent frame excludes probe marker lines.
+                        shot = session.shot(settle_s=0.05)
+                    elif session.cwd_src == "stale":
+                        # Probe ran and failed. Local chdir already applied a
+                        # verified directory; remote cwd is unconfirmed.
+                        if transport.name != "local":
+                            out_cwd = None
+                            session.cwd = None
+                    elif session.cwd_src is None:
+                        session.cwd_src = "stale"
+                except Exception:  # noqa: BLE001
+                    if session.cwd_src == "probe":
+                        session.cwd_src = "stale"
+                    if session.cwd_src is None:
+                        session.cwd_src = "stale"
+                    if transport.name != "local":
+                        out_cwd = None
+                        session.cwd = None
+                # Re-evaluate surface after probe I/O (cheap).
+                try:
+                    refresh_session_surface(session)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Re-validate generation/liveness after settle/probe (long
+            # window) immediately before publish. Concurrent close_endpoint
+            # must not leave a screen session on a dead/retired transport.
+            if not get_registry().generation_still_open(endpoint):
+                try:
+                    if not session.closed:
+                        session.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return OpResult(
+                    kind="screen",
+                    status="error",
+                    code="NOT_CONNECTED",
+                    fields={
+                        "op": "open",
+                        "ep": ep_name,
+                        "msg": (
+                            "endpoint closed or transport died during "
+                            "screen open settle"
+                        ),
+                    },
+                )
+
+            # Publish only when ready: concurrent send can attach after this.
+            session.mark_ready()
+            reg.add(session)
+            # Post-add fence: if close raced between check and add, drop the
+            # zombie immediately (close may have snapshotted empty ids).
+            if not get_registry().generation_still_open(endpoint):
+                try:
+                    reg.remove(sid)
+                except Exception:  # noqa: BLE001
+                    pass
+                return OpResult(
+                    kind="screen",
+                    status="error",
+                    code="NOT_CONNECTED",
+                    fields={
+                        "op": "open",
+                        "ep": ep_name,
+                        "msg": (
+                            "endpoint closed or transport died during "
+                            "screen open register"
+                        ),
+                    },
+                )
     except Exception as exc:  # noqa: BLE001
-        reg.remove(sid)
+        # Unexpected failure outside adapt (should be rare); tear down PTY.
+        try:
+            if not session.closed:
+                session.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            reg.remove(sid)
+        except Exception:  # noqa: BLE001
+            pass
         return OpResult(
             kind="screen",
             status="error",
@@ -250,31 +479,9 @@ def open_screen(
             fields={
                 "op": "open",
                 "ep": ep_name,
-                "msg": _short(f"settle/shot failed: {type(exc).__name__}: {exc}"),
+                "msg": _short(f"open finalize failed: {type(exc).__name__}: {exc}"),
             },
         )
-
-    # Prefer absolute cwd for Agent output; silent probe when still in a shell.
-    out_cwd = session.cwd
-    if out_cwd and transport.name == "local":
-        try:
-            out_cwd = str(Path(out_cwd).expanduser().resolve())
-        except OSError:
-            pass
-    session.cwd = out_cwd
-    if open_mode == "shell" and session.surface == "shell":
-        try:
-            probed = probe_and_update_cwd(session, timeout_s=1.2)
-            if probed:
-                out_cwd = probed
-                session.cwd_src = "probe"
-                # Re-shot so the Agent frame excludes probe marker lines.
-                shot = session.shot(settle_s=0.05)
-            elif session.cwd_src is None:
-                session.cwd_src = "stale"
-        except Exception:  # noqa: BLE001
-            if session.cwd_src is None:
-                session.cwd_src = "stale"
 
     # Frame geometry must match the live session after any grow.
     fields: dict[str, Any] = {
@@ -296,6 +503,12 @@ def open_screen(
     }
     if session.dialect:
         fields["dialect"] = session.dialect
+    # Which codec produced this frame, and whether it dropped bytes: a
+    # non-default codec reads the same bytes as different text, so a reader
+    # must be able to tell them apart.
+    fields.update(_codec_fields(session))
+    if unknown_peer_codec:
+        fields["warning"] = unknown_peer_codec
     if session.shell_caps and session.shell_caps.get("busybox"):
         fields["busybox"] = 1
     if session.cwd_src:
@@ -340,7 +553,16 @@ def send_screen(
     shot: bool | None = None,
     **_kwargs: Any,
 ) -> OpResult:
-    """Execute ordered actions, wait, drain, then take a frame shot by default."""
+    """Execute ordered actions, wait, drain, then take a frame shot by default.
+
+    Concurrent send/close on the same session is serialized by the session
+    op lock: ``execute_send`` holds ``session.serial_ops()`` for the
+    full pipeline; nested RLock re-entry from write/drain/feed is safe.
+
+    Sessions are only registered after open settle/probe marks them ready.
+    A not-ready session (defense if observed early) returns SCREEN_NOT_READY
+    rather than interleaving with the open-path probe writes.
+    """
     sid = id or screen_id
     if not sid or not str(sid).strip():
         return OpResult(
@@ -366,26 +588,61 @@ def send_screen(
 
     do_shot = True if shot is None else bool(shot)
 
-    try:
-        outcome = execute_send(
-            sess,
-            actions=actions,
-            wait=wait,
-            shot=do_shot,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return OpResult(
-            kind="screen",
-            status="error",
-            code="EXEC_FAILED",
-            fields={
-                "op": "send",
-                "id": sid,
-                "screen_id": sid,
-                "msg": _short(f"{type(exc).__name__}: {exc}"),
-            },
-            cwd=sess.cwd,
-        )
+    # Re-check closed/ready under the session op lock so a concurrent close or
+    # mid-open race is not followed by a half-started send. execute_send
+    # re-enters the same RLock for the action/wait/drain pipeline.
+    with sess.serial_ops():
+        if sess.closed:
+            return OpResult(
+                kind="screen",
+                status="error",
+                code="SCREEN_NOT_FOUND",
+                fields={
+                    "op": "send",
+                    "id": sid,
+                    "msg": f"screen not open: {sid}",
+                },
+            )
+        if not sess.ready:
+            return OpResult(
+                kind="screen",
+                status="error",
+                code="SCREEN_NOT_READY",
+                fields={
+                    "op": "send",
+                    "id": sid,
+                    "screen_id": sid,
+                    "msg": f"screen not ready (open settle/probe in progress): {sid}",
+                },
+                cwd=sess.cwd,
+            )
+        try:
+            # _execute_send_locked via execute_send - nested serial_ops (RLock).
+            outcome = execute_send(
+                sess,
+                actions=actions,
+                wait=wait,
+                shot=do_shot,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return OpResult(
+                kind="screen",
+                status="error",
+                code="EXEC_FAILED",
+                fields={
+                    "op": "send",
+                    "id": sid,
+                    "screen_id": sid,
+                    "msg": _short(f"{type(exc).__name__}: {exc}"),
+                },
+                cwd=sess.cwd,
+            )
+        # Agent meta surface tracks live alt-screen / mouse after send
+        # (probe path also refreshes inside _should_probe; cover noop/skip paths).
+        try:
+            refresh_session_surface(sess)
+        except Exception:  # noqa: BLE001
+            pass
 
     fields: dict[str, Any] = {
         "op": "send",
@@ -414,7 +671,7 @@ def send_screen(
     if not do_shot:
         fields["shot"] = False
     if outcome.error_code:
-        fields["msg"] = _short(outcome.error_msg or outcome.error_code)
+        fields["msg"] = _send_msg(outcome.error_msg or outcome.error_code)
     if outcome.status == "unchanged":
         fields["unchanged"] = True
     if sess.dialect:
@@ -423,6 +680,9 @@ def send_screen(
         fields["busybox"] = 1
     if sess.cwd_src:
         fields["cwd_src"] = sess.cwd_src
+    # Same codec evidence as the open row: this frame was drawn by the pinned
+    # decoder, and a reader with only the session id can see which one.
+    fields.update(_codec_fields(sess))
 
     body = _frame_body(outcome.frame)
     if body and "__MRC_PWD__:" in body:
@@ -453,6 +713,7 @@ def close_screen(
     screen_id: str | None = None,
     **_kwargs: Any,
 ) -> OpResult:
+    """Close one screen; serialized with concurrent send on the same session."""
     sid = id or screen_id
     if not sid or not str(sid).strip():
         return OpResult(
@@ -464,8 +725,11 @@ def close_screen(
         )
     sid = str(sid).strip()
     reg = get_screen_registry()
-    sess = reg.remove(sid)
-    if sess is None:
+    # Lookup first so we can hold the session op lock across pop+close and
+    # wait out any in-flight send. Registry map lock is only held briefly
+    # inside remove(); never hold registry lock across PTY I/O.
+    sess = reg.get(sid)
+    if sess is None or sess.closed:
         return OpResult(
             kind="screen",
             status="error",
@@ -476,6 +740,33 @@ def close_screen(
                 "msg": f"screen not open: {sid}",
             },
         )
+    with sess.serial_ops():
+        if sess.closed:
+            return OpResult(
+                kind="screen",
+                status="error",
+                code="SCREEN_NOT_FOUND",
+                fields={
+                    "op": "close",
+                    "id": sid,
+                    "msg": f"screen not open: {sid}",
+                },
+            )
+        # remove() pops under the registry map lock then calls sess.close(),
+        # which re-enters this RLock. Concurrent send waits on serial_ops.
+        removed = reg.remove(sid)
+        if removed is None:
+            return OpResult(
+                kind="screen",
+                status="error",
+                code="SCREEN_NOT_FOUND",
+                fields={
+                    "op": "close",
+                    "id": sid,
+                    "msg": f"screen not open: {sid}",
+                },
+            )
+        sess = removed
     return OpResult(
         kind="screen",
         status="ok",
@@ -515,7 +806,7 @@ def list_screens(**_kwargs: Any) -> OpResult:
 
 
 def run(op: str, **kwargs: Any) -> OpResult:
-    """Dispatch screen op → Core implementation."""
+    """Dispatch screen op -> Core implementation."""
     op_norm = (op or "").strip().lower()
     if op_norm not in VALID_OPS:
         return OpResult(
@@ -555,6 +846,17 @@ def _open_pty(
 ) -> LocalPty | SshPty:
     name = transport.name
     if name == "local":
+        # Local interactive PTY needs POSIX fcntl/termios/pty; reject on Windows
+        # before importing local_pty so win32 hosts can still import mcp_server.
+        if sys.platform.startswith("win"):
+            raise TransportError(
+                "UNSUPPORTED",
+                "local interactive PTY is not supported on Windows",
+                details={"transport": "local", "platform": sys.platform},
+            )
+        # Lazy: avoid pulling POSIX-only modules at screen_ops / mcp_server import.
+        from mcp_remote_control.screen.local_pty import LocalPty
+
         run_argv: list[str] | None
         if argv:
             run_argv = list(argv)
@@ -611,35 +913,82 @@ def _resolve_open_cwd(
     endpoint_cwd: str | None,
     transport: BaseTransport,
 ) -> str | None:
-    raw = requested if requested is not None else endpoint_cwd
-    if raw is None or not str(raw).strip():
-        raw = transport.cwd
-    if raw is None or not str(raw).strip():
-        if transport.name == "local":
-            return os.getcwd()
-        return None
-    text = str(raw).strip()
+    """Resolve screen-open cwd with the same fail-close rules as exec.
+
+    Explicit local missing/non-dir cwd raises ``INVALID_CWD`` - never
+    ``$HOME`` / ``getcwd`` fallback. Profile/transport seeds may still
+    skip a missing directory and land on ``getcwd()``. Non-path values
+    (``True``, unexpanded probe placeholders) are rejected by
+    ``coerce_cwd_path``.
+    """
+    requested_path = coerce_cwd_path(requested)
     if transport.name == "local":
-        p = Path(text).expanduser()
+        return _resolve_local_open_cwd(
+            requested=requested_path,
+            endpoint_cwd=coerce_cwd_path(endpoint_cwd),
+            transport_cwd=coerce_cwd_path(transport.cwd),
+            strict_requested=requested_path is not None,
+        )
+
+    raw = requested_path
+    if raw is None:
+        raw = coerce_cwd_path(endpoint_cwd)
+    if raw is None:
+        raw = coerce_cwd_path(transport.cwd)
+    if raw is None:
+        return None
+    if raw.startswith("~") and transport.home:
+        if raw == "~" or raw.startswith("~/"):
+            raw = transport.home + raw[1:]
+    return raw
+
+
+def _resolve_local_open_cwd(
+    *,
+    requested: str | None,
+    endpoint_cwd: str | None,
+    transport_cwd: str | None,
+    strict_requested: bool,
+) -> str:
+    candidates: list[str] = []
+    for raw in (requested, endpoint_cwd, transport_cwd):
+        if raw:
+            candidates.append(raw)
+    candidates.append(os.getcwd())
+
+    last_error: str | None = None
+    for i, raw in enumerate(candidates):
         try:
-            if not p.is_absolute():
-                p = (Path(os.getcwd()) / p).resolve()
-            else:
-                p = p.resolve()
-        except OSError:
-            return text
-        if p.is_dir():
-            return str(p)
-        # Profile seed may point at a missing path; fall back to $HOME or cwd.
-        home = os.environ.get("HOME")
-        if home and Path(home).is_dir():
-            return str(Path(home).resolve())
-        return os.getcwd()
-    # Remote: expand ~ with transport.home when known.
-    if text.startswith("~") and transport.home:
-        if text == "~" or text.startswith("~/"):
-            text = transport.home + text[1:]
-    return text
+            abs_path = _expand_abs_local(raw)
+        except OSError as exc:
+            last_error = str(exc)
+            continue
+        if Path(abs_path).is_dir():
+            return abs_path
+        last_error = f"not a directory: {abs_path}"
+        if strict_requested and i == 0 and requested is not None:
+            raise TransportError(
+                "INVALID_CWD",
+                f"cwd does not exist or is not a directory: {abs_path}",
+                details={"cwd": abs_path},
+            )
+    fallback = os.getcwd()
+    if last_error and strict_requested:
+        raise TransportError(
+            "INVALID_CWD",
+            last_error,
+            details={"cwd": requested},
+        )
+    return fallback
+
+
+def _expand_abs_local(raw: str) -> str:
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (Path(os.getcwd()) / p).resolve()
+    else:
+        p = p.resolve()
+    return str(p)
 
 
 def _transport_error(
@@ -663,12 +1012,6 @@ def _transport_error(
         code=exc.code or "EXEC_FAILED",
         fields=fields,
     )
-
-
-def _home(home: Path | str | None) -> Path:
-    if home is None:
-        return resolve_home()
-    return Path(home).expanduser().resolve()
 
 
 def _dialect_from_endpoint(
@@ -739,8 +1082,37 @@ def _dialect_from_endpoint(
     )
 
 
-def _short(msg: str, limit: int = 200) -> str:
-    text = " ".join(str(msg).split())
-    if len(text) > limit:
-        return text[: limit - 3] + "..."
-    return text
+# ---------------------------------------------------------------------------
+# Generation-fence helpers.
+# Used by endpoint registry on stale transport pop/reconnect and by
+# close_endpoint. Snapshot ids first, then close_ids only - never name-wide
+# close_for_endpoint after a same-name reopen can register new sessions.
+# ---------------------------------------------------------------------------
+
+
+def snapshot_endpoint_session_ids(ep: str) -> list[str]:
+    """Snapshot open screen session ids attached to *ep*.
+
+    Safe under concurrent registration: returns only ids present at call time.
+    Best-effort; returns ``[]`` on registry failure.
+    """
+    if not ep or not str(ep).strip():
+        return []
+    try:
+        return get_screen_registry().ids_for_endpoint(str(ep).strip())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def close_sessions_by_ids(session_ids: Any) -> int:
+    """Close only the given screen session ids if still registered.
+
+    Returns count closed. Ids registered after the snapshot are never touched.
+    Best-effort; never raises (reconnect/close paths must not fail on cleanup).
+    """
+    if not session_ids:
+        return 0
+    try:
+        return int(get_screen_registry().close_ids(session_ids))
+    except Exception:  # noqa: BLE001
+        return 0

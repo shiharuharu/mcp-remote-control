@@ -1,4 +1,4 @@
-"""``mcp-remote-control-cli replay`` — re-play recorded PTY fixtures offline.
+"""``mcp-remote-control-cli replay`` - re-play recorded PTY fixtures offline.
 
 Runs screen frame fixtures through the same buffer path without a live TUI,
 for CI and local harness checks.

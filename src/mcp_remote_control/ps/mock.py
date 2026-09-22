@@ -44,6 +44,8 @@ class MockRunspace:
     - ``Set-Location`` / ``cd`` updates location
     - ``Get-Location`` / ``(Get-Location).Path`` / ``$PWD.Path``
     - ``Write-Output`` / bare string literals
+    - ``exit N`` maps to ``exit_code=N`` (no silent success)
+    - unknown statements fail with non-zero exit and stderr containing ``UNKNOWN``
     """
 
     location: str = DEFAULT_MOCK_LOCATION
@@ -124,7 +126,12 @@ class MockRunspace:
         if m:
             name = m.group(1)
             raw_val = m.group(2).strip()
-            self.vars[name] = _parse_ps_value(raw_val)
+            parsed = _parse_ps_value(raw_val)
+            if parsed is _NOT_A_LITERAL:
+                # RHS must be int or quoted-string (bool literals already
+                # accepted). Bare cmdlets like Get-Foo must not store as text.
+                return "", f"UNKNOWN: unsupported mock statement: {s}", 1
+            self.vars[name] = parsed
             return "", "", 0
 
         m = re.match(r"^\$(\w+)\s*$", s)
@@ -155,8 +162,15 @@ class MockRunspace:
         ):
             return _strip_ps_quotes(s) + "\n", "", 0
 
-        # Unknown statements succeed with empty output (probe-friendly).
-        return "", "", 0
+        # exit N -> map to that exit code (PowerShell-style session exit).
+        m = re.match(r"(?is)^exit(?:\s+(-?\d+))?\s*$", s)
+        if m:
+            raw = m.group(1)
+            code = int(raw) if raw is not None else 0
+            return "", "", code
+
+        # Unknown statements must not succeed silently.
+        return "", f"UNKNOWN: unsupported mock statement: {s}", 1
 
 
 def _strip_ps_quotes(value: str) -> str:
@@ -168,7 +182,12 @@ def _strip_ps_quotes(value: str) -> str:
     return v
 
 
+# Sentinel: assignment RHS is not a supported literal (not stored).
+_NOT_A_LITERAL = object()
+
+
 def _parse_ps_value(raw: str) -> Any:
+    """Parse an assignment RHS. ``_NOT_A_LITERAL`` if not int / quoted / bool."""
     v = raw.strip()
     if len(v) >= 2 and (
         (v[0] == "'" and v[-1] == "'") or (v[0] == '"' and v[-1] == '"')
@@ -183,7 +202,7 @@ def _parse_ps_value(raw: str) -> Any:
             return int(v)
     except ValueError:
         pass
-    return v
+    return _NOT_A_LITERAL
 
 
 class MockWinRMSessionWithRunspace:

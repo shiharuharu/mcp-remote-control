@@ -1,7 +1,8 @@
-"""Unit tests for mrc doctor / selftest (T04)."""
+"""Unit tests for mrc doctor / selftest."""
 
 from __future__ import annotations
 
+import json
 from io import StringIO
 from pathlib import Path
 
@@ -12,10 +13,13 @@ from mcp_remote_control.cli_cmds import EXIT_OK, EXIT_VALIDATION
 from mcp_remote_control.cli_cmds.doctor import (
     cmd_doctor,
     format_report,
+    format_report_json,
     run_doctor,
 )
 from mcp_remote_control.cli_cmds.selftest import (
     cmd_selftest,
+    format_report as format_selftest_report,
+    format_report_json as format_selftest_report_json,
     locate_package_fixture_home,
     run_selftest,
 )
@@ -24,7 +28,7 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
 
 # ---------------------------------------------------------------------------
-# doctor — good fixture home
+# doctor - good fixture home
 # ---------------------------------------------------------------------------
 
 
@@ -62,7 +66,7 @@ def test_main_doctor_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# doctor — broken / missing home
+# doctor - broken / missing home
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +129,7 @@ def test_doctor_create_missing_home(
 
 
 # ---------------------------------------------------------------------------
-# O12: doctor soft-warn — ``mcp`` import failure keeps report.ok True
+# doctor soft-warn - ``mcp`` import failure keeps report.ok True
 # ---------------------------------------------------------------------------
 
 
@@ -160,7 +164,7 @@ def test_doctor_soft_warn_mcp_import_failure_still_ok(
     mcp_check = mcp_checks[0]
     assert mcp_check.soft is True
     assert mcp_check.ok is False
-    assert mcp_check.line().startswith("warn")  # soft failure → warn status
+    assert mcp_check.line().startswith("warn")  # soft failure -> warn status
 
     # Hard deps still report ok (regression guard: monkeypatch only touched mcp).
     hard_names = {"import asyncssh", "import pyte", "import pypsrp"}
@@ -207,7 +211,7 @@ def test_main_doctor_soft_warn_still_zero_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end: ``main(["doctor"])`` must return 0 when only the soft ``mcp``
-    import fails. Guards the wiring ``_handle_doctor → cmd_doctor → exit_code``.
+    import fails. Guards the wiring ``_handle_doctor -> cmd_doctor -> exit_code``.
     """
     monkeypatch.setenv("MRC_HOME", str(FIXTURES))
     from mcp_remote_control.cli_cmds import doctor
@@ -274,6 +278,156 @@ def test_selftest_bad_home_fails(
     code = cmd_selftest(stdout=buf)
     assert code == EXIT_VALIDATION
     assert "selftest: FAIL" in buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# global / local --json for doctor + selftest
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_format_report_json_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """format_report_json must be compact single-line JSON with kind=doctor."""
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    report = run_doctor()
+    raw = format_report_json(report)
+    assert raw.endswith("\n")
+    # compact: no indent (body is one JSON object line + newline)
+    assert "\n" not in raw.rstrip("\n")
+    data = json.loads(raw)
+    assert data["kind"] == "doctor"
+    assert data["status"] == "ok"
+    assert isinstance(data["checks"], list)
+    assert data["checks"], "expected at least one check"
+    assert "name" in data["checks"][0]
+    assert "ok" in data["checks"][0]
+    assert "home" in data
+
+
+def test_doctor_cmd_as_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    buf = StringIO()
+    code = cmd_doctor(stdout=buf, as_json=True)
+    assert code == EXIT_OK
+    data = json.loads(buf.getvalue())
+    assert data["kind"] == "doctor"
+    assert data["status"] == "ok"
+    # human markers must not appear when as_json
+    assert "doctor: PASS" not in buf.getvalue()
+
+
+def test_main_json_doctor_stdout_is_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main(['--json', 'doctor'])`` must emit parseable JSON, not human."""
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    assert main(["--json", "doctor"]) == EXIT_OK
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data["kind"] == "doctor"
+    assert data["status"] == "ok"
+    assert "doctor: PASS" not in out
+
+
+def test_main_doctor_local_json_flag(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Local ``doctor --json`` also enables machine track (SUPPRESS + global)."""
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    assert main(["doctor", "--json"]) == EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "doctor"
+
+
+def test_main_doctor_without_json_stays_human(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No --json: human format_report lines and PASS marker unchanged."""
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    assert main(["doctor"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "doctor: PASS" in out
+    assert "ok  config home" in out or "ok  config home:" in out
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(out)
+
+
+def test_selftest_format_report_json_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    report = run_selftest()
+    raw = format_selftest_report_json(report)
+    assert raw.endswith("\n")
+    assert "\n" not in raw.rstrip("\n")
+    data = json.loads(raw)
+    assert data["kind"] == "selftest"
+    assert data["status"] == "ok"
+    assert isinstance(data["steps"], list)
+    assert data["steps"]
+
+
+def test_selftest_cmd_as_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    buf = StringIO()
+    code = cmd_selftest(stdout=buf, as_json=True)
+    assert code == EXIT_OK
+    data = json.loads(buf.getvalue())
+    assert data["kind"] == "selftest"
+    assert data["status"] == "ok"
+    assert "selftest: PASS" not in buf.getvalue()
+
+
+def test_main_json_selftest_stdout_is_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main(['--json', 'selftest'])`` must emit parseable JSON."""
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    assert main(["--json", "selftest"]) == EXIT_OK
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data["kind"] == "selftest"
+    assert data["status"] == "ok"
+    assert "selftest: PASS" not in out
+
+
+def test_main_selftest_without_json_stays_human(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    assert main(["selftest"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "selftest: PASS" in out
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(out)
+
+
+def test_main_json_doctor_fail_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Failed doctor with --json still yields JSON with status=fail."""
+    missing = tmp_path / "no-home"
+    monkeypatch.setenv("MRC_HOME", str(missing))
+    assert main(["--json", "doctor"]) == EXIT_VALIDATION
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "doctor"
+    assert data["status"] == "fail"
+    assert any(not c["ok"] and not c.get("soft") for c in data["checks"])
+
+
+def test_doctor_human_format_report_unchanged_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: human format_report still ends with PASS/FAIL markers."""
+    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
+    text = format_report(run_doctor())
+    assert text.endswith("\n")
+    assert "doctor: PASS" in text
+    st = format_selftest_report(run_selftest())
+    assert "selftest: PASS" in st
 
 
 # ---------------------------------------------------------------------------
