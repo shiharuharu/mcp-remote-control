@@ -19,6 +19,7 @@ htmlcov/
 
 # Internal AI / wave task log — not part of the published project surface
 todo.md
+todo-*.md
 
 # Local agent handoff (if ever created under code-root)
 .agent-handoff/

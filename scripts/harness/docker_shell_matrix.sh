@@ -5,7 +5,7 @@
 #   MRC_DOCKER=1 ./scripts/harness/docker_shell_matrix.sh
 #   MRC_DOCKER=1 MATRIX_ONLY=busybox ./scripts/harness/docker_shell_matrix.sh
 #
-# Without MRC_DOCKER=1 → exit 0 (skip). Requires Docker daemon.
+# Without MRC_DOCKER=1 -> exit 0 (skip). Requires Docker daemon.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -63,7 +63,7 @@ run_cell() {
   fi
   local out
   if ! out=$(docker run --rm "$image" "$shell_bin" -c "$probe" 2>/dev/null); then
-    # Some images use sh without -c the same way — retry as sh -c
+    # Some images use sh without -c the same way - retry as sh -c
     if ! out=$(docker run --rm "$image" sh -c "$probe" 2>/dev/null); then
       echo "FAIL: $name probe command failed to execute" >&2
       FAIL=1
@@ -91,7 +91,7 @@ run_cell() {
 run_cell bash "bash:5" bash "$PROBE_BASH" "fc -p|history -d" || true
 run_cell busybox "busybox:1.36" sh "$PROBE_BUSYBOX" "fc -p|set \+o history|history -d" || true
 run_cell sh "debian:bookworm-slim" sh "$PROBE_SH" "fc -p|set \+o history|history -d" || true
-# zsh image may be large / missing — skip ok if pull fails
+# zsh image may be large / missing - skip ok if pull fails
 run_cell zsh "zshusers/zsh:5.9" zsh "$PROBE_ZSH" "set \+o history|history -d" || true
 
 # Also assert host-side unit registry still green when venv present

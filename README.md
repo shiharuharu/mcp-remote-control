@@ -46,7 +46,7 @@
 
 ## Agent 输出形态（MCP wire）
 
-规范上 `tools/call` 应返回 **纯文本** `content`，例如：
+规范上 `tools/call` 的 `content` 以 **Agent 文本** 为主，例如：
 
 ```json
 {
@@ -73,6 +73,8 @@ deploy
 那一层 `{"result":…}` 来自 MCP SDK 对 `-> str` 的自动 structured 包装（v1 FastMCP / v2 `MCPServer`）。本仓库在 tool 注册时使用 **`structured_output=False`**，只暴露 Agent 文本，避免 Host UI 显示 JSON 外壳。要求 **`mcp` SDK ≥ 2**（`MCPServer`）。
 
 CLI 默认同样是 Agent 文本；加 **`--json`** 才走机器轨。
+
+`fs read` 读到完整 PNG / JPEG / GIF / WebP 时，会在文本块后再附一个 `image` 块：文本仍是路径、大小、MIME 等元信息，**不含**图片 Base64。默认读取上限 **1 MiB**（可用 `max_bytes=` 加大）。超出上限的图片返回错误、不附图片。CLI 只显示元信息。
 
 ---
 
@@ -398,6 +400,75 @@ cwd = "/home/deploy"
 
 密钥：`chmod 600 $MRC_HOME/secrets/*`。密码可用 `password_path = "secrets/lab_pass"`。
 
+### `[winrm]` 配置
+
+WinRM profile 的传输调优键全部放在 `[winrm]`；`[auth].method = "password"` 默认映射为 `ntlm`。
+
+```toml
+# $MRC_HOME/profiles/lab-win.toml
+name = "lab-win"
+transport = "winrm"
+host = "10.0.0.6"
+username = "Administrator"
+
+[auth]
+password_path = "secrets/win_pass"
+
+[winrm]
+scheme = "http"                     # http | https
+server_cert_validation = "ignore"   # 实验室自签证书；生产请留空
+connect_timeout_ms = 15000
+operation_timeout_s = 20
+read_timeout_s = 22
+encryption = "auto"
+probe = "full"
+probe_timeout_s = 5
+reconnection_retries = 2
+reconnection_backoff = 0.5
+
+[winrm.credssp]                     # 仅 auth = "credssp" 时生效
+auth_mechanism = "ntlm"
+disable_tlsv1_2 = true
+minimum_version = 6
+```
+
+| 键（`[winrm]`） | 取值 | 默认 | 含义 |
+|-----------------|------|------|------|
+| `scheme` | `http` \| `https`（亦接受 `ssl` / `true` / `1`） | `http` | 是否走 pypsrp `ssl`；`https` 且 profile 未写 `port` 时端口取 5986 |
+| `ssl` | TOML 布尔 / 字符串 | `false` | `scheme` 之外的显式开关；`"false"` / `"0"` / `"no"` / `"off"` 均视为关 |
+| `auth` | `ntlm` \| `basic` \| `kerberos` \| `negotiate` \| `credssp` \| `certificate` | 由 `[auth].method` 推导（password → `ntlm`） | pypsrp 认证协议；`auth_method` 为等价别名 |
+| `server_cert_validation` | `ignore` / `false` / `0` / `no` 关闭校验 | 校验 | HTTPS 服务端证书校验；本键优先于 `cert_validation` |
+| `cert_validation` | TOML 布尔 | `true` | 同上；两个键都未写时校验 |
+| `connect_timeout_ms` | 整数毫秒 | `15000` | 建连预算；非法值回落默认 |
+| `operation_timeout_s` | 整数秒 | 不写用 pypsrp 默认 `20` | WSMan `OperationTimeout`；exec 调用还会按本次 `timeout_s` 收紧 |
+| `read_timeout_s` | 整数秒 | 不写时：有生效的 operation timeout 则 = 该值 `+ 2`，否则沿用 pypsrp 默认 `30` | HTTP 读超时；显式值优先。读超时必须晚于 WSMan 超时，否则客户端先读超时、拿到的是「像链路故障」的超时 |
+| `message_encryption` | `auto` \| `always` \| `never` | `auto` | 消息加密；`encryption` 为等价别名；`always` 与 `basic` / `certificate` 不兼容 |
+| `probe` | `skip` \| `light` \| `full`（亦接受 `true` / `false`、`1` / `0`） | `full` | open 后的身份 / 能力探测强度；`light` 跳过能力 oneshot，高延迟链路打不开时可用（丢失能力详情）；`skip` 完全跳过 |
+| `probe_timeout_s` | 正数秒 | `5` | 探测预算；高延迟链路（单次命令数秒）需调大。环境变量 `MRC_WINRM_PROBE_TIMEOUT_S` 优先于本键 |
+| `reconnection_retries` | 非负整数（上界 10） | `2` | pypsrp 连接层重试次数；`0` 显式禁用；未写 / 负数 / 非法值回落默认 |
+| `reconnection_backoff` | 秒（非负） | `0.5` | 重试退避间隔 |
+| `[winrm.credssp]` | 子表 | — | 仅 `auth = "credssp"`：`auth_mechanism` / `disable_tlsv1_2` / `minimum_version`；未写时沿用 `[auth]` 的同名字段 |
+
+`probe` 还可在 `[defaults].winrm_probe`（profile 或全局）设置，`MRC_WINRM_PROBE` 环境变量优先级最高。
+
+**链路保持实测提示**：WinRM 明文 HTTP + 消息加密（`scheme = "http"` 且 `encryption = "auto"`）下出现 `HTTP 400` 且 **body 为空**时，它只是一种**拒绝形态**，不是某一种病因的签名——实测它可出现在空闲后的第一个请求、拷贝中途、或重连握手中。**先查网络路径**：同一主机实测，请求经本地 HTTP 代理转发时空闲后的 `fs put` **7/7 失败**；不走代理（把目标主机加入 `NO_PROXY`，或去掉进程环境里的 `HTTP_PROXY` / `HTTPS_PROXY`）后 **18/18 成功**。「明文 HTTP 下消息加密上下文数秒空闲即失效」只是**其中一种**成因，不是 pypsrp 或明文 HTTP 的固有属性。两类拒绝含义不同：**4xx + 空 body** 是分帧层拒绝，已证明请求未被执行（重放安全）；**带 body 的拒绝**（中间方自己的错误页，实测 `502` + `Connection error: read ETIMEDOUT`）**是否已转发未知**——所以是否重放不按 body 判，只要求本次操作尚未完成过带载荷的往返（见下）。自动恢复：`exec`、`ps open` / `ps invoke` / `ps close`、以及 `endpoint open` 的身份 / 能力探测，都会在**重试不可能重复执行你的命令**时重握手并重试一次——判据是本次操作尚未成功完成过带载荷的往返（链路往返计数不可观测时只会更严，不会更宽）；`ps invoke` 首包即脚本，条件更严，只重放空 body 的 4xx 拒绝（`exec` / `ps open` / `ps close` 与探测的首包是建 shell / 建 runspace / 删 runspace / 身份探测，未完成过带载荷往返时带 body 的拒绝也会重放一次，重放不会重复你的命令）；`ps close` 的重发不会重复删除。其余链路类失败判链路失效、断开会话，重新 `endpoint open` 后再调用（下一次调用也会自动重连）；`ps close` 若删除没落地，用 `endpoint close` + `endpoint open` 收尾。`fs` 不静默重放写操作：观察到链路故障会报错并把端点标记为断开；下一次 `fs` 调用会自行重连，重新 `endpoint open` 只是可选的确认手段。改用 HTTPS（不施加消息加密）可消除加密上下文这一类成因。
+
+**子进程输出编码实测提示（子进程写 UTF-8 → 乱码，且工具侧无从察觉）**：WinRM 的 PSRP runspace 是 Windows PowerShell 5.1，它的 **native-command 输出处理器用 runspace 的 console 码页**（实测主机 gb2312/cp936）解子进程的 stdout 字节。决定性变量只有**子进程自己的 `[Console]::OutputEncoding`**：脚本显式把它设成 UTF-8 时（触发的是脚本里那行 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`，不是「用了 pwsh 7」——pwsh 7 的 stdout 被重定向时仍按 console 码页输出），`跳过` / `完成` / `包` 回来就是 `璺宠繃` / `瀹屾垚` / `鍖?`（`?` 是 .NET 的码页替换回退，不是 U+FFFD）。这层解码在**远端**完成、pypsrp 交回的就是已解好的 `str`，所以 `exec` 与 `ps invoke`（同一 runspace 边界，两条都实测）拿到的只是「看起来正常的」乱码：行是 `ok` / `exit=0`，**无提示、无 token**——**字节证据在远端解码处就已丢失，改本工具的解码器没有任何用**。工具侧也**无法**识别它：同一段收到文本既可能来自「对端写 UTF-8 被按 cp936 解」，也可能来自「对端本来就发这些汉字」，两者逐字相同。
+
+**两条实测有效**：① 让子进程按父进程的码页输出——把脚本里那行 `[Console]::OutputEncoding = [Text.Encoding]::UTF8` 去掉即可（同一脚本改回默认后 `跳过` / `完成` / `包` 全部正确）；② 输出落盘再读回，**重定向必须交给 `cmd` 做**：
+
+```text
+# 落盘：cmd 的重定向把子进程 stdout 的原始字节直接写进文件（实测取回的字节与子进程输出逐字节相同）
+exec  ep=<winrm-profile>  command='cmd /c "prog.exe > C:\Windows\Temp\mrc-out.txt"'
+# 读回二选一：fs read 按编码探测解文本（meta 带 | encoding=…）；fs get 把原始字节取到本机
+fs    op=read  ep=<winrm-profile>  path=C:\Windows\Temp\mrc-out.txt
+fs    op=get   ep=<winrm-profile>  path=C:\Windows\Temp\mrc-out.txt  local=./mrc-out.txt
+```
+
+需要 stderr 时在 cmd 串里写 `2>&1`（子进程是 powershell.exe 时，它写进重定向 stderr 的是 CLIXML 记录，实测文件开头会多出 `#< CLIXML` 段，正文行不受影响）。**不要**用 PowerShell 自己的 `>` 落盘：它先按同一码页把子进程输出解成字符串再写文件，实测落盘的正是 `璺宠繃` / `瀹屾垚` / `鍖?`（UTF-16LE+BOM），坏文本从此固化。
+
+**实测无效（别再试）**：照搬 SSH 的 `[Console]::OutputEncoding` prologue → 直接报 `句柄无效`（PSRP runspace 没有 console 句柄；SSH/WinRM 在这点上的不对称有正当理由）；只设 `$OutputEncoding` → 无效；`chcp 65001`（回显 `Active code page: 65001`）→ 无效；事后按 gb18030 重编码「修」回来 → **有损**：`.NET` 的替换回退已顶掉一个字节（`鍖?` 重编码后按 utf-8 解不开），信息不在我们手里。
+
 ### Agent 自助配置（优先）
 
 ```text
@@ -412,10 +483,11 @@ endpoint op=open profile=lab
 |-------------|------|
 | `home` / `ensure_home` | 查看 / 创建布局 + 默认 `config.toml` |
 | `get` / `list_profiles` / `get_profile` | 读配置（**无密钥正文**） |
-| `put_profile` / `delete_profile` | 写/删 `profiles/*.toml` |
+| `put_profile` / `delete_profile` | 写/删 `profiles/*.toml`（删档案时连带删对应 notes 文件） |
 | `put_secret` / `list_secrets` | 写密钥（只回路径）/ 列文件名 |
+| `notes` | 主机备注：`action=read\|write\|append\|prepend\|stat\|rm`；文件在 `notes/{name}.md`；**正文只在 read** |
 
-密钥 **只** 进 `secrets/`，响应永不回 body。
+密钥 **只** 进 `secrets/`，响应永不回 body。备注不是密钥；不要用 `fs` 去改 MRC_HOME。
 
 ---
 
@@ -427,7 +499,7 @@ endpoint op=open profile=lab
 |------|------|
 | `endpoint` | `op=list\|open\|close`；open 用 `profile=`；close 用 `ep=` |
 | `exec` | 非交互：`command` / `argv` / `script`（需 `ep=`） |
-| `fs` | `list\|stat\|read\|write\|put\|get\|mkdir\|rm`（需 `ep=`） |
+| `fs` | `list\|stat\|read\|write\|put\|get\|mkdir\|rm`（需 `ep=`）。`read` 完整 PNG/JPEG/GIF/WebP 以图片内容返回；默认上限 1 MiB，截断则报错 |
 | `screen` | 真 PTY（需 `ep=`）；**不是**串口 |
 | `ps` | WinRM 持久 PowerShell（需 `ep=`） |
 
@@ -448,7 +520,7 @@ console op=close  id=con_01
 | op | 含义 |
 |----|------|
 | `list` | 系统 console 设备名（禁止扫 `/dev`） |
-| `open` | `path=` / `device=`，可选 `baud=`、`max_lines=` |
+| `open` | `path=` / `device=`，可选 `baud=`、`max_lines=`、`encoding=`（对端控制台码页，如 `gbk`；不写按 UTF-8 读。串口设备没有 profile 可探测，所以由操作者显式给出；非法码页名会警告并回落 UTF-8） |
 | `send` | `id=` + `data=` / `data_b64=` |
 | `views` | `mode=tail\|since\|contains` |
 | `close` / `sessions` | 关闭 / 列会话 |
@@ -611,6 +683,11 @@ python -m mcp_remote_control.mcp_server
 | `uvx` / No solution · Python 版本 | 加 **`--python 3.12`**（或 ≥3.11）；确认仓库根有 `pyproject.toml`，勿乱加 `#subdirectory=`。 |
 | 私有仓认证失败 | `git+ssh://…` 或配好 Git/SSH 凭据。 |
 | `PROFILE_NOT_FOUND` | 检查配置根与 `profiles/<name>.toml`；或用 `config put_profile`。默认配置根：`~/.config/mcp-remote-control`。 |
+| `NOTES_NOT_FOUND` | 该 profile 还没有 `notes/{name}.md`；先 `config op=notes action=write`。 |
+| `NOTES_TOO_LARGE` | 备注超过 `max_body_chars`（默认 24000）；缩短后再 write/append/prepend。 |
+| `NOTES_ENCODING_INVALID` | 备注文件不是 UTF-8（read/append/prepend 都会碰到）。**文件未被改动**；按 UTF-8 重编码，或用 `write` 整体覆盖。 |
+| WinRM 输出中文变乱码（`跳过`→`璺宠繃`），行却是 `ok` / `exit=0` | PSRP runspace（5.1）按 console 码页解了子进程的 stdout；字节在远端已丢，工具侧无提示、也无法检测，改本工具的解码器没用。照 [WinRM 配置](#winrm-配置) 一节的「子进程输出编码实测提示」落盘再读回（或先让子进程别写 UTF-8）。 |
+| `PS_CLOSE_UNCONFIRMED` | `ps close` 的 WSMan Delete 被拒，且服务端的应答没能证明远端 runspace 已消失：本进程已注销会话，但**远端 runspace 可能仍在**。先 `endpoint close` + `endpoint open` 重握手，再 `ps open`；期间把主机的 runspace 计数视为可能过时。服务端明确答「无此 shell」（selectors 不匹配该对象）属于删除已落地的证据，此时报 `ok` 而不是本码。 |
 | `Permission denied` 指向奇怪家目录 | Host 里 `MRC_HOME` 若填了无效路径，删掉 `env.MRC_HOME` 用默认，或改成终端里 `echo "$HOME/.config/mcp-remote-control"` 的结果。 |
 | `SCREEN_NOT_FOUND` | 会话仅在**当前** Python 进程内。勿跨两次 CLI 进程接力 `screen open` / `send`；见 [CLI · 进程内状态限制](#进程内状态限制必读)。 |
 | 远端/源码已更新 Host 仍旧 | `uvx --refresh` / pin 新 commit / 开发用本地 `--with-editable`。 |

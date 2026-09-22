@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""In-process screen open → send → close for smoke_local.
+"""In-process screen open -> send -> close for smoke_local.
 
 Endpoint and screen registries are process-local. Multi-process CLI sequences
 like ``mcp-remote-control-cli screen open`` then ``mcp-remote-control-cli screen send`` fail with SCREEN_NOT_FOUND
