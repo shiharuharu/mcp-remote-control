@@ -161,12 +161,11 @@ async def main() -> None:
     print("console:", header)
 
     text = _text(await mcp.call_tool("config", {"op": "home"}))
-    # op_home emits exists=/ready=/layout= and omits the home path field
+    # op_home emits ready=/layout= and omits the home path field
     header = text.splitlines()[0]
     assert header.startswith("@config ok"), text
-    assert "exists=1" in header, text
     assert "ready=1" in header, text
-    assert "layout=profiles,secrets,notes,logs,state" in header, text
+    assert "layout=profiles,secrets,notes,state" in header, text
     assert "home=" not in text, text
     assert "op=home" not in text, text
     print("config:", header)

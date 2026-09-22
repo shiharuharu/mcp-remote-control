@@ -229,7 +229,6 @@ def ensure_home_layout(home: Path) -> dict[str, str]:
         "profiles": profiles_dir(home),
         "secrets": secrets_dir(home),
         "notes": notes_dir(home),
-        "logs": home / "logs",
         "state": home / "state",
     }
     for p in dirs.values():
@@ -243,10 +242,6 @@ def ensure_home_layout(home: Path) -> dict[str, str]:
             "# mcp-remote-control \u2014 agent/self managed\n"
             "[defaults]\n"
             'verbosity = "normal"\n'
-            "\n"
-            "[logging]\n"
-            'level = "info"\n'
-            'dir = "logs"\n'
             "\n"
             "[security]\n"
             "strict_perms = false\n",

@@ -114,7 +114,7 @@ uvx --python 3.12 --with-editable "$REPO" --from "$REPO" mcp-remote-control
 ### 1. 配置目录
 
 ```bash
-mkdir -p ~/.config/mcp-remote-control/{profiles,secrets,state,logs}
+mkdir -p ~/.config/mcp-remote-control/{profiles,secrets,state}
 export MRC_HOME="$HOME/.config/mcp-remote-control"
 ```
 
@@ -344,7 +344,6 @@ Host 侧：重连后工具列表须含 `config`；调用结果应为 `@kind …`
 | `$MRC_HOME/profiles/*.toml` | 每个 endpoint 一个 profile（`name` = `ep=` / `profile=`） |
 | `$MRC_HOME/secrets/` | 密钥/密码文件（**勿提交 Git**） |
 | `$MRC_HOME/state/` | 运行时状态 |
-| `$MRC_HOME/logs/` | 日志 |
 
 | 环境变量 | 含义 |
 |----------|------|
@@ -362,10 +361,6 @@ Host 侧：重连后工具列表须含 `config`；调用结果应为 `@kind …`
 # $MRC_HOME/config.toml
 [defaults]
 verbosity = "normal"
-
-[logging]
-level = "info"
-dir = "logs"
 ```
 
 ```toml

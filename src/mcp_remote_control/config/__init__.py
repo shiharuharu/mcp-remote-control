@@ -22,7 +22,6 @@ from mcp_remote_control.config.models import (
     AuthConfig,
     DefaultsConfig,
     GlobalConfig,
-    LoggingConfig,
     Profile,
     SecurityConfig,
 )
@@ -46,7 +45,6 @@ __all__ = [
     "ConfigInvalid",
     "DefaultsConfig",
     "GlobalConfig",
-    "LoggingConfig",
     "NotesNotFound",
     "Profile",
     "ProfileInvalid",

@@ -26,7 +26,6 @@ from mcp_remote_control.config.models import (
     AuthConfig,
     DefaultsConfig,
     GlobalConfig,
-    LoggingConfig,
     Profile,
     SecurityConfig,
     Transport,
@@ -114,7 +113,6 @@ def load_config(home: Path) -> GlobalConfig:
 
     try:
         defaults = _parse_defaults(data.get("defaults"))
-        logging_cfg = _parse_logging(data.get("logging"))
         security = _parse_security(data.get("security"))
     except ConfigInvalid:
         raise
@@ -123,7 +121,6 @@ def load_config(home: Path) -> GlobalConfig:
 
     return GlobalConfig(
         defaults=defaults,
-        logging=logging_cfg,
         security=security,
         from_defaults=False,
         source_path=path.resolve(),
@@ -796,8 +793,8 @@ def _section_str(
 ) -> str:
     """Require a real ``str`` for ``[{section}].*`` string fields.
 
-    Rejects bool/int/float/containers so ``str(True) -> \"True\"`` cannot
-    silently poison level / dir / verbosity / screen_term / default_shell.
+    Rejects bool/int/float/containers so ``str(True) -> "True"`` cannot
+    silently poison verbosity.
     """
     if key not in table:
         return default
@@ -815,7 +812,7 @@ def _section_int(
     """Require a real ``int`` (not bool) for ``[{section}].*`` int fields.
 
     Aligns with ``_optional_int``: ``bool`` is an ``int`` subclass, so
-    ``int(True) == 1`` must not pass as a timeout/size/geometry/bytes value.
+    ``int(True) == 1`` must not pass as a bytes value.
     Floats, strings, and non-scalars raise ``ConfigInvalid``.
     """
     if key not in table:
@@ -854,11 +851,6 @@ def _parse_defaults(table: Any) -> DefaultsConfig:
     return DefaultsConfig(
         verbosity=_defaults_str(table, "verbosity", base.verbosity),
         max_body_chars=_defaults_int(table, "max_body_chars", base.max_body_chars),
-        screen_cols=_defaults_int(table, "screen_cols", base.screen_cols),
-        screen_rows=_defaults_int(table, "screen_rows", base.screen_rows),
-        screen_term=_defaults_str(table, "screen_term", base.screen_term),
-        default_shell=_defaults_str(table, "default_shell", base.default_shell),
-        exec_timeout_ms=_defaults_int(table, "exec_timeout_ms", base.exec_timeout_ms),
         winrm_probe=winrm_probe,
     )
 
@@ -951,27 +943,6 @@ def _parse_config_bool(value: object, *, section: str, key: str) -> bool:
         )
     raise ConfigInvalid(
         f"[{section}].{key} must be a boolean (got {type(value).__name__})"
-    )
-
-
-def _parse_logging(table: Any) -> LoggingConfig:
-    if table is None:
-        return LoggingConfig()
-    if not isinstance(table, dict):
-        raise ConfigInvalid("[logging] must be a table")
-    base = LoggingConfig()
-    audit_raw = table.get("audit", base.audit)
-    # Strict types: same rules as [defaults] - real str for level/dir;
-    # real int (not bool) for max_bytes/backup_count. No bare str()/int()
-    # coercion (str(True)=="True", int(True)==1).
-    return LoggingConfig(
-        level=_section_str(table, "logging", "level", base.level),
-        dir=_section_str(table, "logging", "dir", base.dir),
-        max_bytes=_section_int(table, "logging", "max_bytes", base.max_bytes),
-        backup_count=_section_int(
-            table, "logging", "backup_count", base.backup_count
-        ),
-        audit=_parse_config_bool(audit_raw, section="logging", key="audit"),
     )
 
 

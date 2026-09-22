@@ -75,7 +75,7 @@ VALID_OPS: frozenset[str] = frozenset(
 
 # Agent-facing directory enumeration (home / ensure_home). Notes live beside
 # profiles, not under state/.
-_LAYOUT_DIRS = "profiles,secrets,notes,logs,state"
+_LAYOUT_DIRS = "profiles,secrets,notes,state"
 
 _NOTES_ACTIONS: frozenset[str] = frozenset(
     {"read", "write", "append", "prepend", "stat", "rm"}
@@ -439,7 +439,6 @@ def op_home(*, home: Path | str | None = None, **_kwargs: Any) -> OpResult:
         fields={
             "op": "home",
             "ready": 1 if h.is_dir() else 0,
-            "exists": 1 if h.is_dir() else 0,
             "layout": _LAYOUT_DIRS,
         },
         body=(

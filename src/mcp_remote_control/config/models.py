@@ -161,47 +161,18 @@ class DefaultsConfig:
     Consumed today: ``max_body_chars`` (notes body truncation) and
     ``winrm_probe`` (WinRM open-time probe intensity).
 
-    ``verbosity``, ``screen_cols``, ``screen_rows``, ``screen_term``,
-    ``default_shell`` and ``exec_timeout_ms`` are parsed and type-checked but
-    no code path acts on them, so setting them has no effect. ``verbosity`` is
-    echoed by ``config op=get`` as a report of the parsed value; nothing reads
-    a level, installs a handler, or changes rendered output from it. The
-    behaviours the others name come from elsewhere: screen geometry and the
-    shell are per-profile (the *profile* ``[defaults]`` table's ``screen_cols``
-    / ``screen_rows`` / ``shell``), ``TERM`` is the built-in
-    ``xterm-256color``, and fs/exec wait budgets are fixed constants. Wire a
-    consumer before advertising any of these as effective.
+    ``verbosity`` is parsed and type-checked but no code path acts on it, so
+    setting it has no effect. It is echoed by ``config op=get`` as a report of
+    the parsed value; nothing reads a level, installs a handler, or changes
+    rendered output from it. Wire a consumer before advertising it as
+    effective.
     """
 
     verbosity: str = "normal"
     max_body_chars: int = 24000
-    screen_cols: int = 120
-    screen_rows: int = 40
-    screen_term: str = "xterm-256color"
-    default_shell: str = ""
-    exec_timeout_ms: int = 60000
     # WinRM open-time probe mode (skip | light | full). Default full keeps
     # hard identity RTT; lab may set skip/light to avoid MaxShells oneshots.
     winrm_probe: str = "full"
-
-
-@dataclass(frozen=True)
-class LoggingConfig:
-    """Global ``[logging]`` values from ``config.toml``.
-
-    Parsed and type-checked, but not wired yet: nothing calls
-    ``logging.basicConfig`` / ``dictConfig`` or installs a handler, so
-    ``level``, ``dir``, ``max_bytes``, ``backup_count`` and ``audit`` have no
-    effect and the ``logs/`` directory created by ``ensure_home_layout``
-    stays empty. The table is reserved for a future file-logging consumer; do
-    not read it as an effective log configuration until one exists.
-    """
-
-    level: str = "info"
-    dir: str = "logs"
-    max_bytes: int = 10_485_760
-    backup_count: int = 5
-    audit: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,7 +198,6 @@ class GlobalConfig:
     """Parsed global ``config.toml`` (or built-in defaults when absent)."""
 
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
-    logging: LoggingConfig = field(default_factory=LoggingConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     # True when no config.toml existed and defaults were used.
     from_defaults: bool = True
