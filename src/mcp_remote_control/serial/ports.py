@@ -14,7 +14,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class SerialConsoleInfo:
-    """One system-visible serial console (USB, UART, BT-SPP mapped COM, …)."""
+    """One system-visible serial console (USB, UART, BT-SPP mapped COM, ...)."""
 
     device: str
     """OS path / name to open (e.g. COM5, /dev/ttyUSB0, /dev/rfcomm0)."""
@@ -32,7 +32,7 @@ class SerialConsoleInfo:
     location: str | None = None
     # Best-effort link class for agent meta (not a second API surface).
     link: str = "serial"
-    """usb | uart | bluetooth | unknown — heuristic from hwid/description."""
+    """usb | uart | bluetooth | unknown \u2014 heuristic from hwid/description."""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -91,7 +91,7 @@ def list_serial_consoles(
 ) -> list[SerialConsoleInfo]:
     """Return serial consoles visible on **this host** (MCP controller machine).
 
-    Does not scan filesystem paths by hand — delegates to pyserial
+    Does not scan filesystem paths by hand - delegates to pyserial
     ``list_ports``. Raises ``ImportError`` if pyserial is not installed.
     """
     if lister is not None:

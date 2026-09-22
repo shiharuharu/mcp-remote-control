@@ -1,4 +1,4 @@
-"""PTY fixture replay for CI — no live TUI required.
+"""PTY fixture replay for CI - no live TUI required.
 
 Load recorded ANSI/PTY bytes, feed a pyte buffer, return frame + hash + cur.
 Optional JSON meta next to the fixture can pin expected hash / substrings.
@@ -26,7 +26,7 @@ from mcp_remote_control.screen.buffer import (
 def _default_fixture_dir() -> Path:
     """Locate tests/fixtures/pty from an editable checkout when present."""
     here = Path(__file__).resolve()
-    # repo root/src/mcp_remote_control/screen/replay.py → parents[3] = repo root
+    # repo root/src/mcp_remote_control/screen/replay.py -> parents[3] = repo root
     for parent in here.parents:
         cand = parent / "tests" / "fixtures" / "pty"
         if cand.is_dir():
@@ -68,7 +68,7 @@ def load_meta(path: Path | str) -> dict[str, Any]:
         candidates.append(p.with_suffix(p.suffix + ".meta.json"))
         candidates.append(p.with_name(p.name + ".meta.json"))
         candidates.append(p.with_suffix(".meta.json"))
-        # e.g. bash_prompt.bin → bash_prompt.meta.json
+        # e.g. bash_prompt.bin -> bash_prompt.meta.json
         candidates.append(p.with_name(p.stem + ".meta.json"))
     for c in candidates:
         if c.is_file():

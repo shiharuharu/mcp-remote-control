@@ -1,16 +1,25 @@
 """xterm-dialect key / paste encoder for PTY stdin bytes.
 
-Encodes named keys (enter, ctrl+c, arrows, …), modifiers, SGR mouse events,
+Encodes named keys (enter, ctrl+c, arrows, ...), modifiers, SGR mouse events,
 and bracketed paste. Single source for screen_send action encoding.
+
+Named keys, mouse reports and paste delimiters are terminal control bytes and
+are written as-is. Literal text is the peer's text, so it is encoded in the
+codec the receiving session resolved for its own reads (see ``encode_text``).
+That covers the single-character forms of ``key``/``keys`` actions (plain,
+``alt+``, ``shift+``, ``alt+shift+``) as well: the base is a character the peer
+receives as text, not a control sequence.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 
+from mcp_remote_control.codec.text_codec import encode_for_remote
+
 ESC = b"\x1b"
 CSI = ESC + b"["
-# Bracketed paste (xterm): ESC [ 200 ~ … ESC [ 201 ~
+# Bracketed paste (xterm): ESC [ 200 ~ ... ESC [ 201 ~
 PASTE_START = CSI + b"200~"
 PASTE_END = CSI + b"201~"
 
@@ -60,7 +69,7 @@ _CSI_LETTER: dict[str, bytes] = {
     "end": b"F",
 }
 
-# Function keys F1–F12 (xterm).
+# Function keys F1-F12 (xterm).
 _F_KEYS: dict[str, bytes] = {
     "f1": ESC + b"OP",
     "f2": ESC + b"OQ",
@@ -76,7 +85,7 @@ _F_KEYS: dict[str, bytes] = {
     "f12": CSI + b"24~",
 }
 
-# Ctrl+letter → ASCII control byte (ctrl+a=0x01 … ctrl+z=0x1a; also @[\\]^_).
+# Ctrl+letter -> ASCII control byte (ctrl+a=0x01 ... ctrl+z=0x1a; also @[\\]^_).
 _CTRL_LETTER: dict[str, int] = {
     "@": 0x00,
     "a": 0x01,
@@ -118,16 +127,42 @@ class KeyEncodeError(ValueError):
     """Raised when a key name cannot be encoded."""
 
 
-def encode_text(text: str) -> bytes:
-    """UTF-8 encode literal text (no CR/LF normalization beyond given string)."""
+def encode_text(text: str, *, codec: str | None = None) -> bytes:
+    """Encode literal text for the peer, in *codec* (default utf-8).
+
+    *codec* is the receiving session's resolved peer codec (``ScreenSession.
+    text_codec``, the console ring's ``text_encoding``): a console that reads a
+    legacy code page reads typed text in that same code page, so utf-8 bytes
+    land on it as mojibake. Encoding never raises - a character the codec
+    cannot represent is written as its replacement character (see
+    ``codec.text_codec.encode_for_remote``). Control bytes and raw payloads are
+    not text and must not pass through here.
+    """
     if not text:
         return b""
-    return text.encode("utf-8", errors="replace")
+    return encode_for_remote(text, codec or "utf-8")
 
 
-def encode_paste(text: str, *, bracketed: bool = True) -> bytes:
-    """Encode paste payload; wrap with bracketed-paste sequences when enabled."""
-    body = encode_text(text)
+def encode_paste(
+    text: str,
+    *,
+    bracketed: bool = True,
+    codec: str | None = None,
+) -> bytes:
+    """Encode paste payload; wrap with bracketed-paste sequences when enabled.
+
+    *bracketed* must reflect the receiving program's state, not a hope:
+    xterm's delimiters are only meaningful to a program that announced DECSET
+    2004 (see ``screen.send.resolve_bracketed_paste``). A line editor without
+    it eats the ``ESC[2`` prefix and inserts the rest of the delimiter
+    literally, corrupting the payload. The default exists for byte-level
+    round-trips (tests, fixtures); interactive sends must pass the resolved
+    capability explicitly.
+
+    The payload is text, so it follows *codec* like :func:`encode_text`. The
+    delimiters themselves are terminal control bytes and stay ASCII.
+    """
+    body = encode_text(text, codec=codec)
     if not bracketed:
         return body
     return PASTE_START + body + PASTE_END
@@ -146,11 +181,16 @@ def encode_raw_hex(hex_str: str) -> bytes:
         raise KeyEncodeError(f"invalid hex: {hex_str!r}") from exc
 
 
-def encode_key(key: str) -> bytes:
+def encode_key(key: str, *, codec: str | None = None) -> bytes:
     """Encode a single named key (xterm dialect) to PTY bytes.
 
-    Syntax: ``[mod+]*base`` where mod ∈ {ctrl, alt, shift, super/meta/cmd}
-    and base is a named key or single character.
+    Syntax: ``[mod+]*base`` where mod is one of ctrl, alt, shift, or
+    super/meta/cmd, and base is a named key or single character.
+
+    A single-character base is literal text and follows *codec* (the peer
+    session's codec; utf-8 when unset - see :func:`encode_text`). Named keys,
+    modifier parameters and control bytes are terminal protocol bytes and are
+    written as-is whatever *codec* says.
     """
     if key is None:
         raise KeyEncodeError("key is None")
@@ -160,7 +200,7 @@ def encode_key(key: str) -> bytes:
 
     # Split on "+" preserving the ORIGINAL case of each segment. Modifier names
     # are matched case-insensitively (ctrl/alt/shift/super), but the base char
-    # must keep its case so encode_key("A") → b"A" and alt+X → ESC + b"X".
+    # must keep its case so encode_key("A") -> b"A" and alt+X -> ESC + b"X".
     parts = [p for p in raw.split("+") if p]
     if not parts:
         raise KeyEncodeError(f"empty key: {key!r}")
@@ -188,21 +228,27 @@ def encode_key(key: str) -> bytes:
     else:
         base = base_parts[0]
 
-    return _encode_base(base, mods=mods, original=raw)
+    return _encode_base(base, mods=mods, original=raw, codec=codec)
 
 
-def encode_keys(keys: Iterable[str]) -> bytes:
-    """Encode an ordered sequence of named keys."""
+def encode_keys(keys: Iterable[str], *, codec: str | None = None) -> bytes:
+    """Encode an ordered sequence of named keys (see :func:`encode_key`)."""
     out = bytearray()
     for k in keys:
-        out.extend(encode_key(k))
+        out.extend(encode_key(k, codec=codec))
     return bytes(out)
 
 
-def _encode_base(base: str, *, mods: int, original: str) -> bytes:
+def _encode_base(
+    base: str,
+    *,
+    mods: int,
+    original: str,
+    codec: str | None = None,
+) -> bytes:
     # Named keys are matched case-insensitively on a lowercased view, while the
     # original-case ``base`` is used for single-character encoding so that
-    # encode_key("A") → b"A" and alt+X → ESC + b"X" (not lowercased).
+    # encode_key("A") -> b"A" and alt+X -> ESC + b"X" (not lowercased).
     base_lower = base.lower()
 
     # Function keys
@@ -218,7 +264,7 @@ def _encode_base(base: str, *, mods: int, original: str) -> bytes:
     if base_lower == "backtab":
         return _NAMED_BASE["backtab"]
 
-    # Arrows / home / end with modifiers → CSI 1;<n>X
+    # Arrows / home / end with modifiers -> CSI 1;<n>X
     if base_lower in _CSI_LETTER:
         if mods == 0:
             return _NAMED_BASE[base_lower]
@@ -226,7 +272,7 @@ def _encode_base(base: str, *, mods: int, original: str) -> bytes:
         param = mods + 1
         return CSI + f"1;{param}".encode("ascii") + _CSI_LETTER[base_lower]
 
-    # pageup/pagedown/delete/insert with mods → CSI n;<mod>~
+    # pageup/pagedown/delete/insert with mods -> CSI n;<mod>~
     _tilde_codes = {
         "pageup": 5,
         "page_up": 5,
@@ -246,7 +292,7 @@ def _encode_base(base: str, *, mods: int, original: str) -> bytes:
         param = mods + 1
         return CSI + f"{code};{param}~".encode("ascii")
 
-    # shift+tab → backtab (plain tab is handled above when mods == 0).
+    # shift+tab -> backtab (plain tab is handled above when mods == 0).
     if base_lower == "tab" and mods == _MOD_SHIFT:
         return _NAMED_BASE["backtab"]
 
@@ -256,13 +302,14 @@ def _encode_base(base: str, *, mods: int, original: str) -> bytes:
         if ch in _CTRL_LETTER:
             return bytes([_CTRL_LETTER[ch]])
 
-    # alt+char → ESC + char (xterm classic); preserve original char case.
+    # alt+char -> ESC + char (xterm classic); preserve original char case.
+    # The char is peer text, so it follows the peer codec; ESC stays a byte.
     if mods == _MOD_ALT and len(base) == 1:
-        return ESC + base.encode("utf-8")
+        return ESC + encode_text(base, codec=codec)
 
-    # alt+shift+letter → ESC + uppercase letter (shift forces upper).
+    # alt+shift+letter -> ESC + uppercase letter (shift forces upper).
     if mods == (_MOD_ALT | _MOD_SHIFT) and len(base) == 1 and base.isalpha():
-        return ESC + base.upper().encode("utf-8")
+        return ESC + encode_text(base.upper(), codec=codec)
 
     # alt+ctrl+char
     if mods == (_MOD_ALT | _MOD_CTRL) and len(base) == 1:
@@ -270,15 +317,30 @@ def _encode_base(base: str, *, mods: int, original: str) -> bytes:
         if ch in _CTRL_LETTER:
             return ESC + bytes([_CTRL_LETTER[ch]])
 
-    # Plain single character — preserve original case (mods == 0).
+    # Plain single character - preserve original case (mods == 0). Text typed
+    # into the peer, so it follows the peer codec like any other literal text.
     if mods == 0 and len(base) == 1:
-        return base.encode("utf-8")
+        return encode_text(base, codec=codec)
 
-    # shift+letter → uppercase
+    # shift+letter -> uppercase
     if mods == _MOD_SHIFT and len(base) == 1 and base.isalpha():
-        return base.upper().encode("utf-8")
+        return encode_text(base.upper(), codec=codec)
 
     raise KeyEncodeError(f"unsupported key: {original!r}")
+
+
+# Accepted button names and their xterm Cb base value. Anything else is a
+# caller error: defaulting an unrecognised name to 0 would deliver a LEFT
+# press+release - activating whatever control is under the cell - for a caller
+# who asked for something else (a wheel name, a typo), and report ok.
+_MOUSE_BUTTONS: dict[str, int] = {
+    "left": 0,
+    "middle": 1,
+    "right": 2,
+    "0": 0,
+    "1": 1,
+    "2": 2,
+}
 
 
 def encode_mouse_sgr(
@@ -292,9 +354,16 @@ def encode_mouse_sgr(
     """Encode an SGR mouse event (1-based cell coords as xterm expects).
 
     *row*/*col* are 0-based agent coords; converted to 1-based for the wire.
+    *button* must be one of the names in ``_MOUSE_BUTTONS``; an unrecognised
+    value raises rather than defaulting (see that table).
     """
-    btn_map = {"left": 0, "middle": 1, "right": 2, "0": 0, "1": 1, "2": 2}
-    b = btn_map.get(str(button).lower(), 0)
+    try:
+        b = _MOUSE_BUTTONS[str(button).lower()]
+    except KeyError as exc:
+        raise KeyEncodeError(
+            f"unsupported mouse button: {button!r} "
+            f"(expected one of {sorted(_MOUSE_BUTTONS)})"
+        ) from exc
     mod_bits = 0
     for m in mods or ():
         ml = str(m).lower()

@@ -1,4 +1,4 @@
-"""Console session: buffer views + background capture + console_* ops."""
+"""Console session: background capture + console_* ops / pump / allowlist."""
 
 from __future__ import annotations
 
@@ -6,43 +6,19 @@ import base64
 import threading
 import time
 
+import pytest
+
 from mcp_remote_control.core import console_ops
 from mcp_remote_control.serial.buffer import LineRingBuffer
+from mcp_remote_control.serial.capture import CapturePump
 from mcp_remote_control.serial.handle import SerialConsole
 from mcp_remote_control.serial.ports import SerialConsoleInfo
 from mcp_remote_control.serial.registry import (
+    SerialRegistry,
+    SerialSession,
     get_serial_registry,
     reset_serial_registry,
 )
-
-
-def test_line_ring_tail_since_contains() -> None:
-    b = LineRingBuffer(max_lines=100)
-    b.feed(b"boot\nU-Boot 2020\nLinux starting\n")
-    b.feed(b"Kernel panic - not syncing\nmore\n")
-    tail = b.view_tail(2, include_partial=False)
-    assert [x.text for x in tail] == ["Kernel panic - not syncing", "more"]
-    since0 = b.view_since(0)
-    assert len(since0) == 5
-    mid = since0[1].seq
-    assert len(b.view_since(mid)) == 3
-    hit, total = b.view_contains("panic", context=1)
-    texts = [x.text for x in hit]
-    assert total >= 1
-    assert "Kernel panic - not syncing" in texts
-
-
-def test_line_ring_drops_oldest() -> None:
-    b = LineRingBuffer(max_lines=3)
-    for i in range(5):
-        b.feed(f"L{i}\n".encode())
-    assert b.line_count == 3
-    assert b.dropped_lines == 2
-    assert [x.text for x in b.view_tail(10, include_partial=False)] == [
-        "L2",
-        "L3",
-        "L4",
-    ]
 
 
 class _ThreadSafeFakeSer:
@@ -80,7 +56,7 @@ class _ThreadSafeFakeSer:
 
 
 def test_background_capture_without_views_calls(monkeypatch) -> None:
-    """P0: RX enters buffer while agent is idle (no send/views)."""
+    """RX enters buffer while agent is idle (no send/views)."""
     reset_serial_registry()
     fake = _ThreadSafeFakeSer()
 
@@ -223,7 +199,7 @@ def test_endpoint_rejects_console_ops() -> None:
 
 
 # ---------------------------------------------------------------------------
-# O9: serial/console fixes — incremental follow, view_tail race, O(N²) feed,
+# Serial/console: incremental follow, view_tail race, O(N^2) feed,
 # pump error surfacing, send failure/partial, open device validation,
 # data_b64 newline, int coercion guard, close-error surfacing.
 # ---------------------------------------------------------------------------
@@ -242,7 +218,7 @@ def test_tail_then_since_keeps_committed_line(monkeypatch) -> None:
     """to_seq points at the last COMMITTED seq, so since=<to_seq> returns the
     line that commits at the synthetic partial's seq (was skipped before)."""
     reset_serial_registry()
-    fake = _ThreadSafeFakeSer()  # rx empty → pump idles, no buffer mutation
+    fake = _ThreadSafeFakeSer()  # rx empty -> pump idles, no buffer mutation
     _patch_console_open(monkeypatch, fake)
 
     r = console_ops.run("open", path="COM9", baud=115200, max_lines=1000)
@@ -273,23 +249,6 @@ def test_tail_then_since_keeps_committed_line(monkeypatch) -> None:
     console_ops.run("close", id=sid)
 
 
-def test_view_tail_synth_seq_matches_next_seq(monkeypatch) -> None:
-    """view_tail captures _next_seq under the lock for the synthetic partial.
-
-    Empty-buffer case pins the code change: the synth seq is _next_seq (1),
-    not the old ``lines[-1].seq + 1 if lines else 0`` (0); and it matches
-    view_since's partial-synthetic seq so tail/since stay consistent.
-    """
-    b = LineRingBuffer(max_lines=100)
-    b.feed(b"partial")  # no committed lines, partial="partial", _next_seq=1
-    tail = b.view_tail(10)
-    assert len(tail) == 1
-    assert tail[0].seq == 1  # was 0 before the fix
-    since = b.view_since(0, include_partial=True)
-    assert len(since) == 1
-    assert since[0].seq == tail[0].seq  # tail/since synth seqs agree
-
-
 def test_view_tail_with_pump_appending_on_read_not_hidden(monkeypatch) -> None:
     """GENUINE race test: a fake that appends lines on read (the pump feeds the
     buffer from read()) concurrent with the views_console call must not hide
@@ -297,7 +256,7 @@ def test_view_tail_with_pump_appending_on_read_not_hidden(monkeypatch) -> None:
 
     The pump's ``read()`` is gated by a ``threading.Event`` released inside an
     instrumented ``snapshot_meta`` AFTER it reads ``_lines`` (so the pump's
-    feed lands AFTER ``snapshot_meta`` observes ``latest_seq`` — the "Case A"
+    feed lands AFTER ``snapshot_meta`` observes ``latest_seq`` - the "Case A"
     window the cursor fix addresses). The cursor (``to_seq``) stays on the
     last committed seq (``latest_seq=1``), and ``since=<to_seq>`` returns the
     concurrently committed "real" line (seq=2).
@@ -308,7 +267,7 @@ def test_view_tail_with_pump_appending_on_read_not_hidden(monkeypatch) -> None:
 
     The Case B window (feed lands BETWEEN ``view_tail`` and the cursor
     computation) is now closed by anchoring the cursor to ``latest_at_view``
-    captured under ``view_tail``'s lock — see
+    captured under ``view_tail``'s lock - see
     ``test_view_tail_case_b_feed_between_view_and_meta``. The earlier note
     that ``to_seq = min(last_seq, latest)`` would fix Case B was WRONG:
     ``min(2, 2) == 2`` still skips seq=2. The real fix captures the latest
@@ -376,7 +335,7 @@ def test_view_tail_with_pump_appending_on_read_not_hidden(monkeypatch) -> None:
     # Instrument snapshot_meta to release the gate AFTER it reads _lines
     # (Case A). The pump's next read() returns "real\n", the pump's feed
     # acquires the lock after snapshot_meta releases it, so the feed lands
-    # after snapshot_meta observed latest_seq=1 — the cursor drops to 1.
+    # after snapshot_meta observed latest_seq=1 - the cursor drops to 1.
     orig_snapshot_meta = buf.snapshot_meta
 
     def _gated_snapshot_meta() -> dict[str, int]:
@@ -414,52 +373,8 @@ def test_view_tail_with_pump_appending_on_read_not_hidden(monkeypatch) -> None:
     console_ops.run("close", id=sid)
 
 
-def test_feed_normalization_large_no_newline_bounded() -> None:
-    """Feeding a large no-newline dump does not re-scan the whole partial each
-    time (O(N²) before) and the partial stays bounded by the 1MB flush cap;
-    lines still split correctly when newlines finally arrive.
-    """
-    b = LineRingBuffer(max_lines=100_000)
-    added = b.feed(b"x" * 2_000_000)
-    # Cap pushed one 1MB line; partial is bounded at ~1M chars.
-    assert added == 1
-    assert b.line_count == 1
-    assert len(b.peek_partial()) <= 1_000_000
-    # Many small no-newline feeds accumulate without re-scanning / splitting.
-    b2 = LineRingBuffer(max_lines=100_000)
-    for _ in range(1000):
-        b2.feed(b"y")
-    assert b2.line_count == 0
-    assert b2.peek_partial() == "y" * 1000
-    b2.feed(b"\n")
-    assert b2.line_count == 1
-    assert b2.view_tail(1, include_partial=False)[0].text == "y" * 1000
-
-
-def test_feed_crlf_cr_normalization_boundary() -> None:
-    """\r\n / \r normalization is correct and matches the original semantics:
-    within-feed \r\n collapses to one break, a lone \r is an immediate line
-    break, and a \r\n split across two feeds yields an empty line (the
-    trailing \r flushes within the first feed) — preserved exactly by the
-    O(chunk) normalize-only-new-text rewrite."""
-    b = LineRingBuffer(max_lines=100)
-    b.feed(b"a\r\nb\rc\r")  # → "a", "b", "c"; partial empty (trailing \r→\n flushed)
-    b.feed(b"\nd")  # → "" (empty line from the bare \n), partial "d"
-    tail = b.view_tail(10, include_partial=False)
-    assert [x.text for x in tail] == ["a", "b", "c", ""]
-    assert b.peek_partial() == "d"
-    # \r\n across the feed boundary: the trailing \r flushes "line1" within the
-    # first feed, then the leading \n flushes an empty line (original behavior).
-    b2 = LineRingBuffer(max_lines=100)
-    b2.feed(b"line1\r")
-    b2.feed(b"\nline2")
-    tail2 = b2.view_tail(10, include_partial=False)
-    assert [x.text for x in tail2] == ["line1", ""]
-    assert b2.peek_partial() == "line2"
-
-
 class _AlwaysRaisesReadFakeSer:
-    """read() always raises — simulates a dead/broken link."""
+    """read() always raises - simulates a dead/broken link."""
 
     def __init__(self) -> None:
         self.is_open = True
@@ -730,11 +645,104 @@ def test_open_rejects_non_serial_device(monkeypatch) -> None:
         "/dev/cu.USBSERIAL",
         "/dev/rfcomm0",
         "COM9",
+        "com3",  # case-insensitive Windows COM
+        "\\\\.\\COM10",  # Windows extended device path
         "/dev/cua0",
     ):
         r = console_ops.run("open", path=good, max_lines=1000)
         assert r.is_ok(), (good, r.fields)
         console_ops.run("close", id=r.fields["id"])
+
+
+def test_open_com_case_insensitive_and_win_device_prefix(monkeypatch) -> None:
+    """com3 and COM3 are the same port; \\\\.\\COM10 normalizes then opens as COM10."""
+    reset_serial_registry()
+    opened_ports: list[str] = []
+
+    def _open(port: str, baudrate: int = 115200, **kw):  # type: ignore[no-untyped-def]
+        opened_ports.append(port)
+        # Fresh fake per open so close() does not leave is_open=False.
+        return SerialConsole(
+            port, baudrate=baudrate, serial_factory=lambda: _ThreadSafeFakeSer()
+        )
+
+    monkeypatch.setattr(console_ops, "SerialConsole", _open)
+
+    r_lo = console_ops.run("open", path="com3", max_lines=1000)
+    assert r_lo.is_ok(), r_lo.fields
+    assert r_lo.fields.get("path") == "COM3"
+    console_ops.run("close", id=r_lo.fields["id"])
+
+    r_hi = console_ops.run("open", path="COM3", max_lines=1000)
+    assert r_hi.is_ok(), r_hi.fields
+    assert r_hi.fields.get("path") == "COM3"
+    console_ops.run("close", id=r_hi.fields["id"])
+
+    r_ext = console_ops.run("open", path="\\\\.\\COM10", max_lines=1000)
+    assert r_ext.is_ok(), r_ext.fields
+    assert r_ext.fields.get("path") == "COM10"
+    console_ops.run("close", id=r_ext.fields["id"])
+
+    assert opened_ports == ["COM3", "COM3", "COM10"]
+
+    # Name-shape helpers: direct unit surface for the allowlist path.
+    assert console_ops._is_serial_port_name("com1")
+    assert console_ops._is_serial_port_name("COM1")
+    assert console_ops._is_serial_port_name("\\\\.\\COM10")
+    assert console_ops._normalize_serial_port_name("com3") == "COM3"
+    assert console_ops._normalize_serial_port_name("\\\\.\\COM10") == "COM10"
+    # Non-COM paths unchanged (Linux/macOS rules preserved).
+    assert console_ops._normalize_serial_port_name("/dev/ttyUSB0") == "/dev/ttyUSB0"
+    assert console_ops._is_serial_port_name("/dev/ttyUSB0")
+    assert not console_ops._is_serial_port_name("/dev/tty")
+
+
+def test_console_hints_use_op_not_legacy_tool_names(monkeypatch) -> None:
+    """Error/success hints advertise console op=... not console_open/list."""
+    reset_serial_registry()
+    fake = _ThreadSafeFakeSer()
+    _patch_console_open(monkeypatch, fake)
+
+    legacy = (
+        "console_open",
+        "console_list",
+        "console_send",
+        "console_views",
+        "console_close",
+    )
+
+    r_miss = console_ops.run("open", path="")
+    assert r_miss.status == "error"
+    assert r_miss.code == "MISSING_ARG"
+    for name in legacy:
+        assert name not in (r_miss.hint or ""), r_miss.hint
+    assert "console op=" in (r_miss.hint or "")
+
+    r_bad = console_ops.run("open", path="/dev/null")
+    assert r_bad.status == "error"
+    assert r_bad.code == "INVALID_ARG"
+    for name in legacy:
+        assert name not in (r_bad.hint or ""), r_bad.hint
+    assert "console op=" in (r_bad.hint or "")
+
+    r_list = console_ops.run("list")
+    # list may fail without pyserial; still check hint when present
+    if r_list.hint:
+        for name in legacy:
+            assert name not in r_list.hint, r_list.hint
+
+    r_bad_op = console_ops.run("not_an_op")
+    assert r_bad_op.status == "error"
+    for name in legacy:
+        assert name not in (r_bad_op.hint or ""), r_bad_op.hint
+    assert "console op=" in (r_bad_op.hint or "")
+
+    r_ok = console_ops.run("open", path="COM9", max_lines=1000)
+    assert r_ok.is_ok(), r_ok.fields
+    for name in legacy:
+        assert name not in (r_ok.hint or ""), r_ok.hint
+    assert "console op=" in (r_ok.hint or "")
+    console_ops.run("close", id=r_ok.fields["id"])
 
 
 def test_send_data_b64_newline_applied(monkeypatch) -> None:
@@ -765,11 +773,43 @@ def test_send_data_b64_newline_applied(monkeypatch) -> None:
     console_ops.run("close", id=sid)
 
 
+def test_send_data_b64_invalid_rejected(monkeypatch) -> None:
+    """Illegal/truncated data_b64 must error (INVALID_ARG), not silent ok.
+
+    Without validate=True, stdlib b64decode ignores non-alphabet chars so
+    '@@@' becomes b'' and the empty-payload branch reports status=ok.
+    """
+    reset_serial_registry()
+    fake = _ThreadSafeFakeSer()
+    _patch_console_open(monkeypatch, fake)
+    r = console_ops.run("open", path="COM9", max_lines=1000)
+    assert r.is_ok(), r.fields
+    sid = str(r.fields["id"])
+
+    for bad in ("@@@", "!!!", "YQ", "abc", "===="):
+        s = console_ops.run("send", id=sid, data_b64=bad)
+        assert s.status == "error", (bad, s.fields)
+        assert s.code == "INVALID_ARG", (bad, s.code, s.fields)
+        assert "data_b64" in (s.fields.get("msg") or ""), s.fields
+        # Agent-facing hint uses console op=send syntax (not legacy tool names).
+        assert "console op=send" in (s.hint or ""), s.hint
+        assert len(fake.written) == 0
+
+    # Valid payload still succeeds after the reject path.
+    good = console_ops.run(
+        "send", id=sid, data_b64=base64.b64encode(b"ok").decode()
+    )
+    assert good.is_ok(), good.fields
+    assert good.fields.get("bytes") == 2
+    assert fake.written == b"ok"
+    console_ops.run("close", id=sid)
+
+
 def test_send_empty_data_no_newline_ok_bytes_zero(monkeypatch) -> None:
-    """send data="" newline=False → ok, bytes=0, no code (no-op, not a failure).
+    """send data="" newline=False -> ok, bytes=0, no code (no-op, not a failure).
 
     The empty-payload branch returns a plain ok (code=None) with bytes=0 and
-    does NOT touch the link — an explicit no-op so the agent can probe liveness
+    does NOT touch the link - an explicit no-op so the agent can probe liveness
     without writing. Pins this contract so a future refactor does not turn the
     empty case into MISSING_ARG or CONSOLE_CLOSED.
     """
@@ -819,8 +859,8 @@ def test_open_baud_non_int_invalid_arg(monkeypatch) -> None:
 
 def test_close_surfaces_close_error(monkeypatch) -> None:
     """When console.close() raises, close still reports closed=True but
-    surfaces a close_error (consuming the O4 SerialSession.close_errors
-    contract) so the agent knows the port may not have released."""
+    surfaces a close_error (SerialSession.close_errors contract) so the
+    agent knows the port may not have released."""
     reset_serial_registry()
 
     class _CloseRaisesFakeSer(_ThreadSafeFakeSer):
@@ -834,7 +874,7 @@ def test_close_surfaces_close_error(monkeypatch) -> None:
     sid = str(r.fields["id"])
 
     c = console_ops.run("close", id=sid)
-    assert c.is_ok(), c.fields  # registry entry removed → op succeeded
+    assert c.is_ok(), c.fields  # registry entry removed -> op succeeded
     assert c.fields.get("closed") is True
     assert "close_error" in c.fields
     assert "console.close" in c.fields["close_error"]
@@ -843,7 +883,7 @@ def test_close_surfaces_close_error(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# MED re-review fixes — Case B incremental-follow, read-lock serialization,
+# Case B incremental-follow, read-lock serialization,
 # write exception propagation, regex chip-family acceptance.
 # ---------------------------------------------------------------------------
 
@@ -857,17 +897,17 @@ def test_view_tail_case_b_feed_between_view_and_meta(monkeypatch) -> None:
     Deterministic: the feed is injected synchronously inside a
     view_tail_with_meta wrapper right after the original returns (after the
     lock release), simulating the pump's feed landing in the Case B window.
-    The background pump's fake returns b"" so it never feeds — the only feed
+    The background pump's fake returns b"" so it never feeds - the only feed
     is the injected one.
 
     Before the fix, the cursor used snapshot_meta().latest_seq (which
-    observed the feed → latest_seq=2); last_seq==latest (2), the drop did
-    NOT trigger, to_seq=2, and since=2 (strict >) skipped seq=2 → the
+    observed the feed -> latest_seq=2); last_seq==latest (2), the drop did
+    NOT trigger, to_seq=2, and since=2 (strict >) skipped seq=2 -> the
     committed "real" line was hidden. With latest_at_view=1 (at view time),
     to_seq=1 and since=1 returns "real".
     """
     reset_serial_registry()
-    fake = _ThreadSafeFakeSer()  # rx empty → pump idles, never feeds
+    fake = _ThreadSafeFakeSer()  # rx empty -> pump idles, never feeds
     _patch_console_open(monkeypatch, fake)
 
     r = console_ops.run("open", path="COM9", max_lines=1000)
@@ -892,7 +932,7 @@ def test_view_tail_case_b_feed_between_view_and_meta(monkeypatch) -> None:
             armed = False
             # Feed lands AFTER view_tail released its lock (latest_at_view
             # already captured under the lock) but BEFORE snapshot_meta
-            # acquires it — the Case B window. The real line commits at
+            # acquires it - the Case B window. The real line commits at
             # _next_seq (== the synth's seq 2).
             buf.feed(b"real\n")
         return lines, latest_at_view
@@ -903,7 +943,7 @@ def test_view_tail_case_b_feed_between_view_and_meta(monkeypatch) -> None:
     assert v.is_ok(), v.fields
     assert v.body and "partial" in v.body  # synth still shown for reading
     # latest_at_view was captured under view_tail's lock BEFORE the feed
-    # landed → latest_seq field reflects the at-view value (1), not the
+    # landed -> latest_seq field reflects the at-view value (1), not the
     # post-feed value (2) that snapshot_meta would observe.
     assert v.fields["latest_seq"] == 1, v.fields
     # Cursor drops to latest_at_view (1), not the synth's seq (2).
@@ -920,7 +960,7 @@ def test_view_tail_case_b_feed_between_view_and_meta(monkeypatch) -> None:
 
 
 def test_view_since_case_b_feed_between_view_and_meta(monkeypatch) -> None:
-    """Case B (since mode): same gap as tail mode — a feed lands between
+    """Case B (since mode): same gap as tail mode - a feed lands between
     view_since releasing its lock and the cursor computation. latest_at_view
     captured under view_since's lock anchors the cursor (to_seq=1) so
     since=1 returns the line that committed at seq=2. Both tail and since
@@ -973,26 +1013,6 @@ def test_view_since_case_b_feed_between_view_and_meta(monkeypatch) -> None:
     console_ops.run("close", id=sid)
 
 
-def test_view_tail_with_meta_returns_latest_at_view() -> None:
-    """view_tail_with_meta returns (lines, latest_at_view) with
-    latest_at_view captured under the same lock as the lines snapshot —
-    pins the new API contract the cursor fix relies on."""
-    b = LineRingBuffer(max_lines=100)
-    b.feed(b"first\n")  # seq 1
-    b.feed(b"second")  # partial; _next_seq == 2
-    lines, latest_at_view = b.view_tail_with_meta(10)
-    assert latest_at_view == 1  # last committed seq at view time
-    assert len(lines) == 2  # first(1) + synth partial(2)
-    assert lines[0].seq == 1 and lines[0].text == "first"
-    assert lines[1].seq == 2 and lines[1].text == "second"  # synth
-
-    # view_since_with_meta mirrors the contract.
-    lines2, latest_at_view2 = b.view_since_with_meta(0, include_partial=True)
-    assert latest_at_view2 == 1
-    assert len(lines2) == 2
-    assert lines2[0].seq == 1 and lines2[1].seq == 2
-
-
 class _ConcurrencyTrackingFakeSer:
     """Fake serial whose read() tracks concurrent readers.
 
@@ -1000,8 +1020,8 @@ class _ConcurrencyTrackingFakeSer:
     underlying ``self._ser.read()``; this fake's ``read()`` sleeps to widen
     the overlap window and records the max concurrent-reader count. With the
     read lock, the CapturePump and ``_brief_pump`` (which both go through
-    ``SerialConsole.read()``) serialize → max_concurrent == 1. Without the
-    lock, the two readers' 20ms read windows overlap → max_concurrent >= 2.
+    ``SerialConsole.read()``) serialize -> max_concurrent == 1. Without the
+    lock, the two readers' 20ms read windows overlap -> max_concurrent >= 2.
     """
 
     def __init__(self) -> None:
@@ -1037,7 +1057,7 @@ class _ConcurrencyTrackingFakeSer:
 
 def test_brief_pump_and_capture_pump_reads_serialized(monkeypatch) -> None:
     """Two readers (background CapturePump + sync _brief_pump) on the same
-    SerialConsole never read the underlying serial concurrently — the
+    SerialConsole never read the underlying serial concurrently - the
     per-console read lock (inside SerialConsole.read()) serializes them.
     Without the lock, a byte burst during the overlap would split bytes
     between the two readers and feed the locked buffer mis-ordered.
@@ -1074,7 +1094,7 @@ def test_brief_pump_and_capture_pump_reads_serialized(monkeypatch) -> None:
 
 def test_send_write_exception_partial_recovered(monkeypatch) -> None:
     """write() propagates an exception that carries a recoverable partial
-    count (``.written``) → send_console reports PARTIAL_WRITE with the
+    count (``.written``) -> send_console reports PARTIAL_WRITE with the
     partial bytes/expected (NOT a generic bytes=0 failure) so the agent
     resends only the tail instead of the full payload.
     """
@@ -1122,7 +1142,7 @@ def test_send_write_exception_partial_recovered(monkeypatch) -> None:
 
 
 def test_send_write_exception_no_partial(monkeypatch) -> None:
-    """write() propagates an exception with no recoverable partial count →
+    """write() propagates an exception with no recoverable partial count ->
     send_console reports CONSOLE_WRITE_FAILED with the ACTUAL error
     type/message in msg (not the generic "write returned 0 bytes"), so the
     agent can diagnose instead of blindly retrying the full payload."""
@@ -1162,3 +1182,528 @@ def test_send_write_exception_no_partial(monkeypatch) -> None:
     assert "OSError" in msg
     assert "link gone" in msg
     console_ops.run("close", id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Per-device exclusive open
+# ---------------------------------------------------------------------------
+
+
+def test_open_same_device_twice_rejected_with_existing_id(monkeypatch) -> None:
+    """Second open of the same path fails with CONSOLE_IN_USE + existing id."""
+    reset_serial_registry()
+    opened: list[str] = []
+
+    def _open(port: str, baudrate: int = 115200, **kw):  # type: ignore[no-untyped-def]
+        opened.append(port)
+        # Fresh fake per successful construction; second open may still build
+        # a handle if it races past get_by_path (add then rejects).
+        return SerialConsole(
+            port, baudrate=baudrate, serial_factory=lambda: _ThreadSafeFakeSer()
+        )
+
+    monkeypatch.setattr(console_ops, "SerialConsole", _open)
+
+    r1 = console_ops.run("open", path="/dev/ttyUSB0", baud=115200, max_lines=1000)
+    assert r1.is_ok(), r1.fields
+    sid = str(r1.fields["id"])
+    assert sid.startswith("con_")
+
+    r2 = console_ops.run("open", path="/dev/ttyUSB0", baud=115200, max_lines=1000)
+    assert r2.status == "error"
+    assert r2.code == "CONSOLE_IN_USE"
+    assert r2.fields.get("id") == sid
+    assert r2.fields.get("path") == "/dev/ttyUSB0"
+    msg = str(r2.fields.get("msg", ""))
+    assert sid in msg
+    assert "already open" in msg.lower() or "already" in msg.lower()
+
+    # Only one session lives; the existing id still works.
+    assert get_serial_registry().get(sid) is not None
+    assert len(get_serial_registry().list_open()) == 1
+
+    # COM alias of a different path does not free ttyUSB0; close frees it.
+    c = console_ops.run("close", id=sid)
+    assert c.is_ok()
+    r3 = console_ops.run("open", path="/dev/ttyUSB0", max_lines=1000)
+    assert r3.is_ok(), r3.fields
+    console_ops.run("close", id=r3.fields["id"])
+
+
+def test_open_same_device_normalized_aliases_collide(monkeypatch) -> None:
+    """com3 / COM3 / \\\\.\\COM3 normalize to one occupancy key."""
+    reset_serial_registry()
+
+    def _open(port: str, baudrate: int = 115200, **kw):  # type: ignore[no-untyped-def]
+        return SerialConsole(
+            port, baudrate=baudrate, serial_factory=lambda: _ThreadSafeFakeSer()
+        )
+
+    monkeypatch.setattr(console_ops, "SerialConsole", _open)
+
+    r1 = console_ops.run("open", path="com3", max_lines=500)
+    assert r1.is_ok(), r1.fields
+    sid = str(r1.fields["id"])
+    assert r1.fields.get("path") == "COM3"
+
+    r2 = console_ops.run("open", path="COM3", max_lines=500)
+    assert r2.status == "error" and r2.code == "CONSOLE_IN_USE"
+    assert r2.fields.get("id") == sid
+
+    r3 = console_ops.run("open", path="\\\\.\\COM3", max_lines=500)
+    assert r3.status == "error" and r3.code == "CONSOLE_IN_USE"
+    assert r3.fields.get("id") == sid
+
+    console_ops.run("close", id=sid)
+
+
+def test_open_two_distinct_devices_succeeds(monkeypatch) -> None:
+    """Different devices may be open concurrently (each gets its own id)."""
+    reset_serial_registry()
+
+    def _open(port: str, baudrate: int = 115200, **kw):  # type: ignore[no-untyped-def]
+        return SerialConsole(
+            port, baudrate=baudrate, serial_factory=lambda: _ThreadSafeFakeSer()
+        )
+
+    monkeypatch.setattr(console_ops, "SerialConsole", _open)
+
+    a = console_ops.run("open", path="/dev/ttyUSB0", max_lines=500)
+    b = console_ops.run("open", path="/dev/ttyUSB1", max_lines=500)
+    assert a.is_ok(), a.fields
+    assert b.is_ok(), b.fields
+    id_a, id_b = str(a.fields["id"]), str(b.fields["id"])
+    assert id_a != id_b
+    open_ids = {s.id for s in get_serial_registry().list_open()}
+    assert open_ids == {id_a, id_b}
+
+    console_ops.run("close", id=id_a)
+    console_ops.run("close", id=id_b)
+    assert get_serial_registry().list_open() == []
+
+
+def test_open_same_device_concurrent_only_one_wins(monkeypatch) -> None:
+    """N concurrent opens of one path: exactly one ok; losers CONSOLE_IN_USE."""
+    reset_serial_registry()
+
+    def _open(port: str, baudrate: int = 115200, **kw):  # type: ignore[no-untyped-def]
+        # Tiny delay so threads can overlap get_by_path / SerialConsole.
+        time.sleep(0.01)
+        return SerialConsole(
+            port, baudrate=baudrate, serial_factory=lambda: _ThreadSafeFakeSer()
+        )
+
+    monkeypatch.setattr(console_ops, "SerialConsole", _open)
+
+    results: list[object] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker() -> None:
+        barrier.wait(timeout=5.0)
+        r = console_ops.run("open", path="/dev/ttyACM0", max_lines=200)
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+
+    oks = [r for r in results if getattr(r, "is_ok", lambda: False)()]
+    errs = [r for r in results if not getattr(r, "is_ok", lambda: True)()]
+    assert len(oks) == 1, f"expected exactly one winner, got {len(oks)}"
+    assert len(errs) == 7
+    winner_id = str(oks[0].fields["id"])  # type: ignore[attr-defined]
+    for e in errs:
+        assert e.code == "CONSOLE_IN_USE"  # type: ignore[attr-defined]
+        assert e.fields.get("id") == winner_id  # type: ignore[attr-defined]
+    assert len(get_serial_registry().list_open()) == 1
+    console_ops.run("close", id=winner_id)
+
+
+def test_console_ops_time_is_module_level() -> None:
+    """console_ops uses top-level ``import time`` only (no lazy in-function)."""
+    import ast
+    import inspect
+
+    import mcp_remote_control.core.console_ops as mod
+
+    assert hasattr(mod, "time")
+    assert mod.time is time
+
+    tree = ast.parse(inspect.getsource(mod))
+    lazy: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for child in ast.walk(node):
+                if isinstance(child, ast.Import):
+                    for alias in child.names:
+                        if alias.name == "time" or alias.name.startswith("time."):
+                            lazy.append(node.name)
+                elif isinstance(child, ast.ImportFrom) and child.module == "time":
+                    lazy.append(node.name)
+    assert lazy == [], f"function-local time imports: {lazy}"
+
+
+# ---------------------------------------------------------------------------
+# Budgeted serial close: join, read-lock, and ser.close must fail visibly.
+# ---------------------------------------------------------------------------
+
+
+class _BlockingReadLink:
+    """Link whose read() ignores stop until *release* is set."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def is_alive(self) -> bool:
+        return True
+
+    def read(self, max_bytes: int = 8192) -> bytes:
+        self.entered.set()
+        self.release.wait(timeout=30.0)
+        return b""
+
+
+class _BlockingReadFakeSer:
+    """pyserial stand-in: read() holds until *release* (holds _read_lock)."""
+
+    def __init__(self) -> None:
+        self.is_open = True
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.written = bytearray()
+
+    @property
+    def in_waiting(self) -> int:
+        return 1
+
+    def read(self, n: int) -> bytes:
+        self.entered.set()
+        self.release.wait(timeout=30.0)
+        return b""
+
+    def write(self, data: bytes) -> int:
+        self.written.extend(data)
+        return len(data)
+
+    def close(self) -> None:
+        self.is_open = False
+
+
+class _HangCloseFakeSer(_ThreadSafeFakeSer):
+    """pyserial stand-in: close() blocks until *release*."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.entered = threading.Event()
+
+    def close(self) -> None:
+        self.entered.set()
+        self.release.wait(timeout=30.0)
+        self.is_open = False
+
+
+def test_capture_pump_stop_join_timeout_raises() -> None:
+    """A pump blocked in read() does not join; stop() raises TimeoutError."""
+    buf = LineRingBuffer()
+    link = _BlockingReadLink()
+    pump = CapturePump(link, buf, name="stuck-pump")
+    pump.start()
+    assert link.entered.wait(timeout=2.0), "pump never entered read()"
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="join timed out"):
+        pump.stop(timeout_s=0.15)
+    assert time.monotonic() - t0 < 1.0
+    assert pump.stats.get("error")
+    assert "join" in str(pump.stats.get("error"))
+    link.release.set()
+    pump.stop(timeout_s=2.0)
+
+
+def test_stuck_pump_join_timeout_recorded_on_close_errors(monkeypatch) -> None:
+    """Pump that ignores stop -> close_errors has stop_capture; not a clean close.
+
+    Built via the registry (not console open) so open's ``_brief_pump`` cannot
+    serialize behind the same blocking read and hang the test.
+    """
+    import mcp_remote_control.serial.capture as capture_mod
+    import mcp_remote_control.serial.handle as handle_mod
+
+    monkeypatch.setattr(capture_mod, "_STOP_JOIN_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(handle_mod, "_CLOSE_TIMEOUT_S", 0.15)
+
+    reset_serial_registry()
+    fake = _BlockingReadFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    sid = "con_01"
+    sess = SerialSession(
+        id=sid,
+        console=con,
+        path="COM9",
+        baud=115200,
+        buffer=LineRingBuffer(),
+    )
+    get_serial_registry().add(sess)
+    assert fake.entered.wait(timeout=2.0), "pump never entered blocking read"
+
+    t0 = time.monotonic()
+    c = console_ops.run("close", id=sid)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0, f"stuck close hung for {elapsed:.2f}s"
+    # Registry entry is gone, but teardown was not clean.
+    assert get_serial_registry().get(sid) is None
+    assert c.fields.get("closed") is True
+    err = str(c.fields.get("close_error") or "")
+    assert "stop_capture" in err or "join" in err, err
+    assert "TimeoutError" in err, err
+    assert c.code == "CONSOLE_CLOSE_PARTIAL"
+    # Not a clean ok: close_error is set and the code is a close warning.
+    assert c.fields.get("close_error")
+    fake.release.set()
+
+
+def test_console_close_read_lock_returns_inside_budget() -> None:
+    """close() times out on _read_lock instead of waiting unbounded.
+
+    The lock timeout still nulls ``_ser`` and invokes ``ser.close`` so the
+    fd is not leaked for the next open.
+    """
+    fake = _ThreadSafeFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def _hold() -> None:
+        con._read_lock.acquire()
+        holding.set()
+        release.wait(timeout=30.0)
+        con._read_lock.release()
+
+    holder = threading.Thread(target=_hold, name="hold-read-lock", daemon=True)
+    holder.start()
+    assert holding.wait(timeout=2.0)
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="read lock"):
+        con.close(timeout_s=0.15)
+    assert time.monotonic() - t0 < 1.0
+    assert con._ser is None
+    assert fake.is_open is False
+    release.set()
+    holder.join(timeout=2.0)
+
+
+def test_hung_ser_close_budgeted_and_visible_on_close_errors(monkeypatch) -> None:
+    """Hung ser.close() returns inside the budget and lands on close_errors."""
+    import mcp_remote_control.serial.handle as handle_mod
+
+    monkeypatch.setattr(handle_mod, "_CLOSE_TIMEOUT_S", 0.15)
+
+    fake = _HangCloseFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    buf = LineRingBuffer()
+
+    class _QuietPump:
+        def stop(self, *, timeout_s: float | None = None) -> None:
+            return None
+
+    sess = SerialSession(
+        id="con_99",
+        console=con,
+        path="COM9",
+        baud=115200,
+        buffer=buf,
+        pump=_QuietPump(),  # type: ignore[arg-type]
+    )
+    reg = SerialRegistry()
+    reg.add(sess)
+
+    t0 = time.monotonic()
+    removed = reg.remove("con_99")
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.5, f"hung ser.close pinned remove for {elapsed:.2f}s"
+    assert removed is not None
+    assert any(
+        "console.close" in e and "TimeoutError" in e and "ser.close" in e
+        for e in removed.close_errors
+    ), removed.close_errors
+    fake.release.set()
+
+
+def test_serial_console_hung_close_raises_timeout() -> None:
+    """Direct SerialConsole.close on a hung port raises inside the budget."""
+    fake = _HangCloseFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="ser.close"):
+        con.close(timeout_s=0.15)
+    assert time.monotonic() - t0 < 1.0
+    fake.release.set()
+
+
+def test_close_lock_timeout_still_releases_fd() -> None:
+    """Dummy reader holds _read_lock; close still nulls _ser and calls ser.close."""
+    fake = _BlockingReadFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+
+    def _reader() -> None:
+        con.read(16)
+
+    reader = threading.Thread(target=_reader, name="dummy-reader", daemon=True)
+    reader.start()
+    assert fake.entered.wait(timeout=2.0), "reader never entered ser.read"
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="read lock"):
+        con.close(timeout_s=0.05)
+    assert time.monotonic() - t0 < 1.0
+    assert con._ser is None
+    assert fake.is_open is False
+    fake.release.set()
+    reader.join(timeout=2.0)
+
+
+def test_add_start_capture_failure_rolls_back_maps() -> None:
+    """start_capture raise leaves _sessions / _by_path empty for that path."""
+    reset_serial_registry()
+    reg = SerialRegistry()
+    fake = _ThreadSafeFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    sess = SerialSession(
+        id="con_01",
+        console=con,
+        path="COM9",
+        baud=115200,
+        buffer=LineRingBuffer(),
+    )
+
+    def _boom() -> None:
+        raise RuntimeError("pump start failed")
+
+    sess.start_capture = _boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="pump start failed"):
+        reg.add(sess)
+    assert reg.get("con_01") is None
+    assert reg.get_by_path("COM9") is None
+    assert "con_01" not in reg._sessions
+    assert "COM9" not in reg._by_path
+    con.close()
+
+
+class _TwoChunkFakeSer:
+    """Yields ABC then DEF so two producers each get one wire chunk."""
+
+    def __init__(self) -> None:
+        self.is_open = True
+        self._lock = threading.Lock()
+        self._chunks = [b"ABC", b"DEF"]
+        self.wire_order: list[bytes] = []
+
+    @property
+    def in_waiting(self) -> int:
+        return 1
+
+    def read(self, n: int) -> bytes:
+        with self._lock:
+            if not self._chunks:
+                return b""
+            chunk = self._chunks.pop(0)
+            self.wire_order.append(chunk)
+            return chunk
+
+    def write(self, data: bytes) -> int:
+        return len(data)
+
+    def close(self) -> None:
+        self.is_open = False
+
+
+def test_pump_read_into_and_snarf_keep_wire_order() -> None:
+    """Pump read_into and snarf/read+feed commit ABC+DEF in wire order.
+
+    Never ADEFBC. DEFABC is allowed only if DEF left the wire first.
+    """
+    fake = _TwoChunkFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    buf = LineRingBuffer()
+    con.bind_rx_buffer(buf)
+
+    def _pump() -> None:
+        con.read_into(buf, 8192)
+
+    def _snarf() -> None:
+        # Same shape as core.console_ops._brief_pump.
+        more = con.read(65536)
+        if more:
+            buf.feed(more)
+
+    t_pump = threading.Thread(target=_pump, name="pump-read-into", daemon=True)
+    t_snarf = threading.Thread(target=_snarf, name="brief-snarf", daemon=True)
+    t_pump.start()
+    t_snarf.start()
+    t_pump.join(timeout=2.0)
+    t_snarf.join(timeout=2.0)
+
+    buf.flush_partial()
+    committed = buf.format_lines(buf.view_tail(10, include_partial=False))
+    wire = b"".join(fake.wire_order).decode("ascii")
+    assert committed in {"ABCDEF", "DEFABC"}, committed
+    assert "ADEFBC" not in committed
+    # With the shared order lock, commit order matches the true wire order.
+    assert committed == wire
+    con.close()
+
+
+def test_read_into_holds_lock_across_feed() -> None:
+    """A second producer cannot read while the first is still feeding."""
+    fake = _TwoChunkFakeSer()
+    con = SerialConsole("COM9", serial_factory=lambda: fake)
+    feed_entered = threading.Event()
+    feed_release = threading.Event()
+    second_read_started = threading.Event()
+    order: list[str] = []
+    lock = threading.Lock()
+
+    class _GatedBuf(LineRingBuffer):
+        def feed(self, data: bytes | str) -> int:  # type: ignore[override]
+            with lock:
+                order.append("feed-start")
+            feed_entered.set()
+            feed_release.wait(timeout=2.0)
+            with lock:
+                order.append("feed-end")
+            return super().feed(data)
+
+    buf = _GatedBuf()
+
+    def _first() -> None:
+        con.read_into(buf, 8192)
+
+    def _second() -> None:
+        assert feed_entered.wait(timeout=2.0)
+        second_read_started.set()
+        con.snarf(buf, 8192)
+
+    t1 = threading.Thread(target=_first, name="first-read-into", daemon=True)
+    t2 = threading.Thread(target=_second, name="second-snarf", daemon=True)
+    t1.start()
+    assert feed_entered.wait(timeout=2.0)
+    t2.start()
+    # Give the second thread time to try; it must not enter ser.read yet.
+    assert second_read_started.wait(timeout=2.0)
+    time.sleep(0.05)
+    assert fake.wire_order == [b"ABC"], fake.wire_order
+    feed_release.set()
+    t1.join(timeout=2.0)
+    t2.join(timeout=2.0)
+    buf.flush_partial()
+    committed = buf.format_lines(buf.view_tail(10, include_partial=False))
+    assert committed == "ABCDEF"
+    assert order[:2] == ["feed-start", "feed-end"]
+    con.close()

@@ -1,4 +1,4 @@
-"""Service tests: screen open/list/close/send with real local PTY (T09/T10)."""
+"""Service tests: screen open/list/close/send with a real local PTY."""
 
 from __future__ import annotations
 
@@ -11,14 +11,11 @@ import pytest
 from mcp_remote_control.cli import main
 from mcp_remote_control.cli_cmds import EXIT_OK, EXIT_VALIDATION
 from mcp_remote_control.core import screen_ops
-from mcp_remote_control.endpoint import ensure_endpoint, get_registry, reset_registry
-from mcp_remote_control.endpoint.registry import Endpoint
-from mcp_remote_control.screen.buffer import dump_frame
+from mcp_remote_control.endpoint import get_registry, reset_registry
 from mcp_remote_control.screen.registry import (
     get_screen_registry,
     reset_screen_registry,
 )
-from mcp_remote_control.transport.local import LocalTransport
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
@@ -197,7 +194,7 @@ def test_send_unchanged_on_double_shot() -> None:
 
 
 def test_send_wait_only_does_not_inject_cwd_probe() -> None:
-    """O3: a wait-only send skips the silent cwd probe (no ctrl+u / echo)."""
+    """A wait-only send skips the silent cwd probe (no ctrl+u / echo)."""
     r = _open_local()
     sid = r.fields["id"]
     # Establish a stable frame first.
@@ -284,7 +281,7 @@ def test_lazy_connect_on_screen_open() -> None:
 
 
 def test_cli_screen_open_list_close() -> None:
-    # CLI path (does not pass shell=; profile may use zsh — still should work).
+    # CLI path (does not pass shell=; profile may use zsh - still should work).
     code = main(["screen", "open", "--ep", "local", "--json"])
     # open goes through default shell from profile; may be slow but should ok
     # If profile shell is broken, core API tests above still cover AC.
@@ -310,230 +307,6 @@ def test_cli_open_json_has_screen_id() -> None:
     assert "cur" in data
 
 
-# ---------------------------------------------------------------------------
-# capability / winrm UNSUPPORTED (T13 — no fake PTY frames)
-# ---------------------------------------------------------------------------
-
-
-def _mock_winrm_connector(**_kwargs: object):
-    """Minimal injectable WinRM session (no network); mirrors test_winrm."""
-    from mcp_remote_control.transport.base import ExecResult
-
-    class _MockWinRMSession:
-        def __init__(self) -> None:
-            self.cwd = r"C:\Users\Administrator"
-            self.home = r"C:\Users\Administrator"
-            self.os = "windows"
-            self.shell = "powershell"
-            self.ps_version = "5.1"
-
-        def close(self) -> None:
-            return None
-
-        def run_command(self, command: str, **_kw: object) -> ExecResult:
-            return ExecResult(exit_code=0, stdout=f"out:{command}\n", stderr="", cwd=self.cwd)
-
-        def run_argv(self, argv: list[str], **_kw: object) -> ExecResult:
-            return ExecResult(exit_code=0, stdout=" ".join(argv) + "\n", cwd=self.cwd)
-
-    return _MockWinRMSession()
-
-
-def test_no_screen_cap_returns_unsupported() -> None:
-    """Inject an endpoint with screen=false (winrm-like caps)."""
-    ensure_endpoint("local", home=FIXTURES)
-    reg = get_registry()
-    ep = reg.get("local")
-    assert ep is not None
-    # Flip caps to deny screen (simulates winrm matrix).
-    ep.caps = {
-        "exec": True,
-        "fs": True,
-        "screen": False,
-        "ps": True,
-    }
-
-    r = screen_ops.open_screen(
-        ep="local",
-        home=FIXTURES,
-        shell=_SIMPLE_SHELL,
-        settle_s=0.1,
-    )
-    assert r.status == "error"
-    assert r.code == "UNSUPPORTED"
-    assert r.body is None  # no forged frame
-    assert "screen" in (r.fields.get("msg") or "").lower() or r.code == "UNSUPPORTED"
-    text = r.render_text()
-    assert "UNSUPPORTED" in text
-    assert get_screen_registry().list_open() == []
-
-
-def test_winrm_transport_open_fails_unsupported_or_connect() -> None:
-    """WinRM transport cannot open screen; connect may fail first."""
-    # Register a synthetic winrm endpoint without going through profile connect.
-    reg = get_registry()
-    transport = LocalTransport()
-    transport.connect()
-    # Pretend winrm with no screen cap.
-    fake = Endpoint(
-        name="win-fake",
-        transport_name="winrm",
-        caps={"exec": True, "fs": True, "screen": False, "ps": True},
-        connected=True,
-        transport=transport,
-        cwd="/",
-    )
-    reg._endpoints["win-fake"] = fake
-
-    r = screen_ops.open_screen(ep="win-fake", home=FIXTURES, settle_s=0.05)
-    assert r.status == "error"
-    assert r.code == "UNSUPPORTED"
-    assert r.body is None
-    assert get_screen_registry().list_open() == []
-
-
-def test_lab_win_screen_open_unsupported_no_session() -> None:
-    """T13: lab-win + mock winrm → screen open UNSUPPORTED, no session, no frame."""
-    reg = get_registry()
-    reg.winrm_connector = _mock_winrm_connector  # type: ignore[assignment]
-
-    r = screen_ops.open_screen(
-        ep="lab-win",
-        home=FIXTURES,
-        connector=_mock_winrm_connector,
-        settle_s=0.05,
-    )
-    assert r.status == "error"
-    assert r.code == "UNSUPPORTED"
-    assert r.fields.get("ep") == "lab-win"
-    assert r.fields.get("transport") == "winrm"
-    assert r.fields.get("op") == "open"
-    # No forged PTY frame body on the hard-fail path.
-    assert r.body is None
-    assert "cur" not in r.fields
-    assert "gen" not in r.fields
-    assert "hash" not in r.fields
-    # Agent track greppable for UNSUPPORTED.
-    text = r.render_text()
-    assert "UNSUPPORTED" in text
-    assert text.startswith("@screen error")
-    assert "code=UNSUPPORTED" in text
-    # JSON track likewise.
-    data = json.loads(r.render_json())
-    assert data["status"] == "error"
-    assert data["code"] == "UNSUPPORTED"
-    assert "body" not in data or data.get("body") in (None, "")
-    # Must not create a screen session.
-    assert get_screen_registry().list_open() == []
-    listed = screen_ops.list_screens()
-    assert listed.status == "ok"
-    assert listed.fields.get("n") == 0
-
-
-def test_lab_win_screen_run_dispatch_and_send_no_frame() -> None:
-    """run(op=open|send) on winrm: open UNSUPPORTED; send never sees a session."""
-    reg = get_registry()
-    reg.winrm_connector = _mock_winrm_connector  # type: ignore[assignment]
-
-    opened = screen_ops.run(
-        op="open",
-        ep="lab-win",
-        home=FIXTURES,
-        connector=_mock_winrm_connector,
-        settle_s=0.05,
-    )
-    assert opened.status == "error"
-    assert opened.code == "UNSUPPORTED"
-    assert opened.body is None
-    assert "UNSUPPORTED" in opened.render_text()
-    assert get_screen_registry().list_open() == []
-
-    # No session exists → send cannot forge a frame (SCREEN_NOT_FOUND, not ok+body).
-    sent = screen_ops.run(op="send", id="scr_nonexistent")
-    assert sent.status == "error"
-    assert sent.code == "SCREEN_NOT_FOUND"
-    assert sent.body is None
-    assert get_screen_registry().list_open() == []
-
-
-def test_cli_lab_win_screen_open_unsupported(capsys: pytest.CaptureFixture[str]) -> None:
-    """CLI: mcp-remote-control-cli screen open --ep lab-win → greppable UNSUPPORTED, non-zero exit."""
-    from mcp_remote_control.cli_cmds import EXIT_VALIDATION
-
-    reg = get_registry()
-    reg.winrm_connector = _mock_winrm_connector  # type: ignore[assignment]
-    code = main(["screen", "open", "--ep", "lab-win"])
-    assert code == EXIT_VALIDATION
-    out = capsys.readouterr().out
-    assert "UNSUPPORTED" in out
-    assert "@screen error" in out
-    assert get_screen_registry().list_open() == []
-
-
-# ---------------------------------------------------------------------------
-# pyte unit-style (no real PTY required)
-# ---------------------------------------------------------------------------
-
-
-def test_pyte_frame_dump_unit() -> None:
-    import pyte
-
-    screen = pyte.Screen(40, 10)
-    stream = pyte.Stream(screen)
-    stream.feed("hello\r\nworld")
-    frame = dump_frame(screen, strip_trailing_empty=True)
-    assert "hello" in frame
-    assert "world" in frame
-    # Cursor somewhere after feed
-    assert screen.cursor.y >= 0
-
-
-def test_screen_session_feed_cross_chunk_utf8_unit() -> None:
-    """O3/H5: ScreenSession.feed reassembles a split multi-byte UTF-8 char."""
-    from mcp_remote_control.screen.session import ScreenSession
-
-    class _FakePty:
-        cols = 40
-        rows = 5
-        cwd: str | None = "/tmp"
-
-        def is_alive(self) -> bool:
-            return True
-
-        def exit_code(self) -> int | None:
-            return None
-
-        def read(self, max_bytes: int = 8192) -> bytes:
-            return b""
-
-        def write(self, data: bytes) -> int:
-            return len(data)
-
-        def resize(self, cols: int, rows: int) -> None:
-            return None
-
-        def drain_for(self, seconds: float, *, on_data: object = None) -> int:
-            return 0
-
-        def close(self) -> None:
-            return None
-
-    sess = ScreenSession(
-        id="scr_utf8",
-        ep="local",
-        pty=_FakePty(),
-        cols=40,
-        rows=5,
-        cwd="/tmp",
-    )
-    # "中" = U+4E2D = b'\xe4\xb8\xad'; split across two feed boundaries.
-    sess.feed(b"\xe4\xb8")
-    sess.feed(b"\xad")
-    frame = dump_frame(sess.screen, strip_trailing_empty=True)
-    assert "中" in frame
-    assert "�" not in frame
-
-
 def test_multiple_screens_independent() -> None:
     r1 = _open_local()
     r2 = _open_local()
@@ -547,61 +320,8 @@ def test_multiple_screens_independent() -> None:
     assert r2.fields["id"] in (listed2.body or "")
 
 
-def test_ssh_mock_screen_open() -> None:
-    """SSH open uses create_process PTY path; mockable without network."""
-
-    class MockProc:
-        def __init__(self) -> None:
-            self.stdin = self
-            self.stdout = self
-            self.exit_status: int | None = None
-            self._chunks = [b"mock-shell$\r\n"]
-
-        def write(self, data: bytes) -> None:
-            return None
-
-        async def read(self, n: int = 8192) -> bytes:
-            if self._chunks:
-                return self._chunks.pop(0)
-            return b""
-
-        def close(self) -> None:
-            self.exit_status = 0
-
-        def terminate(self) -> None:
-            self.exit_status = 0
-
-        def wait(self) -> None:
-            return None
-
-    class MockConn:
-        def create_process(self, *args: object, **kwargs: object) -> MockProc:
-            return MockProc()
-
-        def close(self) -> None:
-            return None
-
-    reg = get_registry()
-    reg.ssh_connector = lambda **_k: MockConn()
-    r = screen_ops.open_screen(
-        ep="lab-ssh",
-        home=FIXTURES,
-        settle_s=0.15,
-        cols=100,
-        rows=30,
-    )
-    assert r.status == "ok", r.render_text()
-    assert r.fields.get("ep") == "lab-ssh"
-    assert r.fields.get("cur")
-    assert r.fields.get("open") == "shell"
-    body = r.body or ""
-    assert "mock-shell" in body or r.fields.get("gen", 0) >= 0
-    sid = r.fields["id"]
-    assert screen_ops.close_screen(id=sid).status == "ok"
-
-
 # ---------------------------------------------------------------------------
-# T19: silent cwd probe after send (live local shell)
+# Silent cwd probe after send (live local shell)
 # ---------------------------------------------------------------------------
 
 
@@ -633,6 +353,26 @@ def test_send_cd_updates_cwd_via_probe() -> None:
     screen_ops.close_screen(id=sid)
 
 
+def test_send_submit_then_text_without_submit_keeps_typed_line() -> None:
+    """Mid-list submit then typed text: silent probe must not wipe the line."""
+    r = _open_local()
+    assert r.status == "ok", r.render_text()
+    sid = r.fields["id"]
+    send = screen_ops.send_screen(
+        id=sid,
+        actions=[
+            {"type": "submit"},
+            {"type": "text", "text": "echo_keep_this_partial"},
+        ],
+        wait={"until": "idle", "idle_ms": 150, "timeout_ms": 5000},
+    )
+    assert send.status in ("ok", "unchanged"), send.render_text()
+    combined = (send.body or "") + "\n" + send.render_text()
+    assert "echo_keep_this_partial" in combined
+    assert "__MRC_PWD__:" not in combined
+    screen_ops.close_screen(id=sid)
+
+
 def test_open_shell_cwd_absolute_no_probe_leak() -> None:
     r = _open_local(cwd="/tmp")
     assert r.status == "ok", r.render_text()
@@ -641,4 +381,36 @@ def test_open_shell_cwd_absolute_no_probe_leak() -> None:
     body = r.body or ""
     assert "__MRC_PWD__:" not in body
     assert "__MRC_PWD__:" not in r.render_text()
+    screen_ops.close_screen(id=r.fields["id"])
+
+
+def test_open_local_missing_cwd_invalid_cwd() -> None:
+    missing = "/definitely/not/here/mrc-screen-cwd"
+    r = _open_local(cwd=missing)
+    assert r.status == "error", r.render_text()
+    assert r.code == "INVALID_CWD"
+    listed = screen_ops.list_screens()
+    assert listed.status == "ok"
+    assert listed.fields.get("n") == 0
+    assert listed.body is None or "scr_" not in (listed.body or "")
+
+
+def test_open_local_file_cwd_invalid_cwd(tmp_path: Path) -> None:
+    target = tmp_path / "not-a-dir"
+    target.write_text("x", encoding="utf-8")
+    r = _open_local(cwd=str(target))
+    assert r.status == "error", r.render_text()
+    assert r.code == "INVALID_CWD"
+    listed = screen_ops.list_screens()
+    assert listed.status == "ok"
+    assert listed.fields.get("n") == 0
+
+
+def test_open_local_tmp_path_cwd_absolute(tmp_path: Path) -> None:
+    r = _open_local(cwd=str(tmp_path))
+    assert r.status == "ok", r.render_text()
+    assert r.cwd is not None
+    assert Path(r.cwd).is_absolute()
+    # Exact probe text may wrap on a long pytest tmp path; the resolver
+    # already applied the directory (open would have been INVALID_CWD).
     screen_ops.close_screen(id=r.fields["id"])

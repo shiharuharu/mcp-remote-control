@@ -2,38 +2,69 @@
 
 Opens a controlling TTY for a local shell or argv, with non-blocking master
 reads and best-effort winsize updates.
+
+POSIX-only modules (``fcntl`` / ``termios`` / ``pty``) are imported lazily
+inside open/resize paths so this module (and mcp_server via screen_ops) can
+load on Windows hosts. Local screen open on win32 is rejected in screen_ops
+before LocalPty is constructed.
 """
 
 from __future__ import annotations
 
 import errno
-import fcntl
+import logging
 import os
 import select
 import signal
 import struct
-import termios
+import threading
 import time
 from typing import Any
 
 from mcp_remote_control.transport.base import TransportError
 
-# ioctl TIOCSWINSZ / TIOCGWINSZ
-_TIOCSWINSZ = getattr(termios, "TIOCSWINSZ", 0x80087467)
+_log = logging.getLogger(__name__)
+
+# Fallback when termios.TIOCSWINSZ is absent (ioctl winsize packing).
+_TIOCSWINSZ_FALLBACK = 0x80087467
+
+# After SIGKILL, poll waitpid(WNOHANG) up to this long then abandon.
+# A child stuck in uninterruptible sleep (D-state, FUSE/NFS) never reaps;
+# blocking waitpid(pid, 0) would hang the FastMCP / Core thread forever.
+DEFAULT_WAITPID_TIMEOUT_S: float = 2.0
+_WAITPID_POLL_INTERVAL_S: float = 0.05
+
+
+def _status_to_exit_code(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return -1
+
+
+def _tiocswinsz() -> int:
+    """Resolve TIOCSWINSZ; import termios only when sizing a live PTY."""
+    import termios
+
+    return int(getattr(termios, "TIOCSWINSZ", _TIOCSWINSZ_FALLBACK))
 
 
 def _set_winsize(fd: int, cols: int, rows: int) -> None:
     # struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel }
+    # fcntl is POSIX-only; import here so module import succeeds on win32.
+    import fcntl
+
     packed = struct.pack("HHHH", int(rows), int(cols), 0, 0)
     try:
-        fcntl.ioctl(fd, _TIOCSWINSZ, packed)
+        fcntl.ioctl(fd, _tiocswinsz(), packed)
     except OSError:
         # Best-effort; some platforms/fds may reject.
         pass
 
 
 def resolve_local_shell(preferred: str | None = None) -> str:
-    """Pick interactive shell: preferred → $SHELL → /bin/bash → /bin/sh."""
+    """Pick interactive shell: preferred -> $SHELL -> /bin/bash -> /bin/sh."""
     candidates: list[str] = []
     if preferred and str(preferred).strip():
         candidates.append(str(preferred).strip())
@@ -94,6 +125,11 @@ class LocalPty:
         self._master: int | None = None
         self._closed = False
         self._exit_code: int | None = None
+        # Serializes master-fd lifetime: close nulls + bumps generation under
+        # the lock so concurrent drain/read never os.read a recycled fd number
+        # after OS reclaim. select() snapshots fd+gen and re-validates after.
+        self._io_lock = threading.Lock()
+        self._fd_gen: int = 0
 
         shell_path = resolve_local_shell(shell)
         if argv:
@@ -126,8 +162,10 @@ class LocalPty:
 
         self._pid = pid
         self._master = master_fd
-        # Non-blocking master for select/read loops.
+        # Non-blocking master for select/read loops (fcntl is POSIX-only).
         try:
+            import fcntl
+
             flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
             fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         except OSError:
@@ -139,7 +177,8 @@ class LocalPty:
 
     @property
     def master_fd(self) -> int | None:
-        return self._master
+        with self._io_lock:
+            return self._master
 
     def is_alive(self) -> bool:
         if self._closed or self._pid is None:
@@ -149,7 +188,11 @@ class LocalPty:
         try:
             done_pid, status = os.waitpid(self._pid, os.WNOHANG)
         except ChildProcessError:
-            self._exit_code = 0
+            # The status is already consumed - by a concurrent is_alive() or
+            # by a host-level SIGCHLD reaper. This caller observed none, so
+            # it records none: a fallback 0 here would overwrite the real
+            # status another caller stored and report a clean exit for a
+            # shell that failed.
             return False
         if done_pid == 0:
             return True
@@ -165,11 +208,24 @@ class LocalPty:
         self.is_alive()
         return self._exit_code
 
-    def read(self, max_bytes: int = 8192) -> bytes:
-        if self._master is None:
-            return b""
+    def _snapshot_master(self) -> tuple[int | None, int]:
+        """Return (master_fd, generation) under the I/O lock."""
+        with self._io_lock:
+            return self._master, self._fd_gen
+
+    def _master_valid(self, fd: int, gen: int) -> bool:
+        """True if *fd* is still the live master for *gen*."""
+        with self._io_lock:
+            return (
+                self._master is not None
+                and self._master == fd
+                and self._fd_gen == gen
+            )
+
+    def _read_master_locked(self, fd: int, max_bytes: int) -> bytes:
+        """Non-blocking read; caller holds ``_io_lock`` and owns *fd*."""
         try:
-            return os.read(self._master, max_bytes)
+            return os.read(fd, max_bytes)
         except BlockingIOError:
             return b""
         except OSError as exc:
@@ -177,24 +233,37 @@ class LocalPty:
                 return b""
             return b""
 
+    def read(self, max_bytes: int = 8192) -> bytes:
+        # Hold the lock across the non-blocking os.read so close cannot
+        # null+close the master while we still hold its number (recycled-fd).
+        with self._io_lock:
+            fd = self._master
+            if fd is None:
+                return b""
+            return self._read_master_locked(fd, max_bytes)
+
     def write(self, data: bytes) -> int:
-        if self._master is None or self._closed:
-            raise TransportError("NOT_CONNECTED", "local PTY is closed")
         if not data:
             return 0
-        try:
-            return os.write(self._master, data)
-        except OSError as exc:
-            raise TransportError(
-                "EXEC_FAILED",
-                f"PTY write failed: {exc}",
-            ) from exc
+        with self._io_lock:
+            if self._master is None or self._closed:
+                raise TransportError("NOT_CONNECTED", "local PTY is closed")
+            fd = self._master
+            try:
+                return os.write(fd, data)
+            except OSError as exc:
+                raise TransportError(
+                    "EXEC_FAILED",
+                    f"PTY write failed: {exc}",
+                ) from exc
 
     def resize(self, cols: int, rows: int) -> None:
         self.cols = int(cols)
         self.rows = int(rows)
-        if self._master is not None:
-            _set_winsize(self._master, self.cols, self.rows)
+        with self._io_lock:
+            fd = self._master
+        if fd is not None:
+            _set_winsize(fd, self.cols, self.rows)
 
     def drain_for(
         self,
@@ -205,9 +274,12 @@ class LocalPty:
         """Read available PTY output for up to *seconds*; return total bytes.
 
         *on_data* if given is called with each bytes chunk.
+
+        select() may block up to 50ms, so it runs on a snapshot of
+        (fd, generation) without holding ``_io_lock``. After select returns,
+        generation is re-checked under the lock before any os.read so a
+        concurrent close cannot leave us reading a recycled fd number.
         """
-        if self._master is None:
-            return 0
         total = 0
         deadline = time.monotonic() + max(0.0, float(seconds))
         idle_rounds = 0
@@ -215,9 +287,12 @@ class LocalPty:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            fd, gen = self._snapshot_master()
+            if fd is None:
+                break
             try:
                 ready, _, _ = select.select(
-                    [self._master], [], [], min(0.05, remaining)
+                    [fd], [], [], min(0.05, remaining)
                 )
             except (ValueError, OSError):
                 break
@@ -228,9 +303,18 @@ class LocalPty:
                     break
                 continue
             idle_rounds = 0
-            chunk = self.read()
+            # Re-validate under lock, then read while still holding it so
+            # close cannot reclaim the number mid-read.
+            with self._io_lock:
+                if (
+                    self._master is None
+                    or self._master != fd
+                    or self._fd_gen != gen
+                ):
+                    break
+                chunk = self._read_master_locked(fd, 8192)
             if not chunk:
-                # EOF or would-block after select — check process.
+                # EOF or would-block after select - check process.
                 if not self.is_alive():
                     break
                 continue
@@ -240,47 +324,78 @@ class LocalPty:
         return total
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        pid = self._pid
-        master = self._master
-        self._master = None
+        # Null master + bump generation under the lock so concurrent
+        # drain/read refuse the old fd number before OS close reclaims it.
+        with self._io_lock:
+            if self._closed:
+                return
+            self._closed = True
+            pid = self._pid
+            master = self._master
+            self._master = None
+            self._fd_gen += 1
+        # os.close outside the lock: short, and readers already see None/gen.
         if master is not None:
             try:
                 os.close(master)
             except OSError:
                 pass
-        if pid is not None and self._exit_code is None:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.kill(pid, sig)
-                except OSError:
-                    break
-                try:
-                    done, status = os.waitpid(pid, 0 if sig == signal.SIGKILL else os.WNOHANG)
-                except ChildProcessError:
-                    self._exit_code = 0
-                    break
-                if done == 0:
-                    time.sleep(0.05)
-                    continue
-                if os.WIFEXITED(status):
-                    self._exit_code = os.WEXITSTATUS(status)
-                elif os.WIFSIGNALED(status):
-                    self._exit_code = -os.WTERMSIG(status)
-                else:
-                    self._exit_code = -1
-                break
-            else:
-                try:
-                    _, status = os.waitpid(pid, 0)
-                    if os.WIFEXITED(status):
-                        self._exit_code = os.WEXITSTATUS(status)
-                    else:
-                        self._exit_code = -1
-                except (ChildProcessError, OSError):
-                    self._exit_code = 0
+        if pid is None or self._exit_code is not None:
+            return
+
+        # SIGTERM: one WNOHANG, a short sleep, then another WNOHANG before SIGKILL.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            # Already gone - still try to reap below.
+            pass
+        else:
+            if self._try_reap(pid):
+                return
+            time.sleep(_WAITPID_POLL_INTERVAL_S)
+            if self._try_reap(pid):
+                return
+
+        # SIGKILL then bounded WNOHANG poll (never block forever).
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        if self._wait_reap(pid, timeout_s=DEFAULT_WAITPID_TIMEOUT_S):
+            return
+        _log.warning(
+            "local PTY child pid=%s still unreaped after SIGKILL within %.1fs "
+            "(possible D-state); abandoning waitpid to avoid blocking",
+            pid,
+            DEFAULT_WAITPID_TIMEOUT_S,
+        )
+        # Leave _exit_code unset: we never observed a wait status.
+
+    def _try_reap(self, pid: int) -> bool:
+        """Single non-blocking waitpid. True if child reaped or already gone."""
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            # Already reaped elsewhere: no status of this caller's own to
+            # record (see is_alive).
+            return True
+        except OSError:
+            return True
+        if done == 0:
+            return False
+        self._exit_code = _status_to_exit_code(status)
+        return True
+
+    def _wait_reap(self, pid: int, *, timeout_s: float) -> bool:
+        """Poll waitpid(WNOHANG) until reaped or *timeout_s* elapses."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            if self._try_reap(pid):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(_WAITPID_POLL_INTERVAL_S, remaining))
 
 
 def _fork_pty(

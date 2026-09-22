@@ -41,10 +41,22 @@ class ScreenRegistry:
     def remove(self, screen_id: str) -> ScreenSession | None:
         if not screen_id:
             return None
+        key = str(screen_id).strip()
         with self._lock:
-            sess = self._sessions.pop(str(screen_id).strip(), None)
-        if sess is not None:
-            # Best-effort close outside the lock; session already removed.
+            sess = self._sessions.get(key)
+        if sess is None:
+            return None
+        # Hold the session lock across unregister + close so a concurrent
+        # send cannot run the pipeline on a still-open PTY after the map pop.
+        # Registry map lock is only held for the dict update - never across
+        # PTY I/O. Nested remove from close_screen (already in serial_ops)
+        # re-enters the RLock.
+        with sess.serial_ops():
+            with self._lock:
+                current = self._sessions.get(key)
+                if current is not sess:
+                    return None
+                self._sessions.pop(key, None)
             try:
                 sess.close()
             except Exception:  # noqa: BLE001
@@ -59,23 +71,46 @@ class ScreenRegistry:
         name = str(ep).strip()
         return [s for s in self.list_open() if s.ep == name]
 
-    def close_for_endpoint(self, ep: str) -> int:
-        """Close all screens attached to *ep*. Returns count closed."""
+    def ids_for_endpoint(self, ep: str) -> list[str]:
+        """Snapshot session ids attached to *ep* (under the registry lock)."""
+        name = str(ep).strip()
+        with self._lock:
+            return [sid for sid, s in self._sessions.items() if s.ep == name]
+
+    def close_ids(self, session_ids: Iterable[str]) -> int:
+        """Close only the given session ids if still registered.
+
+        Returns count closed. Sessions registered after the id list was built
+        (e.g. same-name endpoint reopen) are never touched.
+
+        Each id goes through ``remove``, which acquires ``session.serial_ops()``
+        before close so a concurrent send after teardown cannot return ok.
+        """
         n = 0
-        for sess in list(self.list_for_endpoint(ep)):
-            self.remove(sess.id)
-            n += 1
+        for sid in session_ids:
+            if self.remove(sid) is not None:
+                n += 1
         return n
+
+    def close_for_endpoint(self, ep: str) -> int:
+        """Close all screens attached to *ep* at call time. Returns count closed.
+
+        Snapshots ids under the lock then closes only those ids so a concurrent
+        registration after the snapshot is not torn down.
+        """
+        return self.close_ids(self.ids_for_endpoint(ep))
 
     def clear(self) -> None:
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
             self._seq = 0
-        # Best-effort close outside the lock.
+        # Best-effort close outside the registry lock; still serialize with
+        # in-flight send via the per-session op lock.
         for sess in sessions:
             try:
-                sess.close()
+                with sess.serial_ops():
+                    sess.close()
             except Exception:  # noqa: BLE001
                 pass
 

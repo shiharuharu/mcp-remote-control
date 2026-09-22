@@ -1,7 +1,9 @@
-"""Unit tests: adaptive GeometryAdapter (T18 / notes/007)."""
+"""Unit tests: adaptive GeometryAdapter."""
 
 from __future__ import annotations
 
+import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -194,7 +196,7 @@ def test_assess_tui_under_160_is_cramped() -> None:
 
 def test_assess_cramped_full_width_lines() -> None:
     cols = 100
-    # Many lines flush to the right edge → hard-wrap signal
+    # Many lines flush to the right edge -> hard-wrap signal
     line = "x" * cols
     frame = "\n".join([line] * 8)
     assert assess_layout(frame, cols, 40, "shell") == "cramped"
@@ -222,6 +224,101 @@ def test_geometry_memory_corrupt_ignored(tmp_path: Path) -> None:
     path.write_text("{not json", encoding="utf-8")
     mem = GeometryMemory(path)
     assert mem.get("ep", "shell", None) is None
+
+
+def test_geometry_memory_concurrent_puts_valid_json(tmp_path: Path) -> None:
+    """Concurrent writers: valid JSON + dual-key retention."""
+    path = tmp_path / "geometry_memory.json"
+    errors: list[BaseException] = []
+    n_threads = 2
+    barrier = threading.Barrier(n_threads)
+    iters = 50
+
+    def writer(tid: int) -> None:
+        try:
+            # Separate instances sharing one path (concurrent put/open).
+            mem = GeometryMemory(path)
+            barrier.wait()
+            for i in range(iters):
+                mem.put(
+                    f"ep{tid}",
+                    "tui",
+                    f"cmd{i}",
+                    160 + i,
+                    48 + (i % 5),
+                    healthy=True,
+                )
+        except BaseException as exc:  # noqa: BLE001 - collect for join assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(t,)) for t in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert path.is_file()
+    # Final on-disk document always parses as a JSON object (no torn JSON).
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(obj, dict)
+    # Concurrent puts of different keys must not drop earlier updates.
+    # Both endpoint families retain all written keys.
+    for tid in range(n_threads):
+        for i in range(iters):
+            k = memory_key(f"ep{tid}", "tui", f"cmd{i}")
+            assert k in obj, f"missing key after concurrent RMW: ep{tid}/cmd{i}"
+            entry = obj[k]
+            assert isinstance(entry, dict)
+            assert entry.get("endpoint") == f"ep{tid}"
+            assert entry.get("basename") == f"cmd{i}"
+            assert entry.get("cols") == 160 + i
+    # Read side recovers: get must not raise for any key.
+    mem = GeometryMemory(path)
+    got = mem.get("ep0", "tui", "cmd0")
+    assert got == (160, 48)
+    got_other = mem.get("ep1", "tui", f"cmd{iters - 1}")
+    assert got_other == (160 + iters - 1, 48 + ((iters - 1) % 5))
+    # Fresh reader after deliberate corruption still recovers.
+    path.write_text("{not json", encoding="utf-8")
+    mem_bad = GeometryMemory(path)
+    assert mem_bad.get("ep0", "tui", "cmd0") is None
+    # And a subsequent put re-establishes valid JSON.
+    mem_bad.put("ep0", "tui", "cmd0", 180, 50)
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(reloaded, dict)
+    assert mem_bad.get("ep0", "tui", "cmd0") == (180, 50)
+
+
+def test_geometry_memory_concurrent_puts_retain_distinct_keys(tmp_path: Path) -> None:
+    """Two threads, one put each of distinct endpoint keys -> both retained."""
+    path = tmp_path / "geometry_memory.json"
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def put_one(endpoint: str, basename: str, cols: int, rows: int) -> None:
+        try:
+            mem = GeometryMemory(path)
+            barrier.wait()
+            mem.put(endpoint, "tui", basename, cols, rows, healthy=True)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t0 = threading.Thread(target=put_one, args=("alpha", "htop", 200, 52))
+    t1 = threading.Thread(target=put_one, args=("beta", "vim", 180, 50))
+    t0.start()
+    t1.start()
+    t0.join()
+    t1.join()
+    assert errors == []
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    k_alpha = memory_key("alpha", "tui", "htop")
+    k_beta = memory_key("beta", "tui", "vim")
+    assert k_alpha in obj and k_beta in obj
+    assert obj[k_alpha]["cols"] == 200 and obj[k_alpha]["rows"] == 52
+    assert obj[k_beta]["cols"] == 180 and obj[k_beta]["rows"] == 50
+    mem = GeometryMemory(path)
+    assert mem.get("alpha", "tui", "htop") == (200, 52)
+    assert mem.get("beta", "tui", "vim") == (180, 50)
 
 
 def test_plan_uses_memory_seed(tmp_path: Path) -> None:
@@ -402,7 +499,7 @@ def test_adapt_forced_no_grow() -> None:
 def test_adapt_fit_disabled_no_grow() -> None:
     ad = GeometryAdapter()
     plan = ad.plan_open(command="htop", fit=False)
-    # seed is SEED_TUI 180x50 — still too small message shouldn't grow
+    # seed is SEED_TUI 180x50 - still too small message shouldn't grow
     sess = _FakeSession(plan.cols, plan.rows, frames=["terminal is too small"])
     result, _ = ad.adapt(sess, plan, settle_s=0.0)
     assert result.steps == 0
@@ -435,7 +532,7 @@ def test_adapt_respects_max_grow_steps_poor() -> None:
 
 
 def test_open_frame_geometry_matches_session_after_grow() -> None:
-    """Acceptance: open frame cols/rows consistent with session."""
+    """Open-frame cols/rows match the session size."""
     ad = GeometryAdapter(max_grow_steps=3)
     plan = ad.plan_open(command="vim")  # tui seed 180x50
     # Force cramped by using tiny session first

@@ -20,6 +20,12 @@ class _Readable(Protocol):
     def read(self, max_bytes: int = 8192) -> bytes: ...
 
 
+# Join budget for ``stop()``. A pump blocked inside ``link.read()`` cannot
+# observe ``_stop`` until that read returns; exceeding this is a failure,
+# not a clean stop.
+_STOP_JOIN_TIMEOUT_S = 1.0
+
+
 class CapturePump:
     """Daemon thread: poll *link* and feed *buffer* until ``stop()``."""
 
@@ -75,26 +81,47 @@ class CapturePump:
         self._stop.clear()
         self._thread.start()
 
-    def stop(self, *, timeout_s: float = 1.0) -> None:
+    def stop(self, *, timeout_s: float | None = None) -> None:
+        """Signal the pump thread and join it.
+
+        Raises:
+            TimeoutError: the thread is still alive after the join budget.
+                The registry records this on ``close_errors`` so a stuck
+                pump is never reported as a clean close.
+        """
+        budget = (
+            _STOP_JOIN_TIMEOUT_S
+            if timeout_s is None
+            else max(0.0, float(timeout_s))
+        )
         self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=timeout_s)
+            self._thread.join(timeout=budget)
+        if self._thread.is_alive():
+            msg = f"capture pump join timed out after {budget}s"
+            self._error = f"TimeoutError: {msg}"
+            raise TimeoutError(msg)
 
     def _run(self) -> None:
-        # Reads go through ``SerialConsole.read()``, which holds a per-console
-        # ``_read_lock`` around the underlying pyserial call. The background
-        # pump and the optional sync snarf (``_brief_pump``) therefore
-        # serialize on the same lock: a burst during overlap cannot split
-        # bytes between two readers and reorder the ring. No lock is taken
-        # here — every pyserial read goes through ``SerialConsole.read()``.
+        # Prefer ``read_into``: SerialConsole holds ``_read_lock`` across the
+        # pyserial read *and* the ring feed. The sync snarf (``_brief_pump``)
+        # takes the same lock, so two producers cannot reorder ABC+DEF into
+        # ADEFBC. Links without ``read_into`` (test stubs) fall back to
+        # read-then-feed; they are single-producer.
+        read_into = getattr(self._link, "read_into", None)
         while not self._stop.is_set():
             try:
                 if not self._link.is_alive():
-                    # Link closed externally — exit quietly.
+                    # Link closed externally - exit quietly.
                     self._link_closed = True
                     break
-                data = self._link.read(self._chunk)
-                # Successful read (data or empty): link is healthy again — clear
+                if read_into is not None:
+                    data = read_into(self._buffer, self._chunk)
+                else:
+                    data = self._link.read(self._chunk)
+                    if data:
+                        self._buffer.feed(data)
+                # Successful read (data or empty): link is healthy again - clear
                 # sticky error so views/open do not keep advising reopen after a
                 # short glitch. Consecutive-error stop still sets link_closed.
                 self._consecutive_errors = 0
@@ -102,7 +129,6 @@ class CapturePump:
                 if data:
                     self._reads += 1
                     self._bytes += len(data)
-                    self._buffer.feed(data)
                 else:
                     time.sleep(self._poll_s)
             except Exception as exc:  # noqa: BLE001

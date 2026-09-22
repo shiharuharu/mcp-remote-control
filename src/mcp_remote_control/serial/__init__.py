@@ -1,4 +1,4 @@
-"""Serial console package — unified embedded control link (USB/UART/BT ports)."""
+"""Serial console package - unified embedded control link (USB/UART/BT ports)."""
 
 from __future__ import annotations
 

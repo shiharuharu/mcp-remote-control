@@ -6,6 +6,7 @@ encoder, buffer helpers, and fixture replay.
 
 from __future__ import annotations
 
+from mcp_remote_control.screen.actions import action_truthy, actions_include_submit
 from mcp_remote_control.screen.buffer import (
     SEED_SHELL_COLS,
     SEED_SHELL_ROWS,
@@ -42,6 +43,8 @@ __all__ = [
     "GeometryMemory",
     "ScreenRegistry",
     "ScreenSession",
+    "action_truthy",
+    "actions_include_submit",
     "classify_command",
     "default_shell_geometry",
     "dump_frame",

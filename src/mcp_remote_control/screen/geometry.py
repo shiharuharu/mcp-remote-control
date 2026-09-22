@@ -1,8 +1,8 @@
-"""Adaptive screen geometry: classify → seed → health → grow → memory.
+"""Adaptive screen geometry: classify -> seed -> health -> grow -> memory.
 
 Remote PTYs have no host window to inherit. Winsize is chosen from the
 command class (seed), optional endpoint memory, and first-frame layout
-health, then may grow. Adaptive geometry never auto-shrinks the PTY —
+health, then may grow. Adaptive geometry never auto-shrinks the PTY -
 token trimming is an output-layer concern, not a winsize policy.
 """
 
@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
+import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,7 +32,7 @@ from mcp_remote_control.screen.buffer import (
 # Implementation knobs (not user config)
 # ---------------------------------------------------------------------------
 
-SEED_SHELL = (SEED_SHELL_COLS, SEED_SHELL_ROWS)  # 160×48
+SEED_SHELL = (SEED_SHELL_COLS, SEED_SHELL_ROWS)  # 160x48
 SEED_REPL = (160, 48)
 SEED_PAGER = (160, 50)
 SEED_TUI = (180, 50)
@@ -121,7 +124,7 @@ _TOO_SMALL_RE = re.compile(
 _NEED_COLS_RE = re.compile(r"(?i)need(?:s)?\s+at\s+least\s+(\d+)\s+columns?")
 
 # Ellipsis / truncation marks often left when content is clipped.
-_ELLIPSIS_CHARS = ("…", "...", "…")
+_ELLIPSIS_CHARS = ("\u2026", "...", "\u2026")
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +170,9 @@ def classify_command(
     command: str | None = None,
     argv: list[str] | None = None,
 ) -> str:
-    """Map command/argv to class ∈ {shell, repl, pager, tui, tui_heavy, unknown}.
+    """Map command/argv to class in {shell, repl, pager, tui, tui_heavy, unknown}.
 
-    No command (interactive shell open) → ``shell``.
+    No command (interactive shell open) -> ``shell``.
     Unknown basenames bias to ``unknown`` (seeded like tui).
     """
     name = _primary_basename(command, argv)
@@ -236,7 +239,7 @@ def _basename_from_tokens(tokens: list[str]) -> str | None:
     if not tokens:
         return None
     head = Path(tokens[0]).name.lower()
-    # shell -c / -lc 'inner' → classify inner program when present
+    # shell -c / -lc 'inner' -> classify inner program when present
     if head in _SHELL and len(tokens) >= 2:
         inner = _extract_shell_inner(tokens)
         if inner:
@@ -281,13 +284,13 @@ def assess_layout(
 ) -> str:
     """Score a frame: ``healthy`` | ``cramped`` | ``too_small``.
 
-    Does **not** recommend shrink — slightly large is preferred over unusable.
+    Does **not** recommend shrink - slightly large is preferred over unusable.
     """
     text = frame or ""
     if _TOO_SMALL_RE.search(text):
         return "too_small"
 
-    # TUI-class / recognized surface under shell-ish width → cramped
+    # TUI-class / recognized surface under shell-ish width -> cramped
     surf = (surface or "").lower()
     is_tuiish = cmd_class in ("tui", "tui_heavy", "unknown") or surf in (
         "tui",
@@ -314,7 +317,7 @@ def grow_geometry(
     rows = int(rows)
     new_c, new_r = cols, rows
 
-    # Explicit "need at least N columns" → jump with margin
+    # Explicit "need at least N columns" -> jump with margin
     m = _NEED_COLS_RE.search(frame or "")
     if m:
         needed = int(m.group(1)) + _NEED_COLS_MARGIN
@@ -329,7 +332,7 @@ def grow_geometry(
         # rows only if already at/near max width (still never shrink)
         if cols >= MAX_COLS - GROW_COLS:
             new_r = max(new_r, rows + GROW_ROWS)
-    # healthy / unknown → no change (still enforce non-shrink below)
+    # healthy / unknown -> no change (still enforce non-shrink below)
 
     # Absolute floor for tui-ish cramped under 160: step toward SEED_TUI
     if health_l in ("cramped", "too_small") and new_c < SEED_TUI[0]:
@@ -359,7 +362,7 @@ def _looks_cramped(frame: str, cols: int) -> bool:
         total_fill += length
         if length >= max(1, cols - 1):
             full_width += 1
-        if any(mark in ln for mark in ("…", "...")):
+        if any(mark in ln for mark in ("\u2026", "...")):
             ellipsis_lines += 1
 
     n = len(nonempty)
@@ -387,6 +390,24 @@ def memory_key(
 ) -> str:
     raw = f"{endpoint_id}|{cmd_class}|{basename or ''}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+# Process-wide locks for GeometryMemory RMW (put load-then-save). Separate
+# GeometryMemory instances sharing a path must serialize so concurrent puts
+# of different keys do not last-writer-wins drop earlier keys.
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _geometry_file_lock(path: Path) -> threading.Lock:
+    """Return a process-internal Lock for *path* (absolute string key)."""
+    key = str(path.expanduser().absolute())
+    with _FILE_LOCKS_GUARD:
+        lk = _FILE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _FILE_LOCKS[key] = lk
+        return lk
 
 
 class GeometryMemory:
@@ -437,23 +458,31 @@ class GeometryMemory:
     ) -> None:
         if self.path is None:
             return
-        data = self._load() or {}
-        key = memory_key(endpoint_id, cmd_class, basename)
-        c, r = clamp_geometry(cols, rows)
-        data[key] = {
-            "cols": c,
-            "rows": r,
-            "healthy": bool(healthy),
-            "updated_at": time.time(),
-            "endpoint": endpoint_id,
-            "class": cmd_class,
-            "basename": basename,
-        }
-        self._save(data)
+        # Serialize RMW across instances that share this path; re-read disk
+        # under the lock so we merge this key into current file state rather
+        # than overwriting with a stale in-memory full map.
+        with _geometry_file_lock(self.path):
+            data = dict(self._reload())
+            key = memory_key(endpoint_id, cmd_class, basename)
+            c, r = clamp_geometry(cols, rows)
+            data[key] = {
+                "cols": c,
+                "rows": r,
+                "healthy": bool(healthy),
+                "updated_at": time.time(),
+                "endpoint": endpoint_id,
+                "class": cmd_class,
+                "basename": basename,
+            }
+            self._save(data)
 
     def _load(self) -> dict[str, Any] | None:
         if self._cache is not None:
             return self._cache
+        return self._reload()
+
+    def _reload(self) -> dict[str, Any]:
+        """Read path from disk into ``_cache`` (empty dict on miss/error)."""
         if self.path is None or not self.path.is_file():
             self._cache = {}
             return self._cache
@@ -469,20 +498,52 @@ class GeometryMemory:
         return self._cache
 
     def _save(self, data: dict[str, Any]) -> None:
+        """Persist *data* via a unique same-dir temp + ``os.replace``.
+
+        Unique temp names avoid concurrent writers clobbering a shared
+        ``*.tmp`` path (torn / invalid JSON after replace). Best-effort:
+        ``OSError`` is swallowed; other errors re-raise after cleanup.
+        Callers that RMW (``put``) must hold ``_geometry_file_lock`` so
+        field-level merges are not lost to last-writer full-map overwrite.
+        """
         if self.path is None:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
+            fd, tmp = tempfile.mkstemp(
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
             )
-            tmp.replace(self.path)
+        except OSError:
+            return
+        try:
+            try:
+                fh = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            with fh:
+                fh.write(
+                    json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                )
+            os.replace(tmp, self.path)
             self._cache = data
         except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             # Best-effort only
-            pass
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +552,7 @@ class GeometryMemory:
 
 
 class GeometryAdapter:
-    """Seed → settle health → limited grow. Never auto-shrinks the PTY."""
+    """Seed -> settle health -> limited grow. Never auto-shrinks the PTY."""
 
     def __init__(
         self,
@@ -515,9 +576,9 @@ class GeometryAdapter:
     ) -> GeometryPlan:
         """Resolve open geometry.
 
-        * Explicit ``cols`` + ``rows`` → forced (skip adaptive grow).
+        * Explicit ``cols`` + ``rows`` -> forced (skip adaptive grow).
         * Else: memory seed or class seed (profile screen_cols/rows only as
-          seed override when both set — not a hard lock unless also forced).
+          seed override when both set - not a hard lock unless also forced).
         """
         cmd_class = classify_command(command, argv)
         basename = command_basename(command, argv)

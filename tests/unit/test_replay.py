@@ -1,4 +1,4 @@
-"""Unit tests: PTY fixture replay without live TUI (T19 / 018 §五)."""
+"""Unit tests: PTY fixture replay without live TUI."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def test_replay_tui_menu_find_save() -> None:
     result = replay_fixture(TUI_BIN)
     assert "Save" in result.frame
     assert result.expect_ok is True
-    # find_text via a temp screen from replay path — use frame content
+    # find_text via a temp screen from replay path - use frame content
     assert "Type a message" in result.frame
 
 
@@ -116,7 +116,7 @@ def test_cli_mrc_replay_missing_fixture() -> None:
 
 
 # ---------------------------------------------------------------------------
-# O12: replay --check failure path + bare-positional fixture heuristic
+# replay --check failure path + bare-positional fixture heuristic
 # ---------------------------------------------------------------------------
 
 
