@@ -28,7 +28,6 @@ from mcp_remote_control.screen.keys import (
     encode_text,
 )
 from mcp_remote_control.screen.send import (
-    ACTION_IMPL,
     ACTION_TYPES,
     GO_STEP_CAP,
     ActionError,
@@ -98,15 +97,6 @@ def _session(cols: int = 80, rows: int = 24) -> tuple[ScreenSession, FakePty]:
     return sess, pty
 
 
-def _paint(sess: ScreenSession, text: str, *, row: int = 0, col: int = 0) -> None:
-    """Feed plain text + CUP so cursor sits at (row,col) after paint."""
-    # 1-based CUP
-    cup = f"\x1b[{row + 1};{col + 1}H"
-    sess.feed(text if row == 0 and col == 0 else f"\x1b[H{text}")
-    # Re-position cursor for go/move tests
-    sess.feed(cup)
-
-
 def _mouse_on(sess: ScreenSession) -> None:
     """Make the peer announce xterm mouse tracking so SGR reports are legal."""
     sess.feed("\x1b[?1000h\x1b[?1006h")
@@ -139,7 +129,6 @@ def test_action_types_match_catalog() -> None:
         "wait",
     }
     assert ACTION_TYPES == expected
-    assert set(ACTION_IMPL) == expected
 
 
 def test_normalize_actions_empty() -> None:

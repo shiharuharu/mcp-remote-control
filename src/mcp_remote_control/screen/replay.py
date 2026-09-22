@@ -16,7 +16,6 @@ import pyte
 from mcp_remote_control.screen.buffer import (
     SEED_SHELL_COLS,
     SEED_SHELL_ROWS,
-    clamp_geometry,
     cursor_rc,
     dump_frame,
     frame_hash,
@@ -220,8 +219,3 @@ def resolve_fixture_path(name_or_path: str, *, base: Path | None = None) -> Path
         if c2.is_file():
             return c2.resolve()
     raise FileNotFoundError(f"pty fixture not found: {name_or_path}")
-
-
-# Keep clamp available for callers that want production geometry.
-def production_geometry(cols: int, rows: int) -> tuple[int, int]:
-    return clamp_geometry(cols, rows)

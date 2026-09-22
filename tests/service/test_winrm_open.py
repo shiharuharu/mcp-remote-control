@@ -5,93 +5,27 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from _winrm_session_fake import _MockWinRMSession
+
 from mcp_remote_control.cli import main
 from mcp_remote_control.cli_cmds import EXIT_OK, EXIT_TRANSPORT
 from mcp_remote_control.core import endpoint_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport.base import ExecResult
-from mcp_remote_control.transport.winrm import PypsrpClientAdapter, WinRMTransport
+from mcp_remote_control.transport.winrm import WinRMTransport, note_winrm_connect_handle
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 FAKE_PASSWORD = "dummy-winrm-password"
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
-
-
 # ---------------------------------------------------------------------------
 # Mock session helpers
 # ---------------------------------------------------------------------------
-
-class _MockWinRMSession:
-    """Injectable session: no network sockets."""
-
-    def __init__(
-        self,
-        *,
-        cwd: str = r"C:\Users\Administrator",
-        home: str = r"C:\Users\Administrator",
-        os_name: str = "windows",
-        shell: str = "powershell",
-        ps_version: str = "5.1.19041",
-        probe_partial: bool = False,
-    ) -> None:
-        self.cwd = cwd
-        self.home = home
-        self.os = os_name
-        self.shell = shell
-        self.ps_version = ps_version
-        if probe_partial:
-            self.probe_status = "partial"
-            self.probe_error = "mock probe partial"
-        self.closed = False
-        self.commands: list[str] = []
-        self.argvs: list[list[str]] = []
-
-    def close(self) -> None:
-        self.closed = True
-
-    def run_command(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        timeout_s: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> ExecResult:
-        self.commands.append(command)
-        return ExecResult(
-            exit_code=0,
-            stdout=f"winrm-out:{command}\n",
-            stderr="",
-            cwd=cwd or self.cwd,
-        )
-
-    def run_argv(
-        self,
-        argv: list[str],
-        *,
-        cwd: str | None = None,
-        timeout_s: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> ExecResult:
-        self.argvs.append(list(argv))
-        return ExecResult(
-            exit_code=0,
-            stdout=" ".join(argv) + "\n",
-            cwd=cwd or self.cwd,
-        )
 
 
 def _ok_connector(**kwargs: object) -> _MockWinRMSession:
@@ -154,10 +88,6 @@ class _IdentityHangWinRMSession:
         # Hang longer than the shortened probe budget; released on close.
         self.block.wait(timeout=30.0)
         return ("never", None, False)
-
-
-def _identity_fail_connector(**_kwargs: object) -> _IdentityFailWinRMSession:
-    return _IdentityFailWinRMSession()
 
 
 class _IdentityEmptyStdoutWinRMSession:
@@ -356,18 +286,6 @@ def _identity_access_denied_connector(
     **_kwargs: object,
 ) -> _IdentityJunkStdoutWinRMSession:
     return _IdentityJunkStdoutWinRMSession("Access Denied\n")
-
-
-def _identity_real_probe_lines_connector(
-    **_kwargs: object,
-) -> _IdentityJunkStdoutWinRMSession:
-    stdout = (
-        "Microsoft Windows NT 10.0.19041.0\n"
-        "5.1.19041.1\n"
-        r"C:\Users\Administrator" + "\n"
-        r"C:\Users\Administrator" + "\n"
-    )
-    return _IdentityJunkStdoutWinRMSession(stdout)
 
 
 def test_winrm_identity_access_denied_open_error() -> None:
@@ -907,10 +825,10 @@ def test_winrm_connect_timeout_closes_late_client(
     client = _LateClient()
 
     def hang_after_construct(**_kwargs: object) -> object:
-        # Adapter notes the handle as soon as it exists; then we hang.
-        adapter = PypsrpClientAdapter(client)
+        # The connector notes the handle as soon as it exists; then we hang.
+        note_winrm_connect_handle(client)
         block.wait(timeout=30.0)
-        return adapter
+        return client
 
     t = WinRMTransport(
         host="h",

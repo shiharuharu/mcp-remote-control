@@ -65,18 +65,10 @@ _MAX_SYMLINK_FOLLOW = 32
 # Unlike WinRM (skip at cap), SFTP raises a clear FsError when depth is hit.
 _MAX_RECURSE_DEPTH = 40
 
-# Default wall-clock budget for each SFTP await on the async bridge.
-# Aligns with ``[defaults] exec_timeout_ms`` (60s) so MCP fs ops never block
-# the FastMCP thread pool forever on a silent remote hang (no keepalive).
-# Override per instance via ``SftpFs(..., timeout_s=...)``.
+# Default wall-clock budget for each SFTP await on the async bridge: 60s, so MCP
+# fs ops never block the FastMCP thread pool forever on a silent remote hang (no
+# keepalive). Override per instance via ``SftpFs(..., timeout_s=...)``.
 DEFAULT_SFTP_TIMEOUT_S: float = 60.0
-
-# Default whole-public-op wall-clock budget (shared remaining across awaits).
-# Without this, multi-await ops (recursive list / rmtree / chunked put) can
-# approach N times DEFAULT_SFTP_TIMEOUT_S. Override via
-# ``SftpFs(..., op_timeout_s=...)`` for long multi-chunk transfers; omit to
-# mirror ``timeout_s``.
-DEFAULT_SFTP_OP_TIMEOUT_S: float = DEFAULT_SFTP_TIMEOUT_S
 
 
 def _mode_oct(mode: int) -> str:
@@ -306,8 +298,8 @@ class SftpFs:
         self._timeout_s = (
             DEFAULT_SFTP_TIMEOUT_S if timeout_s is None else float(timeout_s)
         )
-        # Whole-op budget: omit -> mirror per-await (DEFAULT_SFTP_OP_TIMEOUT_S
-        # when timeout_s is also omitted). Explicit op_timeout_s wins.
+        # Whole-op budget: omit -> mirror the per-await budget above.
+        # Explicit op_timeout_s wins.
         self._op_timeout_s = (
             self._timeout_s if op_timeout_s is None else float(op_timeout_s)
         )
@@ -786,7 +778,6 @@ class SftpFs:
                 path=abs_remote,
                 local=str(src),
                 bytes_transferred=int(size),
-                direction="put",
             )
 
     def get(
@@ -884,7 +875,6 @@ class SftpFs:
                 path=abs_remote,
                 local=str(dst),
                 bytes_transferred=int(size),
-                direction="get",
             )
 
     def mkdir(self, path: str, *, parents: bool = True) -> StatInfo:
@@ -1079,10 +1069,6 @@ class SftpFs:
             # original exception class (public methods only see FsError).
             self._invalidate_on_channel_closed(exc)
             raise _map_sftp_error(exc, path) from exc
-
-    def _listdir(self, sftp: Any, path: str) -> list[str]:
-        """Return entry names only (used by ``_rmtree``); see ``_scandir`` for attrs."""
-        return [name for name, _ in self._scandir(sftp, path)]
 
     def _scandir(self, sftp: Any, path: str) -> list[tuple[str, Any | None]]:
         """Return ``(name, attrs)`` pairs for directory entries.
@@ -1324,18 +1310,6 @@ class SftpFs:
 
             self._run_maybe_async(setstat(path, _PermAttrs()))
             return
-
-    def _copy_mode_if_exists(self, sftp: Any, dest: str, onto: str) -> None:
-        """Copy *dest* mode onto *onto* when *dest* is an existing regular file.
-
-        Mirrors local ``_copy_mode_if_exists``: applied to the temp path before
-        rename so the promoted file never lands with the temp's default mode.
-        New destinations leave the temp's umask-derived mode untouched.
-        """
-        mode = self._existing_file_mode(sftp, dest)
-        if mode is None:
-            return
-        self._set_remote_mode(sftp, onto, mode)
 
     def _promote_temp_file(self, sftp: Any, tmp: str, dest: str) -> None:
         """Promote a fully-written temp onto *dest* after successful close.

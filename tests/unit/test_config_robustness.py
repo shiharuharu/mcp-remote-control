@@ -402,7 +402,7 @@ def test_secret_reader_still_reads_an_existing_file(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # A read of the global ``[defaults]`` table's ``verbosity`` key. The
 # declaration and the parser name the key without reading it, so those files
-# are excluded; ``[logging]``-style template text has no ``.defaults``
+# are excluded; template text (the generated config.toml) has no ``.defaults``
 # receiver and does not match.
 _DEFAULTS_VERBOSITY_READ = re.compile(
     r"""\.defaults\b[^\n]*(?:\.verbosity\b|["']verbosity["'])"""

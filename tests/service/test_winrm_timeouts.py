@@ -5,16 +5,16 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from pypsrp.powershell import RunspacePoolState
 from pypsrp.shell import SignalCode
 
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from _winrm_session_fake import _MockWinRMSession
+
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.transport import TransportError
-from mcp_remote_control.transport.base import ExecResult
 from mcp_remote_control.transport.winrm import WinRMTransport, _EXIT_MARKER
 from mcp_remote_control.transport.winrm_timeouts import PYPSRP_HTTP_TIMEOUT_SLACK_S
 
@@ -29,76 +29,9 @@ from test_winrm_runspace import (
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
-
-
 # ---------------------------------------------------------------------------
 # Mock session helpers
 # ---------------------------------------------------------------------------
-
-class _MockWinRMSession:
-    """Injectable session: no network sockets."""
-
-    def __init__(
-        self,
-        *,
-        cwd: str = r"C:\Users\Administrator",
-        home: str = r"C:\Users\Administrator",
-        os_name: str = "windows",
-        shell: str = "powershell",
-        ps_version: str = "5.1.19041",
-        probe_partial: bool = False,
-    ) -> None:
-        self.cwd = cwd
-        self.home = home
-        self.os = os_name
-        self.shell = shell
-        self.ps_version = ps_version
-        if probe_partial:
-            self.probe_status = "partial"
-            self.probe_error = "mock probe partial"
-        self.closed = False
-        self.commands: list[str] = []
-        self.argvs: list[list[str]] = []
-
-    def close(self) -> None:
-        self.closed = True
-
-    def run_command(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        timeout_s: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> ExecResult:
-        self.commands.append(command)
-        return ExecResult(
-            exit_code=0,
-            stdout=f"winrm-out:{command}\n",
-            stderr="",
-            cwd=cwd or self.cwd,
-        )
-
-    def run_argv(
-        self,
-        argv: list[str],
-        *,
-        cwd: str | None = None,
-        timeout_s: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> ExecResult:
-        self.argvs.append(list(argv))
-        return ExecResult(
-            exit_code=0,
-            stdout=" ".join(argv) + "\n",
-            cwd=cwd or self.cwd,
-        )
 
 
 class _BlockingPsSession:
@@ -524,9 +457,6 @@ def test_winrm_timeout_s_5_applies_op_read_ge_5() -> None:
     assert op == 5
     # HTTP read timeout must outlast the WSMan operation timeout.
     assert rd == 5 + PYPSRP_HTTP_TIMEOUT_SLACK_S
-    # Transport records last applied (mock-assertable without live wsman).
-    assert t._last_applied_operation_timeout == 5  # noqa: SLF001
-    assert t._last_applied_read_timeout == 5 + PYPSRP_HTTP_TIMEOUT_SLACK_S  # noqa: SLF001
     # Restored after call so unlimited follow-ups keep connect-time defaults.
     assert sess.wsman.operation_timeout == 20
     assert sess.wsman.transport.read_timeout == 30
@@ -544,8 +474,6 @@ def test_winrm_timeout_s_ceil_fractional() -> None:
     t.connect()
     t.run_command("whoami", timeout_s=5.2)
     assert sess.captured[0] == (6, 6 + PYPSRP_HTTP_TIMEOUT_SLACK_S)
-    assert t._last_applied_operation_timeout == 6  # noqa: SLF001
-    assert t._last_applied_read_timeout == 6 + PYPSRP_HTTP_TIMEOUT_SLACK_S  # noqa: SLF001
 
 
 def test_winrm_profile_op_read_override_derivation() -> None:
@@ -571,8 +499,6 @@ def test_winrm_profile_op_read_override_derivation() -> None:
     assert kw["read_timeout"] == 88
     t.run_command("whoami", timeout_s=5)
     assert sess.captured[0] == (60, 88)
-    assert t._last_applied_operation_timeout == 60  # noqa: SLF001
-    assert t._last_applied_read_timeout == 88  # noqa: SLF001
 
 
 def test_winrm_no_timeout_does_not_force_short_op_read() -> None:
@@ -590,8 +516,6 @@ def test_winrm_no_timeout_does_not_force_short_op_read() -> None:
     assert sess.captured, "call must still run"
     # Without derivation, wsman is left at its prior values (20/30).
     assert sess.captured[0] == (20, 30)
-    assert t._last_applied_operation_timeout is None  # noqa: SLF001
-    assert t._last_applied_read_timeout is None  # noqa: SLF001
     # connect kwargs must not inject tiny op/read when profile omits them.
     kw = t.connect_kwargs()
     assert "operation_timeout" not in kw

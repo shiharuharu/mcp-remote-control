@@ -230,7 +230,7 @@ def _session_wsman(session: Any | None) -> Any | None:
     wsman = getattr(raw, "wsman", None)
     if wsman is not None:
         return wsman
-    # PypsrpClientAdapter keeps the real Client on ``_client``.
+    # A wrapper around the real Client may hold it on ``_client`` instead.
     client = getattr(raw, "_client", None)
     if client is not None:
         return getattr(client, "wsman", None)

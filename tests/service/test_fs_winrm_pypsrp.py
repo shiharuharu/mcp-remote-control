@@ -3,29 +3,20 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pypsrp.exceptions
 import pytest
 
-from _winrm_fakes import HOME, TEMP, FakePypsrpSession
+from _winrm_fakes import HOME, TEMP, FakePypsrpSession, _ErrorStreams
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.fs.backends.winrm import PypsrpFileClient, WinrmFs
 from mcp_remote_control.fs.types import FsError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def _promote_script(sess: FakePypsrpSession) -> str:
@@ -323,6 +314,45 @@ def test_winrm_read_file_bounded_script_no_int32_length() -> None:
     assert "$fs.Length" not in script
 
 
+def test_winrm_not_found_answer_keeps_its_dialect_per_script() -> None:
+    """Each script answers a missing path in the dialect its decoder reads.
+
+    ``read_file``'s scripts answer the bare token ``NOT_FOUND``, decoded by an
+    equality check; ``stat`` / ``readlink`` / ``listdir`` / ``list_with_attrs``
+    answer ``{"error":"NOT_FOUND"}``, decoded by a dict lookup. The two are not
+    interchangeable: a dict answer fed to the base64 read surfaces FS_ERROR
+    ("invalid base64 read") instead of FileNotFoundError. The fake session
+    answers by op marker rather than by evaluating the emitted catch, so only a
+    script-shape assertion like this one can see the swap.
+    """
+    sess = FakePypsrpSession()
+    client = PypsrpFileClient(sess)
+
+    for call in (
+        lambda: client.stat(rf"{TEMP}\missing.bin"),
+        lambda: client.readlink(rf"{TEMP}\missing.bin"),
+        lambda: client.listdir(rf"{TEMP}\missing-dir"),
+        lambda: client.list_with_attrs(rf"{TEMP}\missing-dir"),
+    ):
+        sess.ps_calls.clear()
+        with pytest.raises(FileNotFoundError):
+            call()
+        script = sess.ps_calls[0]
+        assert 'Write-Output \'{"error":"NOT_FOUND"}\'' in script
+        assert 'Write-Output \'NOT_FOUND\'' not in script
+
+    for call in (
+        lambda: client.read_file(rf"{TEMP}\missing.bin"),
+        lambda: client.read_file(rf"{TEMP}\missing.bin", max_bytes=8),
+    ):
+        sess.ps_calls.clear()
+        with pytest.raises(FileNotFoundError):
+            call()
+        script = sess.ps_calls[0]
+        assert 'Write-Output \'NOT_FOUND\'' in script
+        assert '{"error":"NOT_FOUND"}' not in script
+
+
 def test_winrm_read_file_bounded_works_for_large_payload_head() -> None:
     """WinrmFs.read with max_bytes returns the head and uses Length-free PS."""
     sess = FakePypsrpSession()
@@ -358,13 +388,6 @@ def test_winrm_read_file_bounded_works_for_large_payload_head() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _PsStreams:
-    """Minimal stand-in for pypsrp PSDataStreams (``.error`` list)."""
-
-    def __init__(self, errors: list[str] | None = None) -> None:
-        self.error = list(errors or [])
-
-
 class _HadErrorsSession:
     """Session whose execute_ps always returns pypsrp (out, streams, True)."""
 
@@ -377,10 +400,10 @@ class _HadErrorsSession:
         script: str,
         *,
         environment: dict[str, str] | None = None,
-    ) -> tuple[str, _PsStreams, bool]:
+    ) -> tuple[str, _ErrorStreams, bool]:
         del environment
         self.ps_calls.append(script)
-        return ("", _PsStreams([self.stderr]), True)
+        return ("", _ErrorStreams([self.stderr]), True)
 
 
 class _OkTupleSession:
@@ -395,10 +418,10 @@ class _OkTupleSession:
         script: str,
         *,
         environment: dict[str, str] | None = None,
-    ) -> tuple[str, _PsStreams, bool]:
+    ) -> tuple[str, _ErrorStreams, bool]:
         del environment
         self.ps_calls.append(script)
-        return (self.stdout, _PsStreams([]), False)
+        return (self.stdout, _ErrorStreams([]), False)
 
 
 def test_pypsrp_execute_ps_had_errors_write_file_raises() -> None:

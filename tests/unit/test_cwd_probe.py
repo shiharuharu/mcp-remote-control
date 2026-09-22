@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mcp_remote_control.screen.actions import (
+    actions_include_submit as _actions_include_submit,
+)
 from mcp_remote_control.screen.buffer import (
     PWD_MARKER,
     _full_rows,
@@ -15,13 +18,11 @@ from mcp_remote_control.screen.buffer import (
     dump_frame,
     live_tui_modes,
     mouse_tracking_enabled,
-    parse_pwd_marker,
     strip_probe_lines,
 )
 from mcp_remote_control.screen.cwd_probe import (
     _PROBE_CMD_BASH,
     _PROBE_CMD_POSIX,
-    _actions_include_submit,
     _echo_snapshot,
     _fresh_probe_marker,
     _fresh_pwd_marker,
@@ -141,32 +142,30 @@ def test_strip_probe_lines_from_frame() -> None:
     assert "next$" in cleaned
 
 
-def test_parse_pwd_marker() -> None:
-    assert parse_pwd_marker(f"x\n{PWD_MARKER}/tmp/foo\ny") == "/tmp/foo"
-    assert parse_pwd_marker("no marker") is None
+def test_collect_pwd_markers_extracts_paths() -> None:
+    """Marker extraction keeps spaces, unwraps quotes, ignores unexpanded lines."""
+    assert collect_pwd_markers(f"x\n{PWD_MARKER}/tmp/foo\ny") == ["/tmp/foo"]
+    assert collect_pwd_markers("no marker") == []
     # Spaces in path must not truncate at first whitespace.
-    assert parse_pwd_marker(f"{PWD_MARKER}/home/my dir") == "/home/my dir"
-    assert (
-        parse_pwd_marker(f"x\n{PWD_MARKER}/home/my dir\ny") == "/home/my dir"
-    )
-    # Windows drive path with spaces (and UNC without spaces).
-    assert (
-        parse_pwd_marker(f"{PWD_MARKER}C:\\Program Files\\x")
-        == "C:\\Program Files\\x"
-    )
-    assert (
-        parse_pwd_marker(f"{PWD_MARKER}C:/Program Files/x")
-        == "C:/Program Files/x"
-    )
+    assert collect_pwd_markers(f"{PWD_MARKER}/home/my dir") == ["/home/my dir"]
+    assert collect_pwd_markers(f"x\n{PWD_MARKER}/home/my dir\ny") == ["/home/my dir"]
+    # Windows drive path with spaces.
+    assert collect_pwd_markers(f"{PWD_MARKER}C:\\Program Files\\x") == [
+        "C:\\Program Files\\x"
+    ]
+    assert collect_pwd_markers(f"{PWD_MARKER}C:/Program Files/x") == [
+        "C:/Program Files/x"
+    ]
     # Quoted path (probe may quote; unwrap and keep interior spaces).
-    assert parse_pwd_marker(f'{PWD_MARKER}"/home/my dir"') == "/home/my dir"
-    assert parse_pwd_marker(f"{PWD_MARKER}'/home/my dir'") == "/home/my dir"
-    # No marker -> None; unexpanded $(pwd) / %CD% command lines ignored.
-    assert parse_pwd_marker(f"{PWD_MARKER}$(pwd -P 2>/dev/null||pwd)") is None
-    assert parse_pwd_marker(f"{PWD_MARKER}%CD%") is None
-    # Last valid marker wins (space path over earlier plain path).
+    assert collect_pwd_markers(f'{PWD_MARKER}"/home/my dir"') == ["/home/my dir"]
+    assert collect_pwd_markers(f"{PWD_MARKER}'/home/my dir'") == ["/home/my dir"]
+    # Unexpanded $(pwd) / %CD% command lines are not paths.
+    assert collect_pwd_markers(f"{PWD_MARKER}$(pwd -P 2>/dev/null||pwd)") == []
+    assert collect_pwd_markers(f"{PWD_MARKER}%CD%") == []
+    # Screen order, so the newest (last) marker is the tail of the list.
     frame = f"{PWD_MARKER}/tmp/foo\n{PWD_MARKER}/home/my dir\nprompt$"
-    assert parse_pwd_marker(frame) == "/home/my dir"
+    assert collect_pwd_markers(frame) == ["/tmp/foo", "/home/my dir"]
+    assert collect_pwd_markers(frame)[-1] == "/home/my dir"
 
 
 def test_dump_frame_strips_probe_by_default() -> None:
@@ -785,7 +784,7 @@ def test_silent_pwd_probe_ignores_stale_marker() -> None:
     sess, pty = _shell_sess(cwd="/prior", reply_marker=False)
     sess.feed(f"{PWD_MARKER}/old\r\nuser@host:/prior$ ")
     raw = dump_frame(sess.screen, strip_probe=False)
-    assert parse_pwd_marker(raw) == "/old"
+    assert collect_pwd_markers(raw)[-1] == "/old"
     cwd_before = sess.cwd
     path = silent_pwd_probe(sess, timeout_s=0.25)
     assert path is None

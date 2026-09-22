@@ -22,26 +22,36 @@ def action_truthy(val: Any) -> bool:
 
 
 # Keys that commit the current shell input line (same as submit / enter).
+# Restricted to spellings ``encode_key`` accepts: the key text is stripped
+# before the lookup, so "\r" / "\n" fold to "" and can never match, and
+# "kp_enter" / "c-m" / "ctrl-m" raise KeyEncodeError instead of landing input.
 _SUBMIT_KEY_NAMES: frozenset[str] = frozenset(
     {
         "enter",
         "return",
-        "kp_enter",
-        "c-m",
         "ctrl+m",
-        "ctrl-m",
-        "\r",
-        "\n",
     }
 )
 
-# Trailing nop / wait / resize do not land input; they are skipped when
-# finding the last action that actually touched the PTY line.
+# Action types that write no PTY input. Trailing nop / wait / resize do not
+# land input when scanning for the last action that touched the shell line, and
+# a send made only of these needs no cwd probe (the probe injects ctrl+u).
 _NON_INPUT_TYPES: frozenset[str] = frozenset({"nop", "wait", "resize"})
 
 
 def _action_type(act: Mapping[str, Any]) -> str:
     return str(act.get("type") or act.get("op") or "").strip().lower()
+
+
+def _is_noop_actions(actions: Sequence[Mapping[str, Any]] | None) -> bool:
+    """True when actions are empty or only nop/wait/resize (pure re-shot / poll)."""
+    if not actions:
+        return True
+    for act in actions:
+        atype = _action_type(act)
+        if atype and atype not in _NON_INPUT_TYPES:
+            return False
+    return True
 
 
 def _is_submit_action(act: Mapping[str, Any]) -> bool:

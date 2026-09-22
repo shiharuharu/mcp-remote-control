@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -28,13 +27,6 @@ def _pypsrp_exc(qualname: str, *args: object) -> BaseException:
         if real is not None:
             return real(*args)
     return type(qualname, (Exception,), {"__module__": "pypsrp.exceptions"})(*args)
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry() -> Iterator[None]:
-    reset_registry()
-    yield
-    reset_registry()
 
 
 @pytest.fixture
@@ -316,7 +308,7 @@ def test_endpoint_op_lock_present_after_open(mrc_home: Path) -> None:
     ep = get_registry().get("local")
     assert ep is not None
     assert ep.transport is not None
-    assert ep.op_lock is ep.transport.op_lock
+    assert ep.transport.op_lock is not None
     # serial_ops re-enters cleanly (RLock).
     with ep.transport.serial_ops():
         assert ep.transport.is_connected() is True

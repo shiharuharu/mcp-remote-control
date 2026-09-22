@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -11,19 +10,11 @@ from _winrm_fakes import HOME, TEMP, FakePypsrpSession
 from test_fs_winrm import MockWinrmFileClient, _MockAttrs, _connector_for
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.fs.backends.winrm import PypsrpFileClient, WinrmFs
 from mcp_remote_control.fs.types import FsError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +282,7 @@ def test_winrm_fs_script_ops_unsupported_when_ps_script_fs_false(
 
 
 class _CopyFetchClientNoNativeFlag:
-    """SupportsCopyFetch shape without has_native_* attributes.
+    """Client with copy()/fetch() but no has_native_* attributes.
 
     Used to prove missing flags default to False (not treated as native).
     """
@@ -444,7 +435,7 @@ def test_gated_native_copy_not_found_stays_not_found(tmp_path: Path) -> None:
 
 
 class _CopyOnlyClientNoNativeFlag:
-    """Copy-only (misses SupportsCopyFetch). No has_native_* - not native."""
+    """Copy-only (no fetch()). No has_native_* - not native."""
 
     def __init__(self) -> None:
         self.copy_calls: list[tuple[str, str]] = []
@@ -454,7 +445,7 @@ class _CopyOnlyClientNoNativeFlag:
 
 
 class _FetchOnlyClientNoNativeFlag:
-    """Fetch-only (misses SupportsCopyFetch). No has_native_* - not native."""
+    """Fetch-only (no copy()). No has_native_* - not native."""
 
     def __init__(self) -> None:
         self.fetch_calls: list[tuple[str, str]] = []

@@ -70,7 +70,6 @@ def run(
     backend: FsBackend | None = None,
     sftp_client: Any | None = None,
     file_client: Any | None = None,
-    include_via: bool = True,
     **_kwargs: Any,
 ) -> OpResult:
     """Dispatch a filesystem op through the backend selected by the endpoint.
@@ -164,7 +163,7 @@ def run(
                 exc.msg,
                 ep=ep_name,
                 path=path,
-                extra=_connect_failure_fields(exc),
+                extra=connect_failure_fields(exc),
             )
         except Exception as exc:  # noqa: BLE001
             return _err(
@@ -287,7 +286,7 @@ def run(
         result,
         ep=ep_name,
         cwd=cwd,
-        via=backend.via if include_via else None,
+        via=backend.via,
         ms=ms,
         recursive=bool(recursive) if op_norm in {"list", "rm"} else None,
     )
@@ -418,8 +417,6 @@ def _ok_result(
         path_abs = result.path
         fields["path"] = path_abs
         fields["n"] = len(result.entries)
-        if result.truncated:
-            fields["truncated"] = True
         body = _format_list_body(result)
     elif op == "stat" and isinstance(result, StatInfo):
         path_abs = result.path
@@ -579,15 +576,6 @@ def _node_path_field(exc: FsError, path: str | None) -> dict[str, Any]:
     if path is not None and str(path) == node_text:
         return {}
     return {_NODE_PATH_FIELD: node_text}
-
-
-def _connect_failure_fields(exc: TransportError) -> dict[str, Any]:
-    """Classified connect-failure tokens from a lazy-connect ``TransportError``.
-
-    Delegates to the registry so the fs row's vocabulary stays in step with
-    every other surface that reports the same failure.
-    """
-    return connect_failure_fields(exc)
 
 
 def _dead_transport_msg(transport: BaseTransport | None) -> str:

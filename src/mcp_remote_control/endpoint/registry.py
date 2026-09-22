@@ -39,8 +39,8 @@ Invariants:
   ``Endpoint`` under only the main RLock while a concurrent ``mark_dead`` +
   ``ensure_connected`` retires it. ``ensure_endpoint`` likewise returns before
   screen/ps open their PTY or runspace, so callers re-validate with
-  :meth:`holds_same` plus transport liveness before publishing the session -
-  on mismatch close the orphan handle and return ``NOT_CONNECTED``.
+  :meth:`generation_still_open` before publishing the session - on mismatch
+  close the orphan handle and return ``NOT_CONNECTED``.
 
 Construction lives in ``connect``, probing in ``probe``; the module re-exports
 ``_build_winrm_transport``, ``_resolve_password`` and ``_seed_cwd``.
@@ -115,18 +115,6 @@ class Endpoint:
     @property
     def caps_token(self) -> str:
         return format_caps(self.caps)
-
-    @property
-    def op_lock(self) -> threading.RLock | None:
-        """Transport-level serial lock, or None when no transport yet.
-
-        Registry per-name locks cover open/close/ensure only. Concurrent
-        exec/sftp/mark_dead serialize on this lock (held by the transport).
-        """
-        transport = self.transport
-        if transport is None:
-            return None
-        return transport.op_lock
 
 
 # ---------------------------------------------------------------------------
@@ -339,22 +327,6 @@ class EndpointRegistry:
     def get(self, name: str) -> Endpoint | None:
         with self._lock:
             return self._endpoints.get(name)
-
-    def holds_same(self, ep_name: str, handle: Endpoint | None) -> bool:
-        """True when *handle* is still the registered object for *ep_name*.
-
-        Generation pin for long open paths (screen/ps): after
-        ``ensure_endpoint`` returns and before session ``reg.add``, callers
-        re-check that concurrent ``close`` / reconnect did not retire this
-        generation. Does **not** probe transport liveness - use
-        :meth:`generation_still_open` or check ``is_connected`` outside the
-        main RLock.
-        """
-        if not ep_name or handle is None:
-            return False
-        name = str(ep_name).strip()
-        with self._lock:
-            return self._endpoints.get(name) is handle
 
     def generation_still_open(self, handle: Endpoint | None) -> bool:
         """True when *handle* is still registered and its transport is live.

@@ -44,12 +44,6 @@ def _path_after(script: str, marker: str) -> str:
     return m.group(1) if m else ""
 
 
-def _first_sq(script: str) -> str:
-    """Extract the first PowerShell single-quoted string from *script*."""
-    m = re.search(r"'([^']*)'", script)
-    return m.group(1) if m else ""
-
-
 # Guarded ``catch`` statements the emitted write/promote scripts can contain,
 # as one alternation so each is matched at the position it was emitted and the
 # compound patterns consume the plain temp-cleanup shape nested inside them.
@@ -72,10 +66,15 @@ _CATCH_STATEMENT_RE = re.compile(
 
 
 class _ErrorStreams:
-    """Minimal pypsrp ``PSDataStreams`` stand-in (``error`` list)."""
+    """Minimal pypsrp ``PSDataStreams`` stand-in (``error`` list).
 
-    def __init__(self, errors: list[str]) -> None:
-        self.error = list(errors)
+    One owner for every suite that has to hand the transport a pypsrp-shaped
+    error stream; ``errors`` may hold strings or pypsrp error records, and a
+    missing list is normalized to an empty one.
+    """
+
+    def __init__(self, errors: list[object] | None = None) -> None:
+        self.error = list(errors or [])
 
 
 class FakePypsrpSession:

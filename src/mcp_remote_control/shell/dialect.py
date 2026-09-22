@@ -48,66 +48,6 @@ _ALL_DIALECTS: frozenset[str] = frozenset(
 
 
 @dataclass(frozen=True)
-class ShellCaps:
-    """Best-effort capability bits from endpoint probe / PTY sniff."""
-
-    pwd: bool = True
-    pwd_p: bool = False
-    printf: bool = False
-    fc_p: bool = False
-    set_history: bool = False
-    busybox: bool = False
-    fish: bool = False
-
-    def to_dict(self) -> dict[str, bool]:
-        return {
-            "pwd": self.pwd,
-            "pwd_p": self.pwd_p,
-            "printf": self.printf,
-            "fc_p": self.fc_p,
-            "set_history": self.set_history,
-            "busybox": self.busybox,
-            "fish": self.fish,
-        }
-
-    @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> ShellCaps:
-        if not data:
-            return cls()
-        def _b(key: str, default: bool = False) -> bool:
-            # Prefer cap_* / nested caps so a path field like "pwd=/home/..."
-            # is never treated as a capability flag (collides with short name).
-            raw = data.get(f"cap_{key}")
-            if raw is None:
-                nested = data.get("caps")
-                if isinstance(nested, Mapping):
-                    raw = nested.get(key)
-            if raw is None:
-                raw = data.get(key)
-            if raw is None:
-                return default
-            if isinstance(raw, bool):
-                return raw
-            s = str(raw).strip().lower()
-            if key == "pwd" and ("/" in s or "\\" in s or s.startswith("~")):
-                return default
-            # Non-empty busybox path means the capability is present.
-            if key == "busybox" and s and s not in ("0", "false", "no", "off"):
-                return True
-            return s in ("1", "true", "yes", "on")
-
-        return cls(
-            pwd=_b("pwd", True),
-            pwd_p=_b("pwd_p", False),
-            printf=_b("printf", False),
-            fc_p=_b("fc_p", False),
-            set_history=_b("set_history", False),
-            busybox=_b("busybox", False),
-            fish=_b("fish", False),
-        )
-
-
-@dataclass(frozen=True)
 class ProbeSpec:
     """One silent-cwd injection template for a dialect."""
 
@@ -257,11 +197,7 @@ def resolve_dialect(
         return CMD
     if os_l in ("windows", "win32", "win") and family in ("", "cmd"):
         # OpenSSH DefaultShell is often cmd when only the OS is known.
-        if family == "powershell":
-            return POWERSHELL
-        if base or path:
-            pass  # fall through to basename rules
-        elif not base and not path:
+        if not base and not path:
             return CMD
 
     if not base and path:
@@ -389,12 +325,3 @@ def _truthy(val: Any) -> bool:
         return False
     # Non-empty path-like values count as true (e.g. busybox=/bin/busybox).
     return True
-
-
-# Re-exports for cwd_probe and other callers that import probe strings directly.
-PROBE_CMD_ZSH = _PROBE_ZSH
-PROBE_CMD_BASH = _PROBE_BASH
-PROBE_CMD_SH = _PROBE_SH
-PROBE_CMD_BUSYBOX = _PROBE_BUSYBOX
-PROBE_CMD_CMD = _PROBE_CMD
-PROBE_CMD_PWSH = _PROBE_PWSH

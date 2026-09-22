@@ -2,22 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from mcp_remote_control.core import endpoint_ops
-from mcp_remote_control.endpoint import ensure_endpoint, get_registry, reset_registry
+from mcp_remote_control.endpoint import ensure_endpoint, get_registry
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry() -> Iterator[None]:
-    reset_registry()
-    yield
-    reset_registry()
 
 
 @pytest.fixture

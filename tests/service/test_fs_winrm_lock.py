@@ -24,22 +24,13 @@ from typing import Any
 import pypsrp.exceptions
 import pytest
 import requests.exceptions
-from _winrm_fakes import HOME, TEMP, FakePypsrpSession
+from _winrm_fakes import HOME, TEMP, FakePypsrpSession, _ErrorStreams
 
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.fs.backends.winrm import PypsrpFileClient, WinrmFs
 from mcp_remote_control.fs.types import FsError
 from mcp_remote_control.transport.winrm import WinRMTransport
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 class _RecordingSerialOps:
@@ -107,13 +98,6 @@ class _RaisingSession:
         del script, environment
         self.calls += 1
         raise self._factory()
-
-
-class _ErrorStreams:
-    """Minimal pypsrp ``PSDataStreams`` stand-in with an ``error`` list."""
-
-    def __init__(self, errors: list[str]) -> None:
-        self.error = list(errors)
 
 
 class _ErrorSession:

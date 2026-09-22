@@ -464,7 +464,7 @@ def test_real_pty_probe_tail_stays_stripped_after_widening() -> None:
 def test_real_pty_probe_tail_stays_stripped_after_narrow_then_widen() -> None:
     """Real bash PTY at 120 cols: one send narrows to 100, then widens to 200.
 
-    Resize actions take no probe (``_NO_PROBE_TYPES``), so no frame is dumped
+    Resize actions take no probe (``_NON_INPUT_TYPES``), so no frame is dumped
     between the two resizes: pyte pops the echo row's cells 100..119 at the
     narrowing step, and the only dump of that send is taken at 200. The echo
     row's surviving last column is 99 - the last column of a width nothing but

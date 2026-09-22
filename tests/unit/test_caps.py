@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from mcp_remote_control.endpoint.caps import (
-    _coerce_cap_bool,
     caps_for_transport,
     coerce_toml_bool,
     format_caps,
@@ -73,8 +72,6 @@ def test_format_and_merge() -> None:
 )
 def test_coerce_cap_bool_falsey(value: object) -> None:
     assert coerce_toml_bool(value) is False
-    # Alias kept for historical callers / tests.
-    assert _coerce_cap_bool(value) is False
 
 
 @pytest.mark.parametrize(
@@ -98,14 +95,12 @@ def test_coerce_cap_bool_falsey(value: object) -> None:
 )
 def test_coerce_cap_bool_truthy(value: object) -> None:
     assert coerce_toml_bool(value) is True
-    assert _coerce_cap_bool(value) is True
 
 
 def test_coerce_cap_bool_unknown_string_fail_closed() -> None:
     """Non-token strings must not enable (bool(\"maybe\") would be True)."""
     assert coerce_toml_bool("maybe") is False
     assert coerce_toml_bool("enabled") is False
-    assert _coerce_cap_bool("enabled") is False
 
 
 def test_coerce_cap_bool_non_scalar_fail_closed() -> None:
@@ -121,8 +116,7 @@ def test_coerce_cap_bool_non_scalar_fail_closed() -> None:
 
 
 def test_coerce_toml_bool_is_shared_endpoint_truthiness() -> None:
-    """Single helper; alias identity + string false/0 stay false."""
-    assert _coerce_cap_bool is coerce_toml_bool
+    """Single helper; string false/0 stay false."""
     assert coerce_toml_bool("false") is False
     assert coerce_toml_bool("0") is False
     assert coerce_toml_bool("no") is False

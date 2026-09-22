@@ -67,10 +67,6 @@ class ScreenRegistry:
         with self._lock:
             return [self._sessions[k] for k in sorted(self._sessions)]
 
-    def list_for_endpoint(self, ep: str) -> list[ScreenSession]:
-        name = str(ep).strip()
-        return [s for s in self.list_open() if s.ep == name]
-
     def ids_for_endpoint(self, ep: str) -> list[str]:
         """Snapshot session ids attached to *ep* (under the registry lock)."""
         name = str(ep).strip()
@@ -91,14 +87,6 @@ class ScreenRegistry:
             if self.remove(sid) is not None:
                 n += 1
         return n
-
-    def close_for_endpoint(self, ep: str) -> int:
-        """Close all screens attached to *ep* at call time. Returns count closed.
-
-        Snapshots ids under the lock then closes only those ids so a concurrent
-        registration after the snapshot is not torn down.
-        """
-        return self.close_ids(self.ids_for_endpoint(ep))
 
     def clear(self) -> None:
         with self._lock:

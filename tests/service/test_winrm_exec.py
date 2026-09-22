@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from _winrm_session_fake import _MockWinRMSession
+
 from mcp_remote_control.core import exec_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport.base import ExecResult
 from mcp_remote_control.transport.shell_wrap import wrap_with_cwd
@@ -29,76 +30,9 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 FAKE_PASSWORD = "dummy-winrm-password"
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
-
-
 # ---------------------------------------------------------------------------
 # Mock session helpers
 # ---------------------------------------------------------------------------
-
-class _MockWinRMSession:
-    """Injectable session: no network sockets."""
-
-    def __init__(
-        self,
-        *,
-        cwd: str = r"C:\Users\Administrator",
-        home: str = r"C:\Users\Administrator",
-        os_name: str = "windows",
-        shell: str = "powershell",
-        ps_version: str = "5.1.19041",
-        probe_partial: bool = False,
-    ) -> None:
-        self.cwd = cwd
-        self.home = home
-        self.os = os_name
-        self.shell = shell
-        self.ps_version = ps_version
-        if probe_partial:
-            self.probe_status = "partial"
-            self.probe_error = "mock probe partial"
-        self.closed = False
-        self.commands: list[str] = []
-        self.argvs: list[list[str]] = []
-
-    def close(self) -> None:
-        self.closed = True
-
-    def run_command(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        timeout_s: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> ExecResult:
-        self.commands.append(command)
-        return ExecResult(
-            exit_code=0,
-            stdout=f"winrm-out:{command}\n",
-            stderr="",
-            cwd=cwd or self.cwd,
-        )
-
-    def run_argv(
-        self,
-        argv: list[str],
-        *,
-        cwd: str | None = None,
-        timeout_s: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> ExecResult:
-        self.argvs.append(list(argv))
-        return ExecResult(
-            exit_code=0,
-            stdout=" ".join(argv) + "\n",
-            cwd=cwd or self.cwd,
-        )
 
 
 def _ok_connector(**kwargs: object) -> _MockWinRMSession:

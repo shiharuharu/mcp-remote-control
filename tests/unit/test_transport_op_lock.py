@@ -211,7 +211,7 @@ def test_transport_op_lock_serializes_run_command_and_mark_dead() -> None:
 
 
 def test_endpoint_op_lock_delegates_to_transport() -> None:
-    """Endpoint.op_lock exposes the transport serial lock."""
+    """The endpoint's transport exposes the serial lock; no transport -> none."""
     t = _SerialProbeTransport()
     t.connect()
     ep = Endpoint(
@@ -221,9 +221,10 @@ def test_endpoint_op_lock_delegates_to_transport() -> None:
         connected=True,
         transport=t,
     )
-    assert ep.op_lock is t.op_lock
+    assert ep.transport is t
+    assert ep.transport.op_lock is t.op_lock
     ep2 = Endpoint(name="empty", transport_name="local", caps={})
-    assert ep2.op_lock is None
+    assert ep2.transport is None
 
 
 def test_serial_ops_context_reentrant_with_run_command() -> None:

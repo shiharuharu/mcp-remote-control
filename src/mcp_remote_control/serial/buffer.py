@@ -166,7 +166,6 @@ class LineRingBuffer:
         self._next_seq = 1
         self.dropped_lines = 0
         self.dropped_bytes = 0
-        self.total_bytes = 0  # lifetime feed counter (wire/text in)
         # Peer text codec, resolved once: the boundary never re-reads the
         # configuration per chunk, so a peer cannot change codec mid-stream.
         self.text_encoding = resolve_text_codec(text_encoding)
@@ -211,10 +210,8 @@ class LineRingBuffer:
                 # Decode under lock: residual multi-byte state is mutable and
                 # must not race a concurrent feed (pump + brief snarf).
                 text = self._decoder.decode(data)
-                self.total_bytes += len(data)
             else:
                 text = data
-                self.total_bytes += len(text.encode("utf-8", errors="replace"))
             if not text:
                 return 0
             # Normalize only the newly appended chunk (O(chunk)), not the

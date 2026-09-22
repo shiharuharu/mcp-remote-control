@@ -6,17 +6,15 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from _winrm_fakes import HOME, TEMP, FakePypsrpSession
+from _winrm_fakes import HOME, TEMP, FakePypsrpSession, _ErrorStreams
 from test_fs_winrm import MockWinrmFileClient
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.fs.backends.winrm import (
     _CLEANUP_MIN_BUDGET_S,
     _CLEANUP_SWEEP_GAP_S,
@@ -27,22 +25,7 @@ from mcp_remote_control.fs.types import FsError
 from mcp_remote_control.transport.base import BaseTransport
 
 
-class _PsStreams:
-    """Minimal stand-in for pypsrp PSDataStreams (``.error`` list)."""
-
-    def __init__(self, errors: list[str] | None = None) -> None:
-        self.error = list(errors or [])
-
-
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -70,13 +53,13 @@ class _HangForeverPsSession:
         script: str,
         *,
         environment: dict[str, str] | None = None,
-    ) -> tuple[str, _PsStreams, bool]:
+    ) -> tuple[str, _ErrorStreams, bool]:
         del environment
         self.ps_calls.append(script)
         self.entered.set()
         # Block forever unless a test explicitly releases (cleanup).
         self.release.wait()
-        return ("", _PsStreams([]), False)
+        return ("", _ErrorStreams([]), False)
 
 
 def test_pypsrp_execute_ps_hang_raises_timeout() -> None:
@@ -330,12 +313,8 @@ class _DelayedMockWinrm:
 
 def test_winrm_fs_op_timeout_configurable_independent_of_per_call() -> None:
     """op_timeout_s is independently configurable from timeout_s."""
-    from mcp_remote_control.fs.backends.winrm import (
-        DEFAULT_WINRM_FS_OP_TIMEOUT_S,
-        DEFAULT_WINRM_FS_TIMEOUT_S,
-    )
+    from mcp_remote_control.fs.backends.winrm import DEFAULT_WINRM_FS_TIMEOUT_S
 
-    assert DEFAULT_WINRM_FS_OP_TIMEOUT_S == DEFAULT_WINRM_FS_TIMEOUT_S
     assert DEFAULT_WINRM_FS_TIMEOUT_S == 60.0
 
     sess = FakePypsrpSession()

@@ -53,10 +53,6 @@ def coerce_toml_bool(value: object) -> bool:
     return False
 
 
-# Back-compat alias (tests / historical call sites).
-_coerce_cap_bool = coerce_toml_bool
-
-
 def caps_for_transport(transport: str) -> dict[str, bool]:
     """Return capability flags for *transport* (copy; never shared mutable)."""
     base = _MATRIX.get(transport)

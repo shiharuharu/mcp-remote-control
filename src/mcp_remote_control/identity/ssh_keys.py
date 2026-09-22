@@ -5,7 +5,7 @@ Rules:
 - If ``profile.auth.key_path`` is set -> only that path (explicit key).
 - Else default chain under ``~/.ssh``: ``id_rsa``, ``id_ecdsa``, ``id_ed25519``
   (and optional ``*_sk`` variants). Order is intentional: **id_rsa before
-  id_ed25519**. By default only existing files are returned.
+  id_ed25519**. Only files that exist on disk are returned.
 
 Default-chain entries must also be *importable*: a client-key list is handed
 to asyncssh as an explicit ``client_keys`` sequence, and asyncssh then aborts
@@ -202,18 +202,6 @@ def _key_import_verdict(path: Path) -> str:
     return _key_import_probe(path)[0]
 
 
-def _key_is_importable(path: Path) -> bool:
-    """Can asyncssh import *path* as a private key without a passphrase?
-
-    Importing is the only honest test: a file can exist and still be
-    unusable (passphrase-protected, truncated, saved in a foreign format).
-    Errors that are not import failures - a vanished file, no read
-    permission - count as usable so the connect reports them verbatim
-    instead of hiding them behind a silently empty chain.
-    """
-    return _key_import_verdict(path) in ("usable", "unknown")
-
-
 def _key_is_chainable(path: Path, *, passphrase_source: bool) -> bool:
     """Should a default-chain entry be handed to asyncssh as a client key?
 
@@ -309,16 +297,12 @@ def resolve_ssh_key_paths(
     profile: Profile,
     *,
     ssh_dir: Path | None = None,
-    only_existing: bool = True,
 ) -> list[Path]:
     """Resolve ordered client key paths for *profile*.
 
     Args:
         profile: Loaded connection profile.
         ssh_dir: Override for ``~/.ssh`` (injection / alternate homes).
-        only_existing: When True (default), skip missing files in the default
-            chain. Explicit ``auth.key_path`` is always returned even if missing
-            so the transport can surface a clear connect error.
 
     Returns:
         Ordered list of key **paths** only (never file contents). Default-chain
@@ -337,10 +321,7 @@ def resolve_ssh_key_paths(
     paths: list[Path] = []
     for name in DEFAULT_SSH_IDENTITY_BASENAMES:
         candidate = root / name
-        if only_existing:
-            if candidate.is_file():
-                paths.append(candidate)
-        else:
+        if candidate.is_file():
             paths.append(candidate)
     # A configured passphrase source means the chain may legitimately hold
     # encrypted keys, so entries that merely need the passphrase are kept.
@@ -348,15 +329,9 @@ def resolve_ssh_key_paths(
     # them rather than skipping, so one stray file would abort the whole
     # connect - losing the passphrase and the supplied password with it.
     has_passphrase_source = auth is not None and auth.passphrase_path is not None
-    if only_existing:
-        paths = [
-            p
-            for p in paths
-            if _key_is_chainable(p, passphrase_source=has_passphrase_source)
-        ]
+    paths = [
+        p
+        for p in paths
+        if _key_is_chainable(p, passphrase_source=has_passphrase_source)
+    ]
     return paths
-
-
-def identity_labels(paths: list[Path]) -> list[str]:
-    """Human-safe labels for tried keys (basename only)."""
-    return [p.name for p in paths]

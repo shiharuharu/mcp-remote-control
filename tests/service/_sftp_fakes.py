@@ -11,7 +11,8 @@ its pre-stat. ``posix_rename`` / ``readlink`` exercise atomic-write and
 symlink-target paths. ``file_modes`` + ``chmod`` model OpenSSH sftp-server
 permission bits so mode-preservation can be asserted.
 
-The thin progress-suite mock in ``test_fs_progress.py`` stays independent.
+This module is the single owner of these fakes: every service suite, including
+the transfer-progress suite, imports them from here.
 """
 
 from __future__ import annotations

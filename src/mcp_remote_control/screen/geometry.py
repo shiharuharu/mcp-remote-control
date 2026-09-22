@@ -123,9 +123,6 @@ _TOO_SMALL_RE = re.compile(
 )
 _NEED_COLS_RE = re.compile(r"(?i)need(?:s)?\s+at\s+least\s+(\d+)\s+columns?")
 
-# Ellipsis / truncation marks often left when content is clipped.
-_ELLIPSIS_CHARS = ("\u2026", "...", "\u2026")
-
 
 # ---------------------------------------------------------------------------
 # Public result types
@@ -157,7 +154,6 @@ class FitResult:
     seed_rows: int
     steps: int
     fit: str  # ok | poor | forced
-    health: str  # healthy | cramped | too_small
     forced: bool = False
 
 
@@ -292,11 +288,7 @@ def assess_layout(
 
     # TUI-class / recognized surface under shell-ish width -> cramped
     surf = (surface or "").lower()
-    is_tuiish = cmd_class in ("tui", "tui_heavy", "unknown") or surf in (
-        "tui",
-        "grok",
-        "alt",
-    )
+    is_tuiish = cmd_class in ("tui", "tui_heavy", "unknown") or surf == "tui"
     if is_tuiish and cols < 160:
         return "cramped"
 
@@ -688,7 +680,6 @@ class GeometryAdapter:
                     seed_rows=plan.seed_rows,
                     steps=0,
                     fit="forced",
-                    health="healthy",
                     forced=True,
                 )
                 return result, last_shot
@@ -702,7 +693,6 @@ class GeometryAdapter:
                     seed_rows=plan.seed_rows,
                     steps=0,
                     fit="ok",
-                    health=self.assess(frame, cols, rows, plan.cmd_class, surface=surf),
                     forced=False,
                 )
                 return result, last_shot
@@ -727,7 +717,6 @@ class GeometryAdapter:
                         seed_rows=plan.seed_rows,
                         steps=steps,
                         fit="ok",
-                        health=health,
                         forced=False,
                     ),
                     last_shot,
@@ -737,11 +726,9 @@ class GeometryAdapter:
                 break
 
             new_c, new_r = self.grow(cols, rows, health, frame)
-            # Must not shrink; if no progress, stop as poor
+            # grow() clamps to the current size, so "no progress" is exactly
+            # new_c == cols and new_r == rows; stop as poor either way.
             if new_c <= cols and new_r <= rows:
-                break
-            # Also stop if clamp prevented growth
-            if new_c == cols and new_r == rows:
                 break
             session.resize(new_c, new_r)
             steps += 1
@@ -770,13 +757,7 @@ class GeometryAdapter:
                 seed_rows=plan.seed_rows,
                 steps=steps,
                 fit=fit,
-                health=health,
                 forced=False,
             ),
             last_shot,
         )
-
-
-def default_adapter(home: Path | str | None = None) -> GeometryAdapter:
-    """Adapter with optional on-disk memory under *home*/state/."""
-    return GeometryAdapter(memory=GeometryMemory.for_home(home))

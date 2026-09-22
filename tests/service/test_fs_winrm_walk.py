@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -10,7 +9,6 @@ import pytest
 from _winrm_fakes import HOME, TEMP, FakePypsrpSession, _path_after
 from test_fs_winrm import _MockAttrs, _backend
 
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.fs.backends.winrm import (
     _MAX_RECURSE_DEPTH,
     PypsrpFileClient,
@@ -19,14 +17,6 @@ from mcp_remote_control.fs.backends.winrm import (
 from mcp_remote_control.fs.types import FsError, ListEntry
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def test_winrm_fs_recursive_list_depth_and_prefix_overlap() -> None:
@@ -43,7 +33,6 @@ def test_winrm_fs_recursive_list_depth_and_prefix_overlap() -> None:
     store.files[overlap] = b"ovr"
 
     res = backend.list(TEMP, recursive=True)
-    assert res.truncated is False
     by_path = {e.path: e for e in res.entries}
     # Depth-4 entry: name is the full relative path from TEMP, not truncated.
     e_deep = by_path[deep]

@@ -51,7 +51,6 @@ class MockRunspace:
     location: str = DEFAULT_MOCK_LOCATION
     vars: dict[str, Any] = field(default_factory=dict)
     closed: bool = False
-    scripts: list[str] = field(default_factory=list)
 
     def invoke(self, script: str) -> RunspaceResult:
         if self.closed:
@@ -60,7 +59,6 @@ class MockRunspace:
                 "runspace is closed",
             )
         text = script if script is not None else ""
-        self.scripts.append(text)
         return self._eval(text)
 
     def close(self) -> None:
@@ -227,7 +225,6 @@ class MockWinRMSessionWithRunspace:
         self.shell = shell
         self.ps_version = ps_version
         self.closed = False
-        self.commands: list[str] = []
         self._runspaces: list[MockRunspace] = []
 
     def close(self) -> None:
@@ -248,7 +245,6 @@ class MockWinRMSessionWithRunspace:
     ) -> Any:
         from mcp_remote_control.transport.base import ExecResult
 
-        self.commands.append(command)
         return ExecResult(
             exit_code=0,
             stdout=f"winrm-out:{command}\n",

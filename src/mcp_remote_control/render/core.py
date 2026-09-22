@@ -18,33 +18,18 @@ from mcp_remote_control.render.redact import (
     redact_string,
 )
 
-# Fixed status vocabulary for Agent and JSON tracks.
-VALID_STATUSES: frozenset[str] = frozenset(
-    {"ok", "fail", "timeout", "dead", "unchanged", "error"}
-)
-
-# Kind tokens this renderer formats (tool kinds plus generic error).
-VALID_KINDS: frozenset[str] = frozenset(
-    {"endpoint", "exec", "fs", "screen", "ps", "error"}
-)
-
 # Fields rendered on ``| meta`` lines rather than the status header.
 _META_KEYS: frozenset[str] = frozenset(
     {
-        "cursor_line",
-        "title",
         "label",
-        "changed_lines",
         "encoding",
         "note",
-        "resolved_from",
         "redacted",
         # Free-text values whose spaces carry meaning: prose messages, prose
         # failure detail, and documented machine tokens the caller matches
         # literally. Header tokens are space-free, so folding one here would
         # hand back a string the caller never wrote and cannot match.
         "msg",
-        "message",
         "warning",
         "reopen_hint",
         "pump_error",
@@ -113,7 +98,6 @@ _HEADER_ORDER: tuple[str, ...] = (
     "bytes",
     "lines",
     "n",
-    "wrote",
     "gen",
     "hash",
     "surface",
@@ -125,14 +109,10 @@ _HEADER_ORDER: tuple[str, ...] = (
     "truncated",
     "overwritten",
     "recursive",
-    "next_offset",
     "screens_closed",
     "disconnected",
     "alive",
     "idle",
-    "busy",
-    "alt",
-    "empty",
     "via",
 )
 
@@ -142,13 +122,9 @@ _HEADER_ORDER: tuple[str, ...] = (
 # stay in sync (a set-only entry would be silently dropped from Agent output).
 _FLAG_ORDER: tuple[str, ...] = (
     "idle",
-    "busy",
     "alive",
-    "dead",
-    "alt",
     "partial",
     "truncated",
-    "empty",
     "overwritten",
     "recursive",
     "disconnected",
@@ -313,9 +289,6 @@ def _collapse_geometry_meta(meta: dict[str, Any]) -> None:
         if cmd is not None and str(cmd) != "":
             meta["geom"] = f"cmd={_format_meta_value(cmd)}"
         return
-    if trivial_ok and fit_s == "" and steps_n in (None, 0):
-        if seed is None and cmd_class is None and cmd is None:
-            return
 
     parts: list[str] = []
     if fit is not None and str(fit) != "":
@@ -513,7 +486,7 @@ def render_agent_text(
             continue
         raw = redact_string(mv) if isinstance(mv, str) else mv
         # Path fields keep spaces (a rewritten path is a different path).
-        # Other meta may contain spaces (msg, cursor_line, geom payload).
+        # Other meta may contain spaces (msg, geom payload).
         text = (
             _format_path_meta(raw)
             if mk in _PATH_META_KEYS

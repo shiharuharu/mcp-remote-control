@@ -16,7 +16,7 @@ Covers:
   logged at DEBUG (no exception escapes).
 - close_endpoint session teardown vs concurrent reopen; close_if_same
   generation pin; liveness probes must not hold the main RLock across
-  transport op_lock; generation_still_open / holds_same fence.
+  transport op_lock; generation_still_open fence.
 """
 
 from __future__ import annotations
@@ -1673,12 +1673,12 @@ def test_concurrent_mark_dead_open_list_no_deadlock() -> None:
 
 
 # ---------------------------------------------------------------------------
-# generation_still_open / holds_same (screen/ps open registration fence)
+# generation_still_open (screen/ps open registration fence)
 # ---------------------------------------------------------------------------
 
 
-def test_holds_same_and_generation_still_open_pin() -> None:
-    """holds_same is identity-pinned; generation_still_open needs live transport."""
+def test_generation_still_open_pin() -> None:
+    """generation_still_open is identity-pinned and needs a live transport."""
     reg = EndpointRegistry()
 
     def connector(**_kwargs: object) -> _MockConn:
@@ -1686,9 +1686,7 @@ def test_holds_same_and_generation_still_open_pin() -> None:
 
     e1 = reg.open("lab-ssh", home=FIXTURES, connector=connector, probe=False)
     assert e1 is not None and e1.transport is not None
-    assert reg.holds_same("lab-ssh", e1) is True
     assert reg.generation_still_open(e1) is True
-    assert reg.holds_same("lab-ssh", None) is False
     assert reg.generation_still_open(None) is False
 
     # Wrong generation pin after force-replace.
@@ -1696,19 +1694,15 @@ def test_holds_same_and_generation_still_open_pin() -> None:
         "lab-ssh", home=FIXTURES, connector=connector, probe=False, force=True
     )
     assert e2 is not e1
-    assert reg.holds_same("lab-ssh", e1) is False
-    assert reg.holds_same("lab-ssh", e2) is True
     assert reg.generation_still_open(e1) is False
     assert reg.generation_still_open(e2) is True
 
     # Dead transport: identity may still match until pop, but liveness fails.
     e2.transport.mark_dead("r28_dead")  # type: ignore[union-attr]
-    assert reg.holds_same("lab-ssh", e2) is True
     assert reg.generation_still_open(e2) is False
 
-    # After close, neither pin holds.
+    # After close the generation pin is gone.
     reg.close("lab-ssh")
-    assert reg.holds_same("lab-ssh", e2) is False
     assert reg.generation_still_open(e2) is False
 
 
@@ -1788,9 +1782,9 @@ def test_open_screen_mid_settle_close_endpoint_no_zombie_session() -> None:
         assert open_result, "open_screen did not return"
         opened = open_result[0]
         sreg = get_screen_registry()
-        assert sreg.list_for_endpoint("local") == [], (
+        assert sreg.ids_for_endpoint("local") == [], (
             f"zombie screen sessions after concurrent close: "
-            f"{[s.id for s in sreg.list_for_endpoint('local')]}"
+            f"{sreg.ids_for_endpoint('local')}"
         )
         status = getattr(opened, "status", None)
         code = getattr(opened, "code", None)
@@ -1882,9 +1876,8 @@ def test_open_ps_mid_runspace_close_endpoint_no_zombie_session() -> None:
         assert open_result, "open_session did not return"
         opened = open_result[0]
         preg = get_ps_registry()
-        assert preg.list_for_endpoint("lab-win") == [], (
-            f"zombie ps sessions: {[s.id for s in preg.list_for_endpoint('lab-win')]}"
-        )
+        zombie_ids = preg.ids_for_endpoint("lab-win")
+        assert zombie_ids == [], f"zombie ps sessions: {zombie_ids}"
         status = getattr(opened, "status", None)
         code = getattr(opened, "code", None)
         if status == "ok":

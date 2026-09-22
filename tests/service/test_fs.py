@@ -7,7 +7,6 @@ import errno
 import json
 import os
 import stat
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -21,20 +20,12 @@ from mcp_remote_control.cli import main
 from mcp_remote_control.cli_cmds import EXIT_OK, EXIT_VALIDATION
 from mcp_remote_control.core import fs_ops
 from mcp_remote_control.core.result import OpResult
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.fs.backends.local import LocalFs, _MAX_RECURSE_DEPTH as _LOCAL_MAX_RECURSE_DEPTH
 from mcp_remote_control.fs.types import FsError, ProgressCallback
 from mcp_remote_control.transport.base import TransportError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +69,6 @@ def test_local_recursive_list_shallow_returns_full_tree(tmp_path: Path) -> None:
 
     backend = LocalFs()
     result = backend.list(str(tmp_path), recursive=True)
-    assert result.truncated is False
     names = {e.name for e in result.entries}
     assert "a.txt" in names
     assert "sub" in names

@@ -64,7 +64,6 @@ def test_open_returns_session_id_and_cwd() -> None:
     assert r.kind == "ps"
     sid = r.fields.get("id")
     assert sid and str(sid).startswith("ps_")
-    assert r.fields.get("session_id") == sid
     assert r.fields.get("ep") == "lab-win"
     assert r.cwd is not None
     assert "Users" in r.cwd or r.cwd.startswith("C:")
@@ -186,7 +185,7 @@ def test_local_ps_open_cap_denied() -> None:
     assert "lacks ps capability" in (r.fields.get("msg") or "").lower()
     assert "ps" in text.lower() or "winrm" in text.lower()
     # no session registered
-    assert len(get_ps_registry()) == 0
+    assert get_ps_registry().list_open() == []
 
 
 def test_ssh_ps_open_cap_denied() -> None:
@@ -995,7 +994,7 @@ def test_ps_open_unsupported_when_ps_runspace_false() -> None:
     assert "ps_runspace" in (r.fields.get("msg") or "") or "runspace" in (
         r.fields.get("msg") or ""
     ).lower()
-    assert len(get_ps_registry()) == 0
+    assert get_ps_registry().list_open() == []
     text = r.render_text()
     assert "UNSUPPORTED" in text
 
@@ -1206,7 +1205,7 @@ def test_open_ps_concurrent_close_no_zombie_session() -> None:
     assert not errors, errors
     assert open_result, "open_session did not return"
     opened = open_result[0]
-    assert get_ps_registry().list_for_endpoint("lab-win") == []
+    assert get_ps_registry().ids_for_endpoint("lab-win") == []
     status = getattr(opened, "status", None)
     if status == "ok":
         sid = getattr(opened, "fields", {}).get("id")
@@ -1432,7 +1431,7 @@ def test_ps_open_hanging_open_runspace_fails_within_budget(
     assert r.code == "EXEC_FAILED"
     msg = (r.fields.get("msg") or "").lower()
     assert "timed out" in msg or "timeout" in msg
-    assert len(get_ps_registry()) == 0
+    assert get_ps_registry().list_open() == []
     assert elapsed < 3.0, f"ps open wall-clock not bounded: {elapsed}s"
     assert elapsed >= 0.15, f"timed out too early: {elapsed}s"
     block.set()

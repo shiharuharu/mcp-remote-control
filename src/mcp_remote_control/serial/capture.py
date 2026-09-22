@@ -56,21 +56,13 @@ class CapturePump:
             daemon=True,
         )
         self._error: str | None = None
-        self._reads = 0
-        self._bytes = 0
         self._consecutive_errors = 0
         self._link_closed = False
-
-    @property
-    def error(self) -> str | None:
-        return self._error
 
     @property
     def stats(self) -> dict[str, Any]:
         return {
             "running": self._thread.is_alive() and not self._stop.is_set(),
-            "reads": self._reads,
-            "bytes": self._bytes,
             "error": self._error,
             "link_closed": self._link_closed,
         }
@@ -126,10 +118,7 @@ class CapturePump:
                 # short glitch. Consecutive-error stop still sets link_closed.
                 self._consecutive_errors = 0
                 self._error = None
-                if data:
-                    self._reads += 1
-                    self._bytes += len(data)
-                else:
+                if not data:
                     time.sleep(self._poll_s)
             except Exception as exc:  # noqa: BLE001
                 self._error = f"{type(exc).__name__}: {exc}"

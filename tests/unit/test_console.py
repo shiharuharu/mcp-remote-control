@@ -1688,7 +1688,7 @@ def test_read_into_holds_lock_across_feed() -> None:
     def _second() -> None:
         assert feed_entered.wait(timeout=2.0)
         second_read_started.set()
-        con.snarf(buf, 8192)
+        con.read_into(buf, 8192)
 
     t1 = threading.Thread(target=_first, name="first-read-into", daemon=True)
     t2 = threading.Thread(target=_second, name="second-snarf", daemon=True)

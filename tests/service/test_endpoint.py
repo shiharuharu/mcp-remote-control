@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -18,7 +17,7 @@ from mcp_remote_control.config.store import (
     write_notes,
 )
 from mcp_remote_control.core import endpoint_ops
-from mcp_remote_control.endpoint import ensure_endpoint, get_registry, reset_registry
+from mcp_remote_control.endpoint import ensure_endpoint, get_registry
 from mcp_remote_control.transport import SSHTransport, TransportError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
@@ -31,13 +30,6 @@ FAKE_PEM = (
     "-----END OPENSSH PRIVATE KEY-----\n"
 )
 FAKE_PASSWORD = "super-secret-password-xyz"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry() -> Iterator[None]:
-    reset_registry()
-    yield
-    reset_registry()
 
 
 @pytest.fixture

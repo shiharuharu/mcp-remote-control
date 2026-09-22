@@ -14,7 +14,6 @@ wins, but no caller has to mistake it for a corroborated one.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -351,16 +350,3 @@ def _normalize_preferred(preferred: str | None) -> str | None:
         return None
     mapped = charmap_to_codec(text)
     return mapped or text
-
-
-def decode_to_str(
-    data: Any,
-    preferred: str | None = None,
-) -> str:
-    """Text-only convenience: ``decode_auto(...).text``.
-
-    A caller that must report *which* codec produced the text - a transport
-    surfacing a fallback decode to its reader - takes the whole
-    :class:`DecodeResult` from :func:`decode_auto` instead.
-    """
-    return decode_auto(data, preferred=preferred).text

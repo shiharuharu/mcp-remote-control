@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import requests.exceptions as requests_exceptions
 
 from mcp_remote_control.core import exec_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.transport import winrm_files
 from mcp_remote_control.transport.base import ExecResult, TransportError
 from mcp_remote_control.transport.winrm import WinRMTransport, _EXIT_MARKER
@@ -32,14 +32,6 @@ except ImportError:  # pragma: no cover - exercised only without pypsrp
     pypsrp_exceptions = None  # type: ignore[assignment]
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def _double(module: str, qualname: str) -> type[BaseException]:

@@ -40,14 +40,12 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import requests.exceptions as requests_exceptions
 
 from mcp_remote_control.core import exec_ops
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.transport.winrm import WinRMTransport, _EXIT_MARKER
 from mcp_remote_control.transport.winrm_timeouts import (
     PYPSRP_DEFAULT_OPERATION_TIMEOUT_S,
@@ -59,14 +57,6 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 # The reset the exit probe emits before the caller's text.
 _RESET = "$global:LASTEXITCODE = $null"
 _PROBE = "Write-Output ('" + _EXIT_MARKER + "' + [string]($(if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 })))"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------

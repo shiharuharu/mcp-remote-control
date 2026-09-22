@@ -58,14 +58,12 @@ from mcp_remote_control.transport.winrm_exec import (
     _EXIT_MARKER as _EXIT_MARKER,
     _append_ps_exit_probe as _append_ps_exit_probe,
     _coerce_exec_result as _coerce_exec_result,
-    _decode_stream as _decode_stream,
     _exit_code_from_ps as _exit_code_from_ps,
     _format_ps_errors as _format_ps_errors,
     _format_ps_output as _format_ps_output,
     _is_execute_ps_result_tuple as _is_execute_ps_result_tuple,
     _is_timeout_exc as _is_timeout_exc,
     _isolate_user_script as _isolate_user_script,
-    _parse_exit_marker_value as _parse_exit_marker_value,
     _ps_result_to_exec as _ps_result_to_exec,
     _ps_single_quote as _ps_single_quote,
     _split_exit_marker as _split_exit_marker,
@@ -80,13 +78,10 @@ from mcp_remote_control.transport.winrm_probe import (
     MRC_WINRM_PS_FS_MIN as MRC_WINRM_PS_FS_MIN,
     WINRM_PS_CAPABILITY_PROBE as WINRM_PS_CAPABILITY_PROBE,
     WinrmOpenProbeMode as WinrmOpenProbeMode,
-    _WINRM_OPEN_PROBE_MODES as _WINRM_OPEN_PROBE_MODES,
     _WINRM_PS_RAW_KEYS as _WINRM_PS_RAW_KEYS,
-    _as_bool as _as_bool,
     _incomplete_winrm_ps as _incomplete_winrm_ps,
     _is_probe_ps_version_line as _is_probe_ps_version_line,
     _normalize_winrm_ps_raw as _normalize_winrm_ps_raw,
-    _parse_ps_version_tuple as _parse_ps_version_tuple,
     derive_winrm_ps_caps as derive_winrm_ps_caps,
     normalize_winrm_probe_mode as normalize_winrm_probe_mode,
     parse_winrm_ps_probe_output as parse_winrm_ps_probe_output,
@@ -101,14 +96,10 @@ from mcp_remote_control.transport.winrm_runspace import (
     _adapt_runspace_handle as _adapt_runspace_handle,
     _call_with_deadline as _call_with_deadline,
     _coerce_runspace_result as _coerce_runspace_result,
-    _safe_stop_pipeline as _safe_stop_pipeline,
-    _split_location_output as _split_location_output,
 )
 from mcp_remote_control.transport.winrm_session import (
     AdaptedWinRMSession as AdaptedWinRMSession,
-    PypsrpClientAdapter as PypsrpClientAdapter,
     _WinRMConnectWatch as _WinRMConnectWatch,
-    _bound as _bound,
     _use_winrm_connect_watch as _use_winrm_connect_watch,
     abandon_winrm_connect_watch as abandon_winrm_connect_watch,
     adapt_winrm_session as adapt_winrm_session,
@@ -298,8 +289,7 @@ class WinRMTransport(BaseTransport):
     ----------
     connector:
         Factory that receives :meth:`connect_kwargs` and returns a session.
-        Defaults to :func:`default_winrm_connector` (``PypsrpClientAdapter``
-        around a real pypsrp ``Client``).
+        Defaults to :func:`default_winrm_connector` (a real pypsrp ``Client``).
     reconnection_retries / reconnection_backoff:
         pypsrp ``WSMan`` urllib3 retry knobs; ``None`` resolves through
         :func:`resolve_winrm_reconnect`. They retry connection-level failures
@@ -392,10 +382,6 @@ class WinRMTransport(BaseTransport):
         self.credssp_auth_mechanism = credssp_auth_mechanism
         self.credssp_disable_tlsv1_2 = credssp_disable_tlsv1_2
         self.credssp_minimum_version = credssp_minimum_version
-        # Last resolved op/read applied for a call (tests / diagnostics).
-        # Not Agent-track fields; cleared only by subsequent resolves.
-        self._last_applied_operation_timeout: int | None = None
-        self._last_applied_read_timeout: int | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - defensive
         return (
@@ -531,15 +517,11 @@ class WinRMTransport(BaseTransport):
     ) -> Iterator[tuple[int | None, int | None]]:
         """Apply resolved op/read onto the live session for one call; restore after.
 
-        Records :attr:`_last_applied_operation_timeout` /
-        :attr:`_last_applied_read_timeout` for tests. Mutates
-        ``wsman.operation_timeout`` and ``wsman.transport.read_timeout`` when
-        present (real pypsrp Client or a duck-typed double). Does not claim
+        Mutates ``wsman.operation_timeout`` and ``wsman.transport.read_timeout``
+        when present (real pypsrp Client or a duck-typed double). Does not claim
         remote cancel; only aligns library HTTP/WSMan budgets with the call.
         """
         op, rd = self.resolve_call_op_read_timeouts(timeout_s)
-        self._last_applied_operation_timeout = op
-        self._last_applied_read_timeout = rd
         restores: list[tuple[Any, str, Any]] = []
         if op is not None or rd is not None:
             wsman = _session_wsman(self._session)
@@ -1196,8 +1178,6 @@ class WinRMTransport(BaseTransport):
         self,
         session: AdaptedWinRMSession,
         script: str,
-        *,
-        timeout_s: float | None = None,
     ) -> str:
         """Run oneshot ``execute_ps`` and return decoded stdout text.
 
@@ -1220,20 +1200,18 @@ class WinRMTransport(BaseTransport):
 
         stdout always comes from :func:`_ps_result_to_exec` so a list/tuple of
         pypsrp pipeline objects becomes parseable key=value / JSON lines. The
-        default budget resolves through :func:`resolve_winrm_probe_timeout_s`
+        budget resolves through :func:`resolve_winrm_probe_timeout_s`
         (env ``MRC_WINRM_PROBE_TIMEOUT_S`` -> profile -> default) and is read at
-        call time; pass a non-positive ``timeout_s`` to skip the wrapper.
+        call time; it is always positive, so the probe always runs under a
+        wall-clock deadline.
         """
         def _call() -> Any:
             return session.execute_ps(script, environment=None)
 
-        if timeout_s is None:
-            budget = resolve_winrm_probe_timeout_s(
-                profile_value=self.probe_timeout_s or MRC_WINRM_PROBE_TIMEOUT_S
-            )
-        else:
-            budget = float(timeout_s)
-        deadline = None if budget <= 0 else time.monotonic() + budget
+        budget = resolve_winrm_probe_timeout_s(
+            profile_value=self.probe_timeout_s or MRC_WINRM_PROBE_TIMEOUT_S
+        )
+        deadline = time.monotonic() + budget
 
         def _attempt(limit: float | None) -> str:
             # Align pypsrp op/read with this attempt's share of the budget.
@@ -1265,14 +1243,12 @@ class WinRMTransport(BaseTransport):
             # first payload exchange is safe to repeat: re-handshake and replay
             # once inside the remaining probe budget. Never raises.
             resync_winrm_session(self._session)
-            remaining: float | None = None
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        "winrm link rejection recovered the session but the "
-                        "probe budget was already spent"
-                    ) from exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "winrm link rejection recovered the session but the "
+                    "probe budget was already spent"
+                ) from exc
             try:
                 stdout = _attempt(remaining)
             except Exception as retry_exc:  # noqa: BLE001 - caller hard-fails identity
@@ -1536,14 +1512,15 @@ class WinRMTransport(BaseTransport):
         if session.can_build_pypsrp_fs:
             from mcp_remote_control.transport.winrm_files import PypsrpFileClient
 
-            # Pass the raw object so optional copy/fetch presence is exact
-            # (AdaptedWinRMSession always exposes methods). fs and exec share
-            # one WSMan connection: hand the client the same serial-ops lock the
-            # transport uses so fs calls cannot interleave with exec/ps, and a
-            # link failure observed on the fs path drops the poisoned session
-            # the same way an exec link failure does. The timed variant lets an
-            # fs call bound its wait for that lock by the remaining whole-op
-            # budget instead of overshooting it before its first remote call.
+            # Pass the raw object, not the adapted session: the raw object's
+            # own copy/fetch presence is what decides native transfer over the
+            # scripted fallback. fs and exec share one WSMan connection: hand
+            # the client the same serial-ops lock the transport uses so fs calls
+            # cannot interleave with exec/ps, and a link failure observed on the
+            # fs path drops the poisoned session the same way an exec link
+            # failure does. The timed variant lets an fs call bound its wait for
+            # that lock by the remaining whole-op budget instead of overshooting
+            # it before its first remote call.
             return PypsrpFileClient(
                 session.raw,
                 serial_ops=self.serial_ops,
@@ -1643,7 +1620,9 @@ class WinRMTransport(BaseTransport):
 
             def _discard_stale_pools() -> None:
                 for stale in stale_pools:
-                    self._best_effort_close_runspace_obj(stale, timeout_s=budget)
+                    # Same bounded close as close_runspace, with the verdict
+                    # dropped: this teardown only clears a half-open pool.
+                    self._close_runspace_with_budget(stale, budget=budget)
                 stale_pools.clear()
 
             handle = self._open_runspace_linked(
@@ -1989,7 +1968,7 @@ class WinRMTransport(BaseTransport):
         """Best-effort interrupt of an in-flight invoke (adapter or raw).
 
         Bounded by :data:`_STOP_DEADLINE_S` on a daemon thread, the same way
-        :func:`_safe_stop_pipeline` and :meth:`_best_effort_close_runspace_obj`
+        :func:`_safe_stop_pipeline` and :meth:`_close_runspace_with_budget`
         bound theirs. This runs on the caller's thread while it holds the
         transport ``_op_lock`` (``runspace_invoke`` is a serial op), so an
         unbounded ``stop()`` would pin that lock past the invoke's own timeout
@@ -2081,30 +2060,18 @@ class WinRMTransport(BaseTransport):
         finally:
             self.op_lock.release()
 
-    def _best_effort_close_runspace_obj(
-        self,
-        handle: Any,
-        *,
-        timeout_s: float,
-    ) -> None:
-        """Best-effort ``handle.close()`` under wall-clock; never raises.
-
-        The same policy as :meth:`close_runspace` for callers with no teardown
-        status to report (half-open pool cleanup after a failed open); only the
-        verdict is dropped.
-        """
-        self._close_runspace_with_budget(handle, budget=timeout_s)
-
     def _close_runspace_with_budget(self, handle: Any, *, budget: float) -> str:
-        """Close *handle* under *budget*; never raises; returns a verdict."""
+        """Close *handle* under *budget*; never raises; returns a verdict.
+
+        Callers pass a positive budget: a deadline already spent is a verdict
+        of its own before this point (see :meth:`close_runspace_within`).
+        """
         if handle is None:
             return _CLOSE_LANDED
         closer = getattr(handle, "close", None)
         if not callable(closer):
             return _CLOSE_LANDED
-        limit = float(budget) if budget and budget > 0 else float(
-            _RUNSPACE_OPEN_CLOSE_TIMEOUT_S
-        )
+        limit = float(budget)
         deadline = time.monotonic() + limit
         before = self._link_round_trips()
 
@@ -2624,9 +2591,9 @@ class WinRMTransport(BaseTransport):
         """Call oneshot ``execute_ps`` / ``execute_cmd`` with optional env.
 
         Env handling (Protocol contract): always pass ``environment=env`` when
-        *env* is set. Implementers (``PypsrpClientAdapter``, mocks) accept that
-        kwarg; no signature probing and no script-side inject on the production
-        path.
+        *env* is set. Every implementer (the real pypsrp ``Client``, mocks)
+        accepts that kwarg; no signature probing and no script-side inject on
+        the production path.
 
         Timeout handling: oneshot APIs do not take a per-call timeout. The
         wall-clock deadline, the MaxShells dispose and the link policy are owned

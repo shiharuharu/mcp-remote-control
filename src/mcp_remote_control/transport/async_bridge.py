@@ -47,14 +47,6 @@ class AsyncLoopBridge:
         self._lock = threading.RLock()
         self._ready = threading.Event()
 
-    @property
-    def loop(self) -> asyncio.AbstractEventLoop | None:
-        return self._loop
-
-    @property
-    def is_running(self) -> bool:
-        return self._started and self._loop is not None and self._loop.is_running()
-
     def start(self) -> None:
         """Start the background loop (idempotent)."""
         with self._lock:

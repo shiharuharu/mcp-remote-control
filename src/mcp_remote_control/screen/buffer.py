@@ -492,9 +492,10 @@ def _marker_output_index(unit: Sequence[str]) -> int | None:
 def collect_pwd_markers(text: str) -> list[str]:
     """Return every valid ``__MRC_PWD__:`` path in *text*, in screen order.
 
-    Same extraction rules as ``parse_pwd_marker`` (spaces kept, quotes
-    unwrapped, unexpanded ``$(pwd)`` / ``%CD%`` ignored). The silent probe
-    snapshots this list before inject and requires a new confirmation.
+    Extraction keeps spaces in a path, unwraps quoted paths, and ignores
+    unexpanded ``$(pwd)`` / ``%CD%`` command lines. The silent probe snapshots
+    this list before inject and requires a new confirmation; a caller that
+    wants the newest cwd takes the tail of the list.
     """
     if not text or PWD_MARKER not in text:
         return []
@@ -518,21 +519,6 @@ def collect_pwd_markers(text: str) -> list[str]:
         if _path_looks_absolute(extracted):
             found.append(extracted)
     return found
-
-
-def parse_pwd_marker(text: str) -> str | None:
-    """Extract absolute path from a buffer/frame containing ``__MRC_PWD__:``.
-
-    Prefers the **last** valid marker line so repeated probes (open + send)
-    are not stuck on a stale earlier value still visible on the screen.
-
-    Path extraction uses the remainder of the line (after the marker), not the
-    first whitespace token - cwd values may contain spaces
-    (``/home/my dir``, ``C:\\Program Files\\x``). Optional surrounding quotes
-    are unwrapped when present.
-    """
-    markers = collect_pwd_markers(text)
-    return markers[-1] if markers else None
 
 
 def _extract_pwd_path(candidate: str) -> str:
@@ -580,11 +566,6 @@ def cursor_rc(screen: Any) -> tuple[int, int]:
     row = int(getattr(screen.cursor, "y", 0) or 0)
     col = int(getattr(screen.cursor, "x", 0) or 0)
     return row, col
-
-
-def format_cur(screen: Any) -> str:
-    r, c = cursor_rc(screen)
-    return f"{r},{c}"
 
 
 def mouse_tracking_enabled(screen: Any) -> bool:

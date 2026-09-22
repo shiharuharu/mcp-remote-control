@@ -217,6 +217,29 @@ def _promote_catch(q_tmp: str, q_dest: str, q_bak: str) -> str:
     )
 
 
+# PowerShell catch clause for the scripts that answer a missing path in the
+# JSON dialect: the answer is a dict the decoder turns into FileNotFoundError,
+# and any other failure is rethrown. ``read_file``'s two scripts answer with
+# the bare token ``NOT_FOUND`` instead, so they keep their own clause and
+# decoder: feeding that dialect this dict answer would surface a missing file
+# as FS_ERROR ("invalid base64 read") rather than FileNotFoundError.
+_PS_NOT_FOUND_JSON_CATCH = (
+    "catch { if ($_.Exception.Message -match 'not find|does not exist|NotFound') { "
+    "Write-Output '{\"error\":\"NOT_FOUND\"}' } else { throw } }"
+)
+
+
+def _raise_if_not_found(data: Any, path: str) -> None:
+    """Raise FileNotFoundError for a JSON-dialect NOT_FOUND answer.
+
+    The scripts carrying :data:`_PS_NOT_FOUND_JSON_CATCH` report a missing path
+    inside their own catch, so every caller of this decoder has already run the
+    script; a non-NOT_FOUND answer is left to the caller's own shape handling.
+    """
+    if isinstance(data, dict) and data.get("error") == "NOT_FOUND":
+        raise FileNotFoundError(path)
+
+
 class PypsrpFileClient:
     """Adapter: pypsrp-compatible session -> :class:`WinRMFileClient` for ``WinrmFs``.
 
@@ -538,13 +561,10 @@ class PypsrpFileClient:
             f"mode=$p.Attributes.ToString() }}; "
             f"if ($null -ne $target -and $target -ne '') {{ $o.target = $target }}; "
             f"$o | ConvertTo-Json -Compress "
-            f"}} catch {{ "
-            f"if ($_.Exception.Message -match 'not find|does not exist|NotFound') {{ "
-            f"Write-Output '{{\"error\":\"NOT_FOUND\"}}' }} else {{ throw }} }}"
+            f"}} {_PS_NOT_FOUND_JSON_CATCH}"
         )
         data = self._run_json(script, path)
-        if isinstance(data, dict) and data.get("error") == "NOT_FOUND":
-            raise FileNotFoundError(path)
+        _raise_if_not_found(data, path)
         return data if isinstance(data, dict) else {"kind": "file", "size": 0}
 
     @_serialized
@@ -571,13 +591,10 @@ class PypsrpFileClient:
             f"$t = [string]$p.LinkTarget "
             f"}}; "
             f"@{{ target=$t }} | ConvertTo-Json -Compress "
-            f"}} catch {{ "
-            f"if ($_.Exception.Message -match 'not find|does not exist|NotFound') {{ "
-            f"Write-Output '{{\"error\":\"NOT_FOUND\"}}' }} else {{ throw }} }}"
+            f"}} {_PS_NOT_FOUND_JSON_CATCH}"
         )
         data = self._run_json(script, path)
-        if isinstance(data, dict) and data.get("error") == "NOT_FOUND":
-            raise FileNotFoundError(path)
+        _raise_if_not_found(data, path)
         if isinstance(data, dict) and data.get("error") == "NOT_A_LINK":
             raise OSError(f"not a reparse point: {path}")
         if not isinstance(data, dict):
@@ -683,13 +700,10 @@ class PypsrpFileClient:
             f"$names = @(Get-ChildItem -LiteralPath {q} -Force | ForEach-Object {{ $_.Name }}); "
             f"if ($names.Count -eq 0) {{ Write-Output '[]' }} "
             f"else {{ $names | ConvertTo-Json -Compress }} "
-            f"}} catch {{ "
-            f"if ($_.Exception.Message -match 'not find|does not exist|NotFound') {{ "
-            f"Write-Output '{{\"error\":\"NOT_FOUND\"}}' }} else {{ throw }} }}"
+            f"}} {_PS_NOT_FOUND_JSON_CATCH}"
         )
         data = self._run_json(script, path)
-        if isinstance(data, dict) and data.get("error") == "NOT_FOUND":
-            raise FileNotFoundError(path)
+        _raise_if_not_found(data, path)
         if data is None:
             return []
         if isinstance(data, list):
@@ -779,13 +793,10 @@ class PypsrpFileClient:
             f"}}); "
             f"if ($items.Count -eq 0) {{ Write-Output '[]' }} "
             f"else {{ $items | ConvertTo-Json -Compress }} "
-            f"}} catch {{ "
-            f"if ($_.Exception.Message -match 'not find|does not exist|NotFound') {{ "
-            f"Write-Output '{{\"error\":\"NOT_FOUND\"}}' }} else {{ throw }} }}"
+            f"}} {_PS_NOT_FOUND_JSON_CATCH}"
         )
         data = self._run_json(script, path)
-        if isinstance(data, dict) and data.get("error") == "NOT_FOUND":
-            raise FileNotFoundError(path)
+        _raise_if_not_found(data, path)
         if data is None:
             return []
         if isinstance(data, list):

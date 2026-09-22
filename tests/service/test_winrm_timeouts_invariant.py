@@ -22,14 +22,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests.exceptions as requests_exceptions
 
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport.winrm import WinRMTransport, _EXIT_MARKER
 from mcp_remote_control.transport.winrm_runspace import _STOP_DEADLINE_S
@@ -40,14 +38,6 @@ from mcp_remote_control.transport.winrm_timeouts import (
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def _ordered(op: int | None, rd: int | None) -> bool:
@@ -222,8 +212,6 @@ def test_call_on_read_only_profile_keeps_the_endpoint_alive() -> None:
     op, rd = sess.applied[-1]
     assert (op, rd) == (20, 22)
     assert rd >= op + PYPSRP_HTTP_TIMEOUT_SLACK_S
-    assert t._last_applied_read_timeout == 22  # noqa: SLF001
-    assert t._last_applied_operation_timeout == 20  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

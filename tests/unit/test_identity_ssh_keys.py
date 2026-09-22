@@ -18,7 +18,6 @@ from mcp_remote_control.identity.ssh_keys import (
     _key_import_probe,
     _key_import_verdict,
     _key_is_chainable,
-    _key_is_importable,
     _key_load_failure_sentence,
     key_load_failure_message,
     resolve_ssh_key_paths,
@@ -187,30 +186,6 @@ def test_fallback_empty_when_none_exist(tmp_path: Path) -> None:
     ssh_dir = tmp_path / ".ssh"
     ssh_dir.mkdir()
     assert resolve_ssh_key_paths(_profile(), ssh_dir=ssh_dir) == []
-
-
-def test_only_existing_false_returns_full_chain(tmp_path: Path) -> None:
-    ssh_dir = tmp_path / ".ssh"
-    ssh_dir.mkdir()
-    paths = resolve_ssh_key_paths(_profile(), ssh_dir=ssh_dir, only_existing=False)
-    assert [p.name for p in paths] == list(DEFAULT_SSH_IDENTITY_BASENAMES)
-
-
-def test_key_is_importable_rejects_unusable_but_keeps_unreadable(tmp_path: Path) -> None:
-    good = tmp_path / "good"
-    _write_key(good)
-    # A public key saved under a private-key name: exists, cannot be imported.
-    public = tmp_path / "public"
-    public.write_text(
-        asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode(),
-        encoding="utf-8",
-    )
-    missing = tmp_path / "missing"
-
-    assert _key_is_importable(good) is True
-    assert _key_is_importable(public) is False
-    # Unreadable / absent stays "usable" so the connect reports the real error.
-    assert _key_is_importable(missing) is True
 
 
 def test_unimportable_default_keys_are_skipped_in_order(tmp_path: Path) -> None:

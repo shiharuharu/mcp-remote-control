@@ -499,9 +499,11 @@ def test_snapshot_master_invalid_after_close() -> None:
         r = -1
         fd, gen = pty._snapshot_master()
         assert fd is not None
-        assert pty._master_valid(fd, gen)
+        # The live fence drain/read use: a snapshot is usable only while the
+        # master fd and its generation still match.
+        assert pty._master == fd and pty._fd_gen == gen
         pty.close()
-        assert not pty._master_valid(fd, gen)
+        assert not (pty._master == fd and pty._fd_gen == gen)
         fd2, gen2 = pty._snapshot_master()
         assert fd2 is None
         assert gen2 == gen + 1

@@ -28,7 +28,7 @@ from __future__ import annotations
 import threading
 import time
 import types
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -37,12 +37,13 @@ import requests
 import requests.exceptions as requests_exceptions
 
 from mcp_remote_control.core import endpoint_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport.base import ExecResult
 from mcp_remote_control.transport.winrm import WinRMTransport, _EXIT_MARKER
 from mcp_remote_control.transport.winrm_runspace import RunspaceResult
 from mcp_remote_control.transport.winrm_session import (
+    AdaptedWinRMSession,
     install_winrm_round_trip_counter,
 )
 
@@ -66,14 +67,6 @@ CAPABILITY_STDOUT = "\n".join(
         "can_file_io=True",
     )
 )
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def _rejection(status: int = 400) -> BaseException:
@@ -525,15 +518,15 @@ def test_round_trip_counter_walks_the_installed_pypsrp_layout() -> None:
     pytest.importorskip("pypsrp")
     from pypsrp.client import Client
 
-    from mcp_remote_control.transport.winrm_session import PypsrpClientAdapter
-
     client = Client("127.0.0.1", username="u", password="p", ssl=False, auth="ntlm")
     assert hasattr(client.wsman.transport, "_send_request")
-    reader = install_winrm_round_trip_counter(PypsrpClientAdapter(client))
+    reader = install_winrm_round_trip_counter(AdaptedWinRMSession(client))
     assert reader is not None
     assert reader() == 0
-    # Idempotent across adapters: the transport object carries the reader.
-    assert install_winrm_round_trip_counter(PypsrpClientAdapter(client)) is reader
+    # Idempotent across adapted sessions: the transport object carries the reader.
+    assert (
+        install_winrm_round_trip_counter(AdaptedWinRMSession(client)) is reader
+    )
 
 
 # ---------------------------------------------------------------------------

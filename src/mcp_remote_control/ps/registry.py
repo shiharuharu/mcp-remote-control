@@ -67,10 +67,6 @@ class PsRegistry:
         with self._lock:
             return [self._sessions[k] for k in sorted(self._sessions)]
 
-    def list_for_endpoint(self, ep: str) -> list[PsSession]:
-        name = str(ep).strip()
-        return [s for s in self.list_open() if s.ep == name]
-
     def ids_for_endpoint(self, ep: str) -> list[str]:
         """Snapshot session ids attached to *ep* (under the registry lock)."""
         name = str(ep).strip()
@@ -107,10 +103,6 @@ class PsRegistry:
                 sess.close()
             except Exception:  # noqa: BLE001
                 pass
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._sessions)
 
     def __iter__(self) -> Iterable[PsSession]:
         return iter(self.list_open())

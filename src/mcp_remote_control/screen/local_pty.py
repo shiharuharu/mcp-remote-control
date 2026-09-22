@@ -213,15 +213,6 @@ class LocalPty:
         with self._io_lock:
             return self._master, self._fd_gen
 
-    def _master_valid(self, fd: int, gen: int) -> bool:
-        """True if *fd* is still the live master for *gen*."""
-        with self._io_lock:
-            return (
-                self._master is not None
-                and self._master == fd
-                and self._fd_gen == gen
-            )
-
     def _read_master_locked(self, fd: int, max_bytes: int) -> bytes:
         """Non-blocking read; caller holds ``_io_lock`` and owns *fd*."""
         try:

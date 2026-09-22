@@ -104,11 +104,7 @@ def _build_winrm_transport(
         )
     winrm_cfg = profile.winrm or {}
     port = profile.port or 5985
-    scheme = str(winrm_cfg.get("scheme") or "http").lower()
-    # String-safe: ssl="false"/"0"/"no"/"off" must not enable via bool(str).
-    ssl = scheme in ("https", "ssl", "true", "1") or coerce_toml_bool(
-        winrm_cfg.get("ssl", False)
-    )
+    ssl = _resolve_winrm_ssl(winrm_cfg)
     # Port default: 5986 for https when profile port was the winrm default.
     if profile.port is None and ssl:
         port = 5986
@@ -136,11 +132,7 @@ def _build_winrm_transport(
         if coerced_timeout is not None:
             timeout_ms = coerced_timeout
 
-    encryption = str(
-        winrm_cfg.get("message_encryption")
-        or winrm_cfg.get("encryption")
-        or "auto"
-    )
+    encryption = _resolve_winrm_encryption(winrm_cfg)
 
     operation_timeout_s = _optional_int(winrm_cfg.get("operation_timeout_s"))
     read_timeout_s = _optional_int(winrm_cfg.get("read_timeout_s"))
@@ -230,6 +222,31 @@ def _build_winrm_transport(
         reconnection_backoff=reconnection_backoff,
         probe_timeout_s=probe_timeout_s,
     )
+
+
+def _resolve_winrm_ssl(winrm_cfg: dict[str, Any]) -> bool:
+    """Effective TLS flag for a ``[winrm]`` table.
+
+    ``scheme`` decides; a bare ``ssl`` flag switches to TLS under string-safe
+    truthiness, so ``ssl = "false"`` / ``"0"`` / ``"no"`` / ``"off"`` never
+    enables it via ``bool(str)``.
+    """
+    scheme = str(winrm_cfg.get("scheme") or "http").strip().lower()
+    if scheme in ("https", "ssl", "true", "1"):
+        return True
+    return coerce_toml_bool(winrm_cfg.get("ssl", False))
+
+
+def _resolve_winrm_encryption(winrm_cfg: dict[str, Any]) -> str:
+    """Effective message-encryption token for a ``[winrm]`` table.
+
+    ``message_encryption`` wins over the ``encryption`` alias; an unset pair
+    means ``auto``. The token is normalized (stripped, lowercased) to the
+    ``auto`` / ``always`` / ``never`` vocabulary the transport validates
+    against, so every reader compares and reports the same value.
+    """
+    raw = winrm_cfg.get("message_encryption") or winrm_cfg.get("encryption") or "auto"
+    return str(raw).strip().lower()
 
 
 def _resolve_winrm_auth_protocol(

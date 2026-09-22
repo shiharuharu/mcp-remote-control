@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pypsrp.exceptions
@@ -11,7 +10,7 @@ import pytest
 from _winrm_fakes import HOME, TEMP, FakePypsrpSession
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.fs.backends.winrm import PypsrpFileClient, WinrmFs
 from mcp_remote_control.fs.types import FsError
 from mcp_remote_control.transport.base import ExecResult
@@ -41,7 +40,7 @@ class _MockAttrs:
 class MockWinrmFileClient:
     """In-memory Windows-like file store for unit/service tests (no network)."""
 
-    # Real in-memory copy/fetch - opt in so SupportsCopyFetch is treated as native.
+    # Real in-memory copy/fetch - opt in so has_native_copy/fetch gate native.
     has_native_copy = True
     has_native_fetch = True
 
@@ -275,14 +274,6 @@ def _connector_for(store: MockWinrmFileClient):
         return _MockWinRMSession(store)
 
     return connector
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def _backend(store: MockWinrmFileClient | None = None) -> tuple[MockWinrmFileClient, WinrmFs]:

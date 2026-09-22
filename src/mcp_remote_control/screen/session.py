@@ -48,12 +48,9 @@ from typing import Any, Protocol, runtime_checkable
 import pyte
 
 from mcp_remote_control.screen.buffer import (
-    SEED_SHELL_COLS,
-    SEED_SHELL_ROWS,
     clamp_geometry,
     cursor_rc,
     dump_frame,
-    format_cur,
     frame_hash,
 )
 from mcp_remote_control.screen.keys import encode_text
@@ -305,17 +302,3 @@ class ScreenSession:
                 self.pty.close()
             except Exception:  # noqa: BLE001
                 pass
-
-    def cur_token(self) -> str:
-        return format_cur(self.screen)
-
-
-def default_shell_geometry(
-    *,
-    cols: int | None = None,
-    rows: int | None = None,
-) -> tuple[int, int]:
-    """Resolve open geometry (shell seed; explicit cols/rows override)."""
-    if cols is not None and rows is not None:
-        return clamp_geometry(cols, rows)
-    return clamp_geometry(SEED_SHELL_COLS, SEED_SHELL_ROWS)

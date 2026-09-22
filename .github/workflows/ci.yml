@@ -40,32 +40,14 @@ jobs:
       - name: Install package + dev tools
         run: uv pip install -e ".[dev]"
 
-      - name: Ruff (pinned via dev extra)
-        run: uv run ruff check src tests
-
-      - name: Pytest (unit + service + mcp; no integration)
+      # The gate has exactly one definition: scripts/harness/ci.sh (ruff +
+      # pytest + doctor/selftest + smokes + replay). Steps must not re-declare
+      # gate commands here, or the two copies drift the way they already did
+      # when this file ran ruff and the script did not.
+      - name: Gate (scripts/harness/ci.sh)
         env:
           MRC_HOME: ${{ github.workspace }}/tests/fixtures/config
-        run: uv run pytest -q --ignore=tests/integration -p no:cacheprovider
-
-      - name: CLI offline gates
-        env:
-          MRC_HOME: ${{ github.workspace }}/tests/fixtures/config
-        run: |
-          uv run mcp-remote-control-cli doctor
-          uv run mcp-remote-control-cli selftest
-
-      - name: Local smoke + MCP surface smoke
-        env:
-          MRC_HOME: ${{ github.workspace }}/tests/fixtures/config
-        run: |
-          ./scripts/harness/smoke_local.sh
-          ./scripts/harness/smoke_mcp.sh
-
-      - name: Screen fixture replay
-        env:
-          MRC_HOME: ${{ github.workspace }}/tests/fixtures/config
-        run: uv run mcp-remote-control-cli replay --fixture bash_prompt --check
+        run: ./scripts/harness/ci.sh
 
   package:
     name: sdist + wheel

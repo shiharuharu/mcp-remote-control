@@ -37,7 +37,6 @@ def test_load_config_missing_uses_defaults(tmp_path: Path) -> None:
     assert cfg.from_defaults is True
     assert cfg.source_path is None
     assert cfg.defaults.verbosity == "normal"
-    assert cfg.logging.level == "info"
 
 
 def test_load_config_fixture() -> None:
@@ -45,8 +44,7 @@ def test_load_config_fixture() -> None:
     assert cfg.from_defaults is False
     assert cfg.source_path is not None
     assert cfg.source_path.name == "config.toml"
-    assert cfg.defaults.screen_cols == 120
-    assert cfg.logging.audit is False
+    assert cfg.defaults.max_body_chars == 24000
     # Fixture may still list removed legacy [security] keys; they are ignored.
     assert cfg.security.strict_perms is False
 
@@ -60,20 +58,20 @@ def test_load_config_bad_toml(tmp_path: Path) -> None:
 
 def test_load_config_utf8_bom(tmp_path: Path) -> None:
     """Notepad/PowerShell UTF-8 BOM must not break config.toml load."""
-    body = b"\xef\xbb\xbf" + b"[logging]\nlevel = \"debug\"\n"
+    body = b"\xef\xbb\xbf" + b'[defaults]\nverbosity = "debug"\n'
     (tmp_path / "config.toml").write_bytes(body)
     cfg = load_config(tmp_path)
     assert cfg.from_defaults is False
-    assert cfg.logging.level == "debug"
+    assert cfg.defaults.verbosity == "debug"
 
 
 def test_load_config_no_bom_utf8_unchanged(tmp_path: Path) -> None:
     """Plain UTF-8 without BOM still loads."""
     (tmp_path / "config.toml").write_text(
-        "[logging]\nlevel = \"warning\"\n", encoding="utf-8"
+        '[defaults]\nverbosity = "warning"\n', encoding="utf-8"
     )
     cfg = load_config(tmp_path)
-    assert cfg.logging.level == "warning"
+    assert cfg.defaults.verbosity == "warning"
 
 
 # ---------------------------------------------------------------------------
@@ -85,48 +83,33 @@ def test_load_config_defaults_valid_types(tmp_path: Path) -> None:
     (tmp_path / "config.toml").write_text(
         "[defaults]\n"
         'verbosity = "quiet"\n'
-        "max_body_chars = 1000\n"
-        "screen_cols = 80\n"
-        "screen_rows = 24\n"
-        'screen_term = "xterm"\n'
-        'default_shell = "/bin/bash"\n'
-        "exec_timeout_ms = 30000\n",
+        "max_body_chars = 1000\n",
         encoding="utf-8",
     )
     cfg = load_config(tmp_path)
     assert cfg.defaults.verbosity == "quiet"
     assert cfg.defaults.max_body_chars == 1000
-    assert cfg.defaults.screen_cols == 80
-    assert cfg.defaults.screen_rows == 24
-    assert cfg.defaults.screen_term == "xterm"
-    assert cfg.defaults.default_shell == "/bin/bash"
-    assert cfg.defaults.exec_timeout_ms == 30000
 
 
 def test_load_config_defaults_partial_keeps_rest(tmp_path: Path) -> None:
     """Only provided keys override; others stay DefaultsConfig defaults."""
     (tmp_path / "config.toml").write_text(
-        "[defaults]\nexec_timeout_ms = 120000\n",
+        "[defaults]\nmax_body_chars = 500\n",
         encoding="utf-8",
     )
     cfg = load_config(tmp_path)
-    assert cfg.defaults.exec_timeout_ms == 120000
+    assert cfg.defaults.max_body_chars == 500
     assert cfg.defaults.verbosity == "normal"
-    assert cfg.defaults.screen_cols == 120
 
 
 @pytest.mark.parametrize(
     "body,key",
     [
-        ("[defaults]\nexec_timeout_ms = true\n", "exec_timeout_ms"),
         ("[defaults]\nmax_body_chars = false\n", "max_body_chars"),
-        ("[defaults]\nscreen_cols = true\n", "screen_cols"),
-        ("[defaults]\nscreen_rows = false\n", "screen_rows"),
-        ("[defaults]\nexec_timeout_ms = 1.5\n", "exec_timeout_ms"),
-        ("[defaults]\nscreen_cols = 80.0\n", "screen_cols"),
-        ("[defaults]\nexec_timeout_ms = \"60000\"\n", "exec_timeout_ms"),
+        ("[defaults]\nmax_body_chars = 1.5\n", "max_body_chars"),
+        ('[defaults]\nmax_body_chars = "60000"\n', "max_body_chars"),
         ("[defaults]\nmax_body_chars = {}\n", "max_body_chars"),
-        ("[defaults]\nscreen_cols = []\n", "screen_cols"),
+        ("[defaults]\nmax_body_chars = []\n", "max_body_chars"),
     ],
 )
 def test_load_config_defaults_int_bad_type_raises(
@@ -147,11 +130,8 @@ def test_load_config_defaults_int_bad_type_raises(
     [
         ("[defaults]\nverbosity = true\n", "verbosity"),
         ("[defaults]\nverbosity = false\n", "verbosity"),
-        ("[defaults]\nscreen_term = true\n", "screen_term"),
-        ("[defaults]\ndefault_shell = 1\n", "default_shell"),
         ("[defaults]\nverbosity = 0\n", "verbosity"),
         ("[defaults]\nverbosity = {}\n", "verbosity"),
-        ("[defaults]\nscreen_term = []\n", "screen_term"),
     ],
 )
 def test_load_config_defaults_str_bad_type_raises(
@@ -173,104 +153,6 @@ def test_load_config_defaults_not_table_raises(tmp_path: Path) -> None:
     with pytest.raises(ConfigInvalid) as ei:
         load_config(tmp_path)
     assert "[defaults]" in str(ei.value)
-    assert "table" in str(ei.value).lower()
-
-
-# ---------------------------------------------------------------------------
-# [logging] strict types (same rules as [defaults]; no str()/int() coerce)
-# ---------------------------------------------------------------------------
-
-def test_load_config_logging_valid_types(tmp_path: Path) -> None:
-    """Legal str/int logging fields load; audit still bool via strict parse."""
-    (tmp_path / "config.toml").write_text(
-        "[logging]\n"
-        'level = "debug"\n'
-        'dir = "var/log/mrc"\n'
-        "max_bytes = 10485760\n"
-        "backup_count = 3\n"
-        "audit = true\n",
-        encoding="utf-8",
-    )
-    cfg = load_config(tmp_path)
-    assert cfg.logging.level == "debug"
-    assert cfg.logging.dir == "var/log/mrc"
-    assert cfg.logging.max_bytes == 10485760
-    assert cfg.logging.backup_count == 3
-    assert cfg.logging.audit is True
-
-
-def test_load_config_logging_partial_keeps_rest(tmp_path: Path) -> None:
-    """Only provided keys override; others stay LoggingConfig defaults."""
-    (tmp_path / "config.toml").write_text(
-        "[logging]\nlevel = \"warning\"\n",
-        encoding="utf-8",
-    )
-    cfg = load_config(tmp_path)
-    assert cfg.logging.level == "warning"
-    assert cfg.logging.dir == "logs"
-    assert cfg.logging.max_bytes == 10_485_760
-    assert cfg.logging.backup_count == 5
-    assert cfg.logging.audit is False
-
-
-@pytest.mark.parametrize(
-    "body,key",
-    [
-        ("[logging]\nmax_bytes = true\n", "max_bytes"),
-        ("[logging]\nbackup_count = false\n", "backup_count"),
-        ("[logging]\nmax_bytes = 1.5\n", "max_bytes"),
-        ("[logging]\nbackup_count = 5.0\n", "backup_count"),
-        ('[logging]\nmax_bytes = "10485760"\n', "max_bytes"),
-        ('[logging]\nbackup_count = "5"\n', "backup_count"),
-        ("[logging]\nmax_bytes = {}\n", "max_bytes"),
-        ("[logging]\nbackup_count = []\n", "backup_count"),
-    ],
-)
-def test_load_config_logging_int_bad_type_raises(
-    tmp_path: Path, body: str, key: str
-) -> None:
-    """bool/float/str/non-scalar into logging int fields -> ConfigInvalid."""
-    (tmp_path / "config.toml").write_text(body, encoding="utf-8")
-    with pytest.raises(ConfigInvalid) as ei:
-        load_config(tmp_path)
-    msg = str(ei.value)
-    assert f"[logging].{key}" in msg
-    assert "integer" in msg.lower()
-    assert isinstance(ei.value, ConfigError)
-
-
-@pytest.mark.parametrize(
-    "body,key",
-    [
-        ("[logging]\nlevel = true\n", "level"),
-        ("[logging]\nlevel = false\n", "level"),
-        ("[logging]\ndir = 1\n", "dir"),
-        ("[logging]\nlevel = 0\n", "level"),
-        ("[logging]\ndir = true\n", "dir"),
-        ("[logging]\nlevel = {}\n", "level"),
-        ("[logging]\ndir = []\n", "dir"),
-        ("[logging]\nlevel = 1.5\n", "level"),
-    ],
-)
-def test_load_config_logging_str_bad_type_raises(
-    tmp_path: Path, body: str, key: str
-) -> None:
-    """bool/int/float/non-scalar into level/dir -> ConfigInvalid (not str(True))."""
-    (tmp_path / "config.toml").write_text(body, encoding="utf-8")
-    with pytest.raises(ConfigInvalid) as ei:
-        load_config(tmp_path)
-    msg = str(ei.value)
-    assert f"[logging].{key}" in msg
-    assert "string" in msg.lower()
-    assert isinstance(ei.value, ConfigError)
-
-
-def test_load_config_logging_not_table_raises(tmp_path: Path) -> None:
-    """[logging] must be a table."""
-    (tmp_path / "config.toml").write_text("logging = true\n", encoding="utf-8")
-    with pytest.raises(ConfigInvalid) as ei:
-        load_config(tmp_path)
-    assert "[logging]" in str(ei.value)
     assert "table" in str(ei.value).lower()
 
 
@@ -339,7 +221,7 @@ def test_load_config_ignores_unknown_security_keys(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# [security]/[logging] bool strict parse (no bool("false") invert)
+# [security] bool strict parse (no bool("false") invert)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -357,23 +239,6 @@ def test_load_config_strict_perms_toml_bool(
         f"[security]\nstrict_perms = {literal}\n", encoding="utf-8"
     )
     assert load_config(tmp_path).security.strict_perms is expected
-
-
-@pytest.mark.parametrize(
-    "literal,expected",
-    [
-        ("true", True),
-        ("false", False),
-    ],
-)
-def test_load_config_audit_toml_bool(
-    tmp_path: Path, literal: str, expected: bool
-) -> None:
-    """Native TOML bool true/false for [logging].audit."""
-    (tmp_path / "config.toml").write_text(
-        f"[logging]\naudit = {literal}\n", encoding="utf-8"
-    )
-    assert load_config(tmp_path).logging.audit is expected
 
 
 @pytest.mark.parametrize(
@@ -402,31 +267,10 @@ def test_load_config_strict_perms_string_tokens(
 
 
 @pytest.mark.parametrize(
-    "token,expected",
-    [
-        ("false", False),
-        ("0", False),
-        ("true", True),
-        ("1", True),
-    ],
-)
-def test_load_config_audit_string_tokens(
-    tmp_path: Path, token: str, expected: bool
-) -> None:
-    """[logging].audit string tokens map the same way as strict_perms."""
-    (tmp_path / "config.toml").write_text(
-        f'[logging]\naudit = "{token}"\n', encoding="utf-8"
-    )
-    assert load_config(tmp_path).logging.audit is expected
-
-
-@pytest.mark.parametrize(
     "section,key,body",
     [
         ("security", "strict_perms", "[security]\nstrict_perms = {}\n"),
         ("security", "strict_perms", "[security]\nstrict_perms = []\n"),
-        ("logging", "audit", "[logging]\naudit = {}\n"),
-        ("logging", "audit", "[logging]\naudit = []\n"),
     ],
 )
 def test_load_config_bool_non_scalar_raises(

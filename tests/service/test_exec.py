@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -17,14 +17,6 @@ from mcp_remote_control.exec import run_script_on_transport
 from mcp_remote_control.transport.base import ExecResult, TransportError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -1860,10 +1852,6 @@ def test_winrm_exec_timeout_5_aligns_op_read_timeouts() -> None:
 
     ep = get_registry().get("lab-win")
     assert ep is not None and isinstance(ep.transport, WinRMTransport)
-    assert ep.transport._last_applied_operation_timeout == 5  # noqa: SLF001
-    assert (  # noqa: SLF001
-        ep.transport._last_applied_read_timeout == 5 + PYPSRP_HTTP_TIMEOUT_SLACK_S
-    )
 
 
 def test_winrm_exec_no_timeout_does_not_force_short_op_read() -> None:

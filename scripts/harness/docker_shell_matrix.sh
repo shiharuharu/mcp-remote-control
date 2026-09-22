@@ -25,13 +25,18 @@ if ! docker info >/dev/null 2>&1; then
   exit 2
 fi
 
-# Probe commands from registry (must stay in sync with shell/dialect.py).
-# MARK must match PWD_MARKER.
-MARK='__MRC_PWD__:'
-PROBE_BASH=" set +o history 2>/dev/null||:;echo ${MARK}\$(pwd -P 2>/dev/null||pwd);set -o history 2>/dev/null||:;"
-PROBE_ZSH=" fc -p 2>/dev/null||:;echo ${MARK}\$(pwd -P 2>/dev/null||pwd);fc -P 2>/dev/null||:;"
-PROBE_SH=" echo ${MARK}\$(pwd -P 2>/dev/null||pwd)"
-PROBE_BUSYBOX=" echo ${MARK}\$(pwd 2>/dev/null||pwd)"
+# Probe commands come from the dialect registry itself, so a matrix cell can
+# never drift from what the transports inject; MARK is the registry's
+# PWD_MARKER. Leading spaces and $( ) substitutions are copied verbatim.
+PY_BIN="$ROOT/.venv/bin/python"
+[[ -x "$PY_BIN" ]] || PY_BIN="$(command -v python3)"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+
+MARK="$("$PY_BIN" -c 'from mcp_remote_control.shell.dialect import PWD_MARKER as m; print(m)')"
+PROBE_BASH="$("$PY_BIN" -c 'from mcp_remote_control.shell.dialect import POSIX_BASH as d, probe_cmd_for_dialect as p; print(p(d))')"
+PROBE_ZSH="$("$PY_BIN" -c 'from mcp_remote_control.shell.dialect import POSIX_ZSH as d, probe_cmd_for_dialect as p; print(p(d))')"
+PROBE_SH="$("$PY_BIN" -c 'from mcp_remote_control.shell.dialect import POSIX_SH as d, probe_cmd_for_dialect as p; print(p(d))')"
+PROBE_BUSYBOX="$("$PY_BIN" -c 'from mcp_remote_control.shell.dialect import POSIX_BUSYBOX as d, probe_cmd_for_dialect as p; print(p(d))')"
 
 ONLY="${MATRIX_ONLY:-all}"
 FAIL=0

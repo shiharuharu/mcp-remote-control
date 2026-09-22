@@ -11,7 +11,6 @@ from mcp_remote_control.screen.buffer import (
     SEED_SHELL_COLS,
     SEED_SHELL_ROWS,
     dump_frame,
-    format_cur,
     frame_hash,
 )
 from mcp_remote_control.screen.geometry import (
@@ -33,7 +32,7 @@ from mcp_remote_control.screen.registry import (
 )
 from mcp_remote_control.screen.replay import replay_ansi, replay_fixture
 from mcp_remote_control.screen.send import ACTION_TYPES, execute_send
-from mcp_remote_control.screen.session import ScreenSession, default_shell_geometry
+from mcp_remote_control.screen.session import ScreenSession
 
 __all__ = [
     "ACTION_TYPES",
@@ -46,14 +45,12 @@ __all__ = [
     "action_truthy",
     "actions_include_submit",
     "classify_command",
-    "default_shell_geometry",
     "dump_frame",
     "encode_key",
     "encode_keys",
     "encode_paste",
     "encode_text",
     "execute_send",
-    "format_cur",
     "frame_hash",
     "get_screen_registry",
     "replay_ansi",

@@ -18,7 +18,6 @@ from mcp_remote_control.codec import (
     decode_auto,
     encode_for_remote,
 )
-from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport import local as local_mod
 from mcp_remote_control.transport.local import LocalTransport
 from mcp_remote_control.transport.ssh import SSHTransport
@@ -247,15 +246,10 @@ def test_local_run_reports_the_codec_that_produced_the_text(
     t.close()
     assert r.exit_code == 0
     assert r.stdout == "\u4e2d\u6587"
-    assert t.last_decode == {
-        "encoding": "gb18030",
-        "preferred": t.text_encoding,
-        "replaced": False,
-        "errors": 0,
-        "fallback": True,
-        "ambiguous": False,
-    }
-    assert len(_decode_warnings(caplog)) == 1
+    warnings = _decode_warnings(caplog)
+    assert len(warnings) == 1
+    # The warning is where the codec that produced the text is reported.
+    assert "gb18030" in warnings[0].getMessage()
 
 
 def test_local_repeat_fallback_warns_once(caplog: pytest.LogCaptureFixture) -> None:
@@ -276,9 +270,6 @@ def test_local_clean_utf8_run_is_quiet(caplog: pytest.LogCaptureFixture) -> None
         r = t.run_command(_child("import sys; sys.stdout.buffer.write('\u4e2d\u6587'.encode())"))
     t.close()
     assert r.stdout == "\u4e2d\u6587"
-    assert t.last_decode is not None
-    assert t.last_decode["encoding"] == "utf-8"
-    assert t.last_decode["replaced"] is False
     assert _decode_warnings(caplog) == []
 
 
@@ -335,8 +326,6 @@ def test_ssh_keeps_utf8_output_when_preferred_is_gb18030(
         r = t.run_command("dir", cwd="/tmp")
     t.close()
     assert r.stdout == "| \u4e3b\u673a |\n"
-    assert t.last_decode is not None
-    assert t.last_decode["encoding"] == "utf-8"
     assert _decode_warnings(caplog) == []
 
 
@@ -349,15 +338,10 @@ def test_ssh_reports_legacy_decode_and_warns_once(
         t.run_command("dir", cwd="/tmp")
     t.close()
     assert first.stdout == "\u4f60\u597d"
-    assert t.last_decode == {
-        "encoding": "gb18030",
-        "preferred": "gb18030",
-        "replaced": False,
-        "errors": 0,
-        "fallback": True,
-        "ambiguous": False,
-    }
-    assert len(_decode_warnings(caplog)) == 1
+    warnings = _decode_warnings(caplog)
+    assert len(warnings) == 1
+    # The warning names the codec the legacy bytes were read with.
+    assert "gb18030" in warnings[0].getMessage()
 
 
 class _ExecResultConn:
@@ -387,8 +371,6 @@ def test_ssh_decodes_bytes_from_a_pre_built_exec_result(
         r = t.run_command("dir", cwd="/tmp")
     t.close()
     assert r.stdout == "\u4f60\u597d"
-    assert t.last_decode is not None
-    assert t.last_decode["encoding"] == "gb18030"
     assert len(_decode_warnings(caplog)) == 1
 
 
@@ -446,9 +428,6 @@ def test_ssh_transport_reports_an_ambiguous_read_and_warns_once(
         t.run_command("dir", cwd="/tmp")
     t.close()
     assert r.stdout == "\u4e00\u76f4".encode("gbk").decode("utf-8")
-    assert t.last_decode is not None
-    assert t.last_decode["ambiguous"] is True
-    assert t.last_decode["fallback"] is False
     # A fallback and an ambiguous read are separate signals: this one must not
     # masquerade as the legacy-codec warning.
     assert _decode_warnings(caplog) == []
@@ -465,61 +444,5 @@ def test_ssh_clean_utf8_read_is_not_ambiguous(
         r = t.run_command("dir", cwd="/tmp")
     t.close()
     assert r.stdout == "total 0\n"
-    assert t.last_decode is not None
-    assert t.last_decode["ambiguous"] is False
     assert _ambiguous_warnings(caplog) == []
 
-
-# ---------------------------------------------------------------------------
-# Decode record scope: last_decode describes one command, never the previous one
-# ---------------------------------------------------------------------------
-
-
-def test_local_last_decode_is_reset_per_command() -> None:
-    """A command that decodes no bytes must not leave the previous command's
-    codec in the record: it would attribute a codec to text nobody produced."""
-    t = LocalTransport()
-    t.connect()
-    t.run_command(_child("import sys; sys.stdout.buffer.write('\u4e2d\u6587'.encode('gbk'))"))
-    assert t.last_decode is not None
-    assert t.last_decode["encoding"] == "gb18030"
-    r = t.run_command(_child("pass"))
-    t.close()
-    assert r.stdout == ""
-    assert t.last_decode is None
-
-
-def test_local_last_decode_is_reset_when_the_command_never_ran() -> None:
-    """A caller-side failure before the child starts is still this command's
-    record: the previous command's codec must not survive it."""
-    t = LocalTransport()
-    t.connect()
-    t.run_command(_child("import sys; sys.stdout.buffer.write('\u4e2d\u6587'.encode('gbk'))"))
-    assert t.last_decode is not None
-    with pytest.raises(TransportError):
-        t.run_command("echo hi", cwd="/nonexistent-mrc-cwd")
-    t.close()
-    assert t.last_decode is None
-
-
-def test_ssh_last_decode_is_reset_per_command() -> None:
-    conn = _StubConn("\u4e2d\u6587".encode("gbk"))
-    t = SSHTransport(
-        host="h", username="u", text_encoding="gb18030", connector=lambda **k: conn
-    )
-    t.connect()
-    first = t.run_command("dir", cwd="/tmp")
-    assert first.stdout == "\u4e2d\u6587"
-    assert t.last_decode == {
-        "encoding": "gb18030",
-        "preferred": "gb18030",
-        "replaced": False,
-        "errors": 0,
-        "fallback": True,
-        "ambiguous": False,
-    }
-    conn._stdout = b""
-    second = t.run_command("dir", cwd="/tmp")
-    t.close()
-    assert second.stdout == ""
-    assert t.last_decode is None

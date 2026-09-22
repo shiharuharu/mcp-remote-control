@@ -167,14 +167,27 @@ def test_connector_reconnect_kwargs_land_on_wsman() -> None:
     """Guards the stub above against pypsrp renaming its transport knobs.
 
     ``Client(**kwargs)`` forwards to ``WSMan``, so the values must be readable
-    on the live HTTP transport once the factory returns a real adapter.
+    on the live HTTP transport once the factory returns a real Client.
     """
     pytest.importorskip("pypsrp")
-    adapter = default_winrm_connector(
+    client = default_winrm_connector(
         **BASE_ARGS,
         reconnection_retries=3,
         reconnection_backoff=0.25,
     )
-    transport = adapter.wsman.transport
+    transport = client.wsman.transport
     assert transport.reconnection_retries == 3
     assert transport.reconnection_backoff == 0.25
+
+
+def test_connector_returns_the_oneshot_surface() -> None:
+    """The factory's return value must itself carry what the transport calls.
+
+    The transport adapts whatever a connector returns by attribute presence, so
+    a pypsrp release that moves one of these callables would make the session
+    unusable at runtime only; assert the surface where the real Client is built.
+    """
+    pytest.importorskip("pypsrp")
+    client = default_winrm_connector(**BASE_ARGS)
+    for name in ("execute_ps", "execute_cmd", "close"):
+        assert callable(getattr(client, name, None)), name

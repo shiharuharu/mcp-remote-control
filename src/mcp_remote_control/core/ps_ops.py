@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any
 
 from mcp_remote_control.config import ProfileInvalid, ProfileNotFound
 from mcp_remote_control.core.result import OpResult, _home, _short
@@ -81,27 +81,6 @@ _PS_PROBE_MISSING_HINT = (
     "before it, so exit=-1 means unknown and cwd is the last known location, "
     "not this invoke's; drop the exit or use exec"
 )
-
-
-class SupportsRunspace(Protocol):
-    """Transport surface required for persistent PowerShell runspaces."""
-
-    def open_runspace(self) -> Any: ...
-
-    def runspace_invoke(
-        self,
-        handle: Any,
-        script: str,
-        *,
-        timeout_s: float | None = None,
-    ) -> Any: ...
-
-    # Returns a close verdict (a string on WinRMTransport, see its
-    # ``close_runspace``); mock transports may return None. A transport that
-    # can also take a caller-owned deadline exposes ``close_runspace_within``
-    # (optional), which is how a ps close keeps lock wait, delete and recovery
-    # on one budget.
-    def close_runspace(self, handle: Any) -> Any: ...
 
 
 def open_session(
@@ -231,9 +210,8 @@ def open_session(
             ),
         )
 
-    runspace = cast(SupportsRunspace, transport)
     try:
-        handle = runspace.open_runspace()
+        handle = transport.open_runspace()
     except TransportError as exc:
         # Same rule as exec: a refusal the transport's taxonomy does not
         # classify (a WSMan 401 that surfaces as a plain auth error) leaves a
@@ -329,7 +307,6 @@ def open_session(
         fields={
             "op": "open",
             "id": sid,
-            "session_id": sid,
             "ep": ep_name,
             "transport": endpoint.transport_name,
         },
@@ -481,7 +458,6 @@ def close_session(
     fields: dict[str, Any] = {
         "op": "close",
         "id": sid,
-        "session_id": sid,
         "ep": sess.ep,
         "closed": True,
     }
@@ -747,7 +723,6 @@ def _invoke_on_session(
     fields: dict[str, Any] = {
         "op": "invoke",
         "id": sid,
-        "session_id": sid,
         "ep": live.ep,
         "exit": rs.exit_code,
     }

@@ -457,7 +457,6 @@ class LocalFs:
             path=dst,
             local=src,
             bytes_transferred=int(size),
-            direction="put",
         )
 
     def get(
@@ -484,7 +483,6 @@ class LocalFs:
             path=src,
             local=str(dst_p),
             bytes_transferred=int(size),
-            direction="get",
         )
 
     def mkdir(self, path: str, *, parents: bool = True) -> StatInfo:

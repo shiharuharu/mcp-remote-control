@@ -19,10 +19,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 from mcp_remote_control.core import endpoint_ops, exec_ops, ps_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
@@ -74,13 +73,6 @@ class _Session:
 
     def close(self) -> None:
         pass
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry() -> Any:
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def test_a_refused_exec_session_is_retired_not_handed_back() -> None:

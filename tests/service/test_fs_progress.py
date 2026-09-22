@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import stat as statmod
-from collections.abc import Iterator
 from pathlib import Path
 
-import pytest
+
+from _sftp_fakes import MockSftp, _MockAttrs
+from test_fs_winrm import MockWinrmFileClient
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.fs.backends.local import LocalFs
 from mcp_remote_control.fs.backends.sftp import SftpFs
 from mcp_remote_control.fs.backends.winrm import WinrmFs
@@ -19,14 +19,6 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
 
 # Large enough to span multiple transfer chunks -> >=1 intermediate progress.
 LARGE_SIZE = DEFAULT_TRANSFER_CHUNK + 12_345
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def _events() -> list[tuple[int, int | None]]:
@@ -131,96 +123,6 @@ def test_local_backend_put_progress_direct(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # sftp mock
 # ---------------------------------------------------------------------------
-
-
-class _MockSftpFile:
-    def __init__(self, store: dict[str, bytes], path: str, mode: str) -> None:
-        self._store = store
-        self._path = path
-        self._mode = mode
-        self._buf = bytearray()
-        if "r" in mode:
-            self._data = store.get(path, b"")
-            self._pos = 0
-        else:
-            self._data = b""
-            self._pos = 0
-
-    def read(self, n: int = -1) -> bytes:
-        if n is None or n < 0:
-            chunk = self._data[self._pos :]
-            self._pos = len(self._data)
-            return chunk
-        chunk = self._data[self._pos : self._pos + n]
-        self._pos += len(chunk)
-        return chunk
-
-    def write(self, data: bytes) -> int:
-        self._buf.extend(data)
-        return len(data)
-
-    def close(self) -> None:
-        if "w" in self._mode:
-            self._store[self._path] = bytes(self._buf)
-
-
-class _MockAttrs:
-    def __init__(self, mode: int, size: int = 0, mtime: float = 0.0) -> None:
-        self.permissions = mode
-        self.size = size
-        self.mtime = mtime
-
-
-class MockSftp:
-    def __init__(self) -> None:
-        self.files: dict[str, bytes] = {}
-        self.dirs: set[str] = {"/"}
-
-    def _norm(self, path: str) -> str:
-        p = path if path.startswith("/") else "/" + path
-        while "//" in p:
-            p = p.replace("//", "/")
-        if p != "/" and p.endswith("/"):
-            p = p.rstrip("/")
-        return p or "/"
-
-    def listdir(self, path: str) -> list[str]:
-        path = self._norm(path)
-        if path not in self.dirs:
-            raise FileNotFoundError(path)
-        return []
-
-    def stat(self, path: str) -> _MockAttrs:
-        path = self._norm(path)
-        if path in self.dirs:
-            return _MockAttrs(statmod.S_IFDIR | 0o755, 0, 1.0)
-        if path in self.files:
-            data = self.files[path]
-            return _MockAttrs(statmod.S_IFREG | 0o644, len(data), 1.0)
-        raise FileNotFoundError(path)
-
-    def lstat(self, path: str) -> _MockAttrs:
-        return self.stat(path)
-
-    def mkdir(self, path: str) -> None:
-        path = self._norm(path)
-        self.dirs.add(path)
-
-    def open(self, path: str, mode: str = "r") -> _MockSftpFile:
-        path = self._norm(path)
-        if "r" in mode and path not in self.files:
-            raise FileNotFoundError(path)
-        return _MockSftpFile(self.files, path, mode)
-
-    def put(self, local: str, remote: str) -> None:
-        remote = self._norm(remote)
-        self.files[remote] = Path(local).read_bytes()
-
-    def get(self, remote: str, local: str) -> None:
-        remote = self._norm(remote)
-        if remote not in self.files:
-            raise FileNotFoundError(remote)
-        Path(local).write_bytes(self.files[remote])
 
 
 def test_sftp_put_progress_fires(tmp_path: Path) -> None:
@@ -412,68 +314,6 @@ def test_sftp_put_progress_close_failure_preserves_remote(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 # winrm mock
 # ---------------------------------------------------------------------------
-
-
-class _MockWinAttrs:
-    def __init__(self, kind: str, size: int = 0) -> None:
-        self.kind = kind
-        self.size = size
-        self.mtime = 1.0
-        self.mode = "Archive"
-
-
-class MockWinrmFileClient:
-    """In-memory WinRM file client with real native copy/fetch (opt-in flags)."""
-
-    # Explicit True: production-like native transfer (default is False when missing).
-    has_native_copy = True
-    has_native_fetch = True
-
-    def __init__(self) -> None:
-        self.files: dict[str, bytes] = {}
-        self.dirs: set[str] = {"C:\\", "C:\\temp"}
-
-    def _norm(self, path: str) -> str:
-        p = str(path).strip().replace("/", "\\")
-        while "\\\\" in p:
-            p = p.replace("\\\\", "\\")
-        if len(p) > 3 and p.endswith("\\"):
-            p = p.rstrip("\\")
-        if len(p) == 2 and p[1] == ":":
-            p = p + "\\"
-        return p
-
-    def listdir(self, path: str) -> list[str]:
-        return []
-
-    def stat(self, path: str) -> _MockWinAttrs:
-        path = self._norm(path)
-        if path in self.dirs or any(self._norm(d) == path for d in self.dirs):
-            return _MockWinAttrs("dir", 0)
-        if path in self.files:
-            return _MockWinAttrs("file", len(self.files[path]))
-        raise FileNotFoundError(path)
-
-    def mkdir(self, path: str) -> None:
-        self.dirs.add(self._norm(path))
-
-    def write_file(self, path: str, data: bytes) -> None:
-        self.files[self._norm(path)] = data
-
-    def read_file(self, path: str) -> bytes:
-        path = self._norm(path)
-        if path not in self.files:
-            raise FileNotFoundError(path)
-        return self.files[path]
-
-    def copy(self, local: str, remote: str) -> None:
-        self.files[self._norm(remote)] = Path(local).read_bytes()
-
-    def fetch(self, remote: str, local: str) -> None:
-        path = self._norm(remote)
-        if path not in self.files:
-            raise FileNotFoundError(path)
-        Path(local).write_bytes(self.files[path])
 
 
 def test_winrm_put_progress_fires(tmp_path: Path) -> None:

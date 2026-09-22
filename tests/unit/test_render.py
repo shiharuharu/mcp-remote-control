@@ -149,7 +149,6 @@ def test_screen_ok_with_cur_and_frame():
             "gen": 3,
             "idle": True,
             "surface": "shell",
-            "cursor_line": "deploy@host:/var/log$ ",
         },
         body="line1\nline2",
     )
@@ -160,7 +159,6 @@ def test_screen_ok_with_cur_and_frame():
     assert "cur=47,2" in first
     assert "cwd=/var/log" in first
     assert "idle" in first.split()
-    assert "| cursor_line=" in text
     assert "line1\nline2" in text
 
 
@@ -762,66 +760,3 @@ def test_redact_inline_private_key_pem_assignment():
     red = redact_string(body)
     assert "BEGIN FAKE" not in red
     assert f'private_key_pem="{REDACTED}"' in red
-
-
-# ---------------------------------------------------------------------------
-# render `dead` flag on Agent track
-# ---------------------------------------------------------------------------
-
-
-def test_dead_flag_emitted_on_agent_track():
-    """``fields={"dead": True}`` emits a bare ``dead`` token on the Agent track.
-
-    Flag membership and emission order both come from ``_FLAG_ORDER``. A
-    true flag omitted from that tuple is skipped in the header loops and
-    dropped from Agent output while JSON still carries the field.
-    """
-    text = render_agent_text(
-        "screen",
-        "ok",
-        fields={"id": "scr_01", "dead": True, "cols": 80, "rows": 24},
-    )
-    first = text.splitlines()[0]
-    assert first.startswith("@screen ok")
-    assert "dead" in first.split()
-    assert "dead=True" not in first  # bare token, not k=v
-    # JSON track still carries the field.
-    data = json.loads(
-        render_json("screen", "ok", fields={"id": "scr_01", "dead": True, "cols": 80, "rows": 24})
-    )
-    assert data["dead"] is True
-
-
-def test_dead_status_with_dead_field_combo_renders():
-    """``status="dead"`` + ``fields={"dead": True}`` combo must render without
-    error and produce a sensible Agent track (status token + bare ``dead``
-    flag).
-
-    The two ``dead`` tokens are independent (``status`` is the OpResult
-    outcome; the ``dead`` field is a boolean-ish flag the renderer emits as a
-    bare token). They can co-occur (a dead endpoint surfaces ``@screen dead``
-    plus a ``dead`` flag from fields).
-    """
-    text = render_agent_text(
-        "screen",
-        "dead",
-        fields={"id": "scr_01", "dead": True, "cols": 80, "rows": 24},
-    )
-    first = text.splitlines()[0]
-    # Status token comes from the status arg; the bare ``dead`` flag from fields.
-    assert first.startswith("@screen dead")
-    tokens = first.split()
-    assert tokens.count("dead") == 2, (tokens, text)
-    assert "dead=True" not in first  # bare flag, not k=v
-    # No crash, no malformed tokens.
-    assert "True" not in first
-    # JSON track: status carries ``dead`` and the field carries ``dead`` too.
-    data = json.loads(
-        render_json(
-            "screen",
-            "dead",
-            fields={"id": "scr_01", "dead": True, "cols": 80, "rows": 24},
-        )
-    )
-    assert data["status"] == "dead"
-    assert data["dead"] is True

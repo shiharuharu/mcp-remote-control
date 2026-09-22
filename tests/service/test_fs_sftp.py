@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import stat as statmod
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -12,19 +11,11 @@ import pytest
 from _sftp_fakes import MockSftp, _MockAttrs, _SFTPName
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import get_registry, reset_registry
+from mcp_remote_control.endpoint import get_registry
 from mcp_remote_control.fs.backends.sftp import _MAX_RECURSE_DEPTH, SftpFs
 from mcp_remote_control.fs.types import FsError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------

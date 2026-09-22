@@ -488,9 +488,7 @@ class PypsrpPoolRunspaceAdapter:
         """
         with self._pending_lock:
             self._retired = True
-            if self._pending_releases:
-                return
-            self._unbind_serial_zone_hooks()
+        self._unbind_when_retired_and_idle()
 
     def close(self) -> None:
         # The runspace is going away, so nothing is left for a later zone to
@@ -770,9 +768,9 @@ def _safe_stop_pipeline(
     ``PowerShell.stop()`` signals the remote host to abort; ``close()`` is the
     release (TERMINATE + deregistration). Both are WSMan exchanges on the
     session every operation shares, so both run in one serial zone capped by
-    :data:`_STOP_DEADLINE_S`; ``close`` is claimed under one lock by the first
-    attempt and by the re-attempt that follows a stalled stop, so the server
-    never sees two TERMINATEs for one pipeline.
+    :data:`_STOP_DEADLINE_S`. The release follows the stop on the same thread,
+    once the interrupt has answered early or late, so the server sees one
+    TERMINATE per pipeline.
 
     *interrupt* marks the cancellation of an invoke whose caller is still inside
     its own serial zone while it waits for this stop (see
@@ -800,19 +798,9 @@ def _safe_stop_pipeline(
         return
     stop = getattr(ps, "stop", None)
     serial = None if interrupt else op_lock
-    claim_lock = threading.Lock()
-    claimed = False
     # Set once this thread's wait for the stop is over: from then on the
     # caller's serial zone is gone (or going), so the release takes the lock.
     wait_ended = threading.Event()
-
-    def _claim_release() -> bool:
-        nonlocal claimed
-        with claim_lock:
-            if claimed:
-                return False
-            claimed = True
-            return True
 
     def _stop_then_release() -> None:
         if callable(stop):
@@ -838,16 +826,14 @@ def _safe_stop_pipeline(
         # The interrupt answered, early or late. Once it has, the pipeline
         # is terminal and close() can release it - the only way a release
         # survives a stop that outlasted the deadline, where the close
-        # could not run at all.
-        if _claim_release():
-            # Outside the zone above: the close takes the lock itself on the
-            # re-attempt that follows a stalled stop, where the caller's zone
-            # is gone by then.
-            _close_pipeline(
-                ps,
-                op_lock=op_lock if wait_ended.is_set() else serial,
-                retain=retain,
-            )
+        # could not run at all. Outside the zone above: the close takes the
+        # lock itself when the stop outlasted the deadline, where the caller's
+        # zone is gone by then.
+        _close_pipeline(
+            ps,
+            op_lock=op_lock if wait_ended.is_set() else serial,
+            retain=retain,
+        )
 
     if _call_with_deadline(_stop_then_release, deadline_s=_STOP_DEADLINE_S):
         return
@@ -1029,22 +1015,6 @@ def _coerce_runspace_result(
                 exit_probe_ran=raw.exit_probe_ran,
             )
         return raw
-
-    # Same shape as this module's RunspaceResult but a different class object
-    # (avoid importing sibling packages at module load).
-    if type(raw).__name__ == "RunspaceResult" and hasattr(raw, "stdout"):
-        loc = getattr(raw, "location", None) or default_location
-        exit_code = int(getattr(raw, "exit_code", 0) or 0)
-        stderr = _decode_stream(getattr(raw, "stderr", "") or "")
-        return RunspaceResult(
-            stdout=_decode_stream(getattr(raw, "stdout", "") or ""),
-            stderr=stderr,
-            exit_code=exit_code,
-            location=loc,
-            had_errors=bool(getattr(raw, "had_errors", False)) or exit_code != 0,
-            timed_out=bool(getattr(raw, "timed_out", False)),
-            exit_probe_ran=bool(getattr(raw, "exit_probe_ran", True)),
-        )
 
     if isinstance(raw, tuple):
         # (stdout, location) or (stdout, stderr, exit, location)

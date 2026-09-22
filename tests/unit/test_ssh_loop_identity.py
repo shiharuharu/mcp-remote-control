@@ -12,6 +12,7 @@ from mcp_remote_control.screen.ssh_pty import SshPty
 from mcp_remote_control.transport.async_bridge import (
     AsyncLoopBridge,
     reset_shared_bridge,
+    run_coro,
 )
 from mcp_remote_control.transport.ssh import SSHTransport, _run_maybe_async
 
@@ -129,7 +130,12 @@ def test_loop_identity_across_connect_run_sftp_pty() -> None:
             "create_process",
         )}
         assert len(ids) == 1, f"loop mismatch: {loops}"
-        assert loops["connect"] is bridge.loop
+
+        async def _bridge_loop() -> asyncio.AbstractEventLoop:
+            return asyncio.get_running_loop()
+
+        # The loop every op recorded is the one this bridge runs coroutines on.
+        assert loops["connect"] is run_coro(_bridge_loop(), bridge=bridge)
     finally:
         if t is not None:
             t.close()

@@ -1,9 +1,8 @@
-"""Open a serial console as a PtyHandle-compatible byte stream."""
+"""Open a serial console as a bounded, thread-safe byte stream."""
 
 from __future__ import annotations
 
 import threading
-import time
 from typing import Any
 
 # Wall-clock budget for ``close()``: acquiring ``_read_lock`` and the
@@ -45,7 +44,12 @@ def _call_with_timeout(fn: Any, *, timeout_s: float, what: str) -> None:
 
 
 class SerialConsole:
-    """Bidirectional serial link for embedded control (PtyHandle-shaped)."""
+    """Bidirectional serial link for embedded control.
+
+    The console ops and the capture pump use one shape: ``read`` / ``read_into``
+    / ``write`` / ``close`` / ``is_alive`` plus the ``cols`` / ``rows`` label
+    fields.
+    """
 
     def __init__(
         self,
@@ -78,7 +82,6 @@ class SerialConsole:
         # *and* the matching ring feed. CapturePump uses ``read_into``;
         # ``_brief_pump`` uses ``read()`` + ``buffer.feed``. Both paths
         # take this lock so two producers cannot commit ABC+DEF as ADEFBC.
-        # ``drain_for`` also uses ``self.read()`` and is covered.
         self._read_lock = threading.Lock()
 
         if serial_factory is not None:
@@ -122,9 +125,6 @@ class SerialConsole:
         except Exception:  # noqa: BLE001
             return False
 
-    def exit_code(self) -> int | None:
-        return None if self.is_alive() else 0
-
     def _read_unlocked(self, max_bytes: int) -> bytes:
         """Single pyserial read. Caller must hold ``_read_lock``."""
         # close() may have nulled _ser after our is_alive() check.
@@ -140,7 +140,7 @@ class SerialConsole:
             n = max_bytes
         # Propagate read errors so CapturePump can record them and stop
         # after persistent failure. Callers that need tolerance (pump,
-        # _brief_pump, drain_for) catch at their own layer.
+        # _brief_pump) catch at their own layer.
         data = self._ser.read(n)
         return bytes(data) if data else b""
 
@@ -171,10 +171,6 @@ class SerialConsole:
                 buffer.feed(data)
             return data
 
-    def snarf(self, buffer: Any, max_bytes: int = 65536) -> bytes:
-        """One bounded read+feed for the sync views/open settle path."""
-        return self.read_into(buffer, max_bytes)
-
     def write(self, data: bytes) -> int:
         if not self.is_alive():
             return 0
@@ -190,29 +186,6 @@ class SerialConsole:
             return 0
         n = ser.write(data)
         return int(n) if n is not None else len(data)
-
-    def resize(self, cols: int, rows: int) -> None:
-        # Serial has no winsize; kept for PtyHandle compatibility.
-        self.cols = int(cols)
-        self.rows = int(rows)
-
-    def drain_for(self, seconds: float, *, on_data: Any | None = None) -> int:
-        deadline = time.monotonic() + max(0.0, float(seconds))
-        total = 0
-        while time.monotonic() < deadline:
-            try:
-                chunk = self.read(4096)
-            except Exception:  # noqa: BLE001
-                # read() propagates link errors; keep drain_for tolerant so a
-                # flaky link does not abort a settle/snarf loop.
-                chunk = b""
-            if chunk:
-                total += len(chunk)
-                if on_data is not None:
-                    on_data(chunk)
-            else:
-                time.sleep(0.01)
-        return total
 
     def close(self, *, timeout_s: float | None = None) -> None:
         """Tear down the link. Lock wait and ``ser.close`` are budgeted.

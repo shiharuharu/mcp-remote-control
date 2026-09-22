@@ -12,7 +12,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from mcp_remote_control.screen.actions import action_truthy, actions_include_submit
+from mcp_remote_control.screen.actions import (
+    _is_noop_actions,
+    action_truthy,
+    actions_include_submit,
+)
 from mcp_remote_control.screen.buffer import (
     cursor_rc,
     dump_frame,
@@ -30,7 +34,6 @@ from mcp_remote_control.screen.keys import (
 )
 from mcp_remote_control.screen.session import ScreenSession
 
-_truthy = action_truthy
 _actions_have_submit = actions_include_submit
 
 # Default WaitSpec settle windows.
@@ -101,27 +104,6 @@ PASTE_BRACKET_DECSET = 2004
 # report layout and 1005/1015 carry their own extended encodings, so none of
 # them say the SGR form is understood. Same <<5 encoding as above.
 SGR_MOUSE_DECSET = 1006
-
-# Realization summary for each action type.
-ACTION_IMPL: dict[str, str] = {
-    "nop": "no-op",
-    "key": "encode_key \u2192 PTY write",
-    "keys": "encode_keys \u2192 PTY write",
-    "text": "encode_text (+ enter if submit)",
-    "paste": "paste (bracketed iff DECSET 2004) (+ enter if submit)",
-    "raw": "hex \u2192 raw bytes",
-    "go": "click when the peer takes SGR reports; keys only for how=keys",
-    "click": "SGR mouse press+release; needs tracking (no_tracking otherwise)",
-    "move": "relative direction keys",
-    "to_text": "find_text on frame \u2192 click, or keys when click=false",
-    "submit": "key enter",
-    "clear_line": "key ctrl+u",
-    "interrupt": "key ctrl+c",
-    "eof": "key ctrl+d",
-    "escape": "key escape",
-    "resize": "session.resize",
-    "wait": "mid-sequence drain/sleep",
-}
 
 
 class ActionError(Exception):
@@ -1081,24 +1063,6 @@ def _error_outcome(
         shot=shot,
         cwd=session.cwd,
     )
-
-
-# Action types that write no meaningful PTY input: the silent cwd probe
-# (which injects ctrl+u + an echo command) can be skipped for sends whose
-# actions are all in this set, so a pure wait/resize poll can still return
-# status=unchanged without the probe rewriting the frame hash.
-_NO_PROBE_TYPES: frozenset[str] = frozenset({"nop", "wait", "resize"})
-
-
-def _is_noop_actions(actions: list[dict[str, Any]]) -> bool:
-    """True when actions are empty or only nop/wait/resize (pure re-shot / poll)."""
-    if not actions:
-        return True
-    for act in actions:
-        atype = str(act.get("type") or act.get("op") or "").strip().lower()
-        if atype and atype not in _NO_PROBE_TYPES:
-            return False
-    return True
 
 
 def encode_actions_bytes(

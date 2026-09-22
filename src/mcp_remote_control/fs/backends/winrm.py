@@ -46,18 +46,11 @@ from mcp_remote_control.transport.protocols import (
 )
 
 # Default wall-clock budget for each oneshot ``execute_ps`` driven by
-# :class:`PypsrpFileClient`. Aligns with :data:`DEFAULT_SFTP_TIMEOUT_S` (60s)
-# and ``[defaults] exec_timeout_ms`` so MCP/worker threads never block forever
-# on a hung remote PowerShell oneshot. Override per client via
-# ``PypsrpFileClient(..., timeout_s=...)`` or ``WinrmFs(..., timeout_s=...)``.
+# :class:`PypsrpFileClient`. Aligns with :data:`DEFAULT_SFTP_TIMEOUT_S` (60s) so
+# MCP/worker threads never block forever on a hung remote PowerShell oneshot.
+# Override per client via ``PypsrpFileClient(..., timeout_s=...)`` or
+# ``WinrmFs(..., timeout_s=...)``.
 DEFAULT_WINRM_FS_TIMEOUT_S: float = 60.0
-
-# Default whole-public-op wall-clock budget (shared remaining across RTs).
-# Without this, multi-RT ops (recursive list / rmtree fallback / chunked put /
-# mkdir_p) can approach N times DEFAULT_WINRM_FS_TIMEOUT_S. Override via
-# ``WinrmFs(..., op_timeout_s=...)``; omit to mirror the resolved per-call
-# ``timeout_s`` (or this default when both are omitted).
-DEFAULT_WINRM_FS_OP_TIMEOUT_S: float = DEFAULT_WINRM_FS_TIMEOUT_S
 
 # Bounded budget (seconds) for the error-path temp cleanup that follows a
 # failed put. The whole-op deadline is already spent exactly when cleanup
@@ -1133,7 +1126,6 @@ class WinrmFs:
                             path=abs_remote,
                             local=str(src),
                             bytes_transferred=int(size),
-                            direction="put",
                         )
                 except Exception as exc:  # noqa: BLE001 - native client surface
                     self._reraise_gated_native_failure(exc, abs_remote)
@@ -1163,7 +1155,6 @@ class WinrmFs:
                 path=abs_remote,
                 local=str(src),
                 bytes_transferred=int(size),
-                direction="put",
             )
 
     def get(
@@ -1208,7 +1199,6 @@ class WinrmFs:
                             path=abs_remote,
                             local=str(dst),
                             bytes_transferred=int(size),
-                            direction="get",
                         )
                 except Exception as exc:  # noqa: BLE001 - native client surface
                     try:
@@ -1273,7 +1263,6 @@ class WinrmFs:
                 path=abs_remote,
                 local=str(dst),
                 bytes_transferred=int(size),
-                direction="get",
             )
 
     def mkdir(self, path: str, *, parents: bool = True) -> StatInfo:
@@ -2171,5 +2160,4 @@ from mcp_remote_control.transport.winrm_files import (  # noqa: E402
     _is_http_rejection as _is_http_rejection,
     _is_link_failure as _is_link_failure,
     _op_timeout_error as _op_timeout_error,
-    _ps_streams_stderr as _ps_streams_stderr,
 )

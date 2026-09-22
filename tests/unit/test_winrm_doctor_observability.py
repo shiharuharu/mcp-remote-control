@@ -439,3 +439,42 @@ def test_doctor_without_winrm_profile_adds_no_lines(tmp_path: Path) -> None:
     names = [c.name for c in report.checks]
     assert names == [n for n in names if not n.startswith("winrm")]
     assert "profile box" in names
+
+
+@pytest.mark.parametrize(
+    "winrm",
+    [
+        {"scheme": "http"},
+        {"scheme": "https", "message_encryption": "never"},
+        {"ssl": "true", "message_encryption": "NEVER"},
+        {"scheme": "http", "ssl": "false"},
+    ],
+)
+def test_doctor_winrm_tokens_match_the_transport_the_open_builds(
+    winrm: dict[str, Any],
+) -> None:
+    """doctor's scheme/auth/encryption tokens equal the transport's own knobs.
+
+    A doctor line that disagrees with what ``endpoint open`` builds would
+    report a policy the session does not use, so both sides read the same
+    resolvers.
+    """
+    from mcp_remote_control.cli_cmds.doctor import _winrm_self_checks
+    from mcp_remote_control.config.models import AuthConfig, Profile
+    from mcp_remote_control.endpoint.connect import _build_winrm_transport
+
+    profile = Profile(
+        name="lab",
+        transport="winrm",
+        host="10.0.0.20",
+        username="Administrator",
+        auth=AuthConfig(method="credssp", password="hunter2"),
+        winrm=winrm,
+    )
+    checks = _winrm_self_checks(profile, global_winrm_probe=None, env={})
+    detail = checks[0].detail
+    transport = _build_winrm_transport(profile, connector=None)
+
+    assert f"scheme={'https' if transport.ssl else 'http'}" in detail
+    assert f"auth={transport.auth}" in detail
+    assert f"encryption={transport.encryption}" in detail

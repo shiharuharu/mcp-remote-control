@@ -1,4 +1,4 @@
-"""WinRM session adapters (AdaptedWinRMSession, PypsrpClientAdapter)."""
+"""WinRM session adapters (AdaptedWinRMSession)."""
 
 from __future__ import annotations
 
@@ -63,20 +63,7 @@ def note_winrm_connect_handle(obj: Any) -> None:
         watch.handles.append(obj)
         close_now = bool(watch.abandoned)
     if close_now:
-        close_winrm_connect_handle(obj)
-
-
-def close_winrm_connect_handle(obj: Any) -> None:
-    """Best-effort ``close()`` on a connect-time Client/session; never raises."""
-    if obj is None:
-        return
-    closer = getattr(obj, "close", None)
-    if not callable(closer):
-        return
-    try:
-        closer()
-    except Exception:  # noqa: BLE001 - best-effort teardown
-        pass
+        _close_quietly(obj)
 
 
 def abandon_winrm_connect_watch(watch: _WinRMConnectWatch) -> None:
@@ -86,7 +73,7 @@ def abandon_winrm_connect_watch(watch: _WinRMConnectWatch) -> None:
         leftover = list(watch.handles)
         watch.handles.clear()
     for obj in leftover:
-        close_winrm_connect_handle(obj)
+        _close_quietly(obj)
 
 
 def _bound(obj: Any, name: str) -> Callable[..., Any] | None:
@@ -103,10 +90,11 @@ class AdaptedWinRMSession:
     surface with fixed kwargs (``environment=`` on oneshot exec; wall-clock
     timeout outside the session API).
 
-    Real ``pypsrp.client.Client`` instances are wrapped by
-    :class:`PypsrpClientAdapter` in :func:`default_winrm_connector` so the
-    library call shape is fixed. Test doubles implement the same methods
-    directly (accept ``environment=`` even when unused).
+    Real ``pypsrp.client.Client`` instances are used directly by
+    :func:`default_winrm_connector`, which is why every method here is resolved
+    through attribute presence rather than checked against one concrete class.
+    Test doubles implement the same methods directly (accept ``environment=``
+    even when unused).
     """
 
     def __init__(self, raw: Any) -> None:
@@ -173,10 +161,6 @@ class AdaptedWinRMSession:
     @property
     def has_open_fs(self) -> bool:
         return self._open_fs is not None
-
-    @property
-    def has_wsman(self) -> bool:
-        return self.wsman is not None
 
     @property
     def is_file_client(self) -> bool:
@@ -269,16 +253,6 @@ class AdaptedWinRMSession:
             )
         return self._open_fs()
 
-    def copy(self, local: str, remote: str) -> None:
-        if self._copy is None:
-            raise TransportError("UNSUPPORTED", "winrm session has no copy")
-        self._copy(local, remote)
-
-    def fetch(self, remote: str, local: str) -> None:
-        if self._fetch is None:
-            raise TransportError("UNSUPPORTED", "winrm session has no fetch")
-        self._fetch(remote, local)
-
     def seed_attr(self, key: str) -> Any:
         return self._meta_seeds.get(key)
 
@@ -291,51 +265,6 @@ def adapt_winrm_session(raw: Any) -> AdaptedWinRMSession:
     if isinstance(raw, AdaptedWinRMSession):
         return raw
     return AdaptedWinRMSession(raw)
-
-
-class PypsrpClientAdapter:
-    """Adapter: real pypsrp ``Client`` -> oneshot Protocol surface.
-
-    Knows the fixed pypsrp call shape (``environment=`` always supported;
-    no per-call timeout kwarg). Confines library-specific kwargs here so
-    production never uses ``inspect.signature``.
-    """
-
-    def __init__(self, client: Any) -> None:
-        self._client = client
-        self.wsman = getattr(client, "wsman", None)
-        self.cwd = getattr(client, "cwd", None)
-        self.home = getattr(client, "home", None)
-        # Record as soon as the adapter exists so a hung connector that
-        # already built the Client can still be closed on connect timeout.
-        note_winrm_connect_handle(self)
-
-    def close(self) -> None:
-        closer = getattr(self._client, "close", None)
-        if callable(closer):
-            closer()
-
-    def execute_ps(
-        self,
-        script: str,
-        *,
-        environment: dict[str, str] | None = None,
-    ) -> Any:
-        return self._client.execute_ps(script, environment=environment)
-
-    def execute_cmd(
-        self,
-        command: str,
-        *,
-        environment: dict[str, str] | None = None,
-    ) -> Any:
-        return self._client.execute_cmd(command, environment=environment)
-
-    def copy(self, local: str, remote: str) -> None:
-        self._client.copy(local, remote)
-
-    def fetch(self, remote: str, local: str) -> None:
-        self._client.fetch(remote, local)
 
 
 # Adapter-chain attributes linking an adapted session to the pypsrp HTTP
@@ -353,7 +282,14 @@ _ROUND_TRIP_READER_ATTR = "_mrc_round_trips"
 
 
 def _close_quietly(obj: Any) -> None:
-    """Best-effort ``close()``; never raises."""
+    """Best-effort ``close()``; never raises.
+
+    The connect path calls this on a Client/session that may still be live when
+    a connect fails or its watch is abandoned, and resync calls it to release a
+    stale transport session: a close that fails must never replace the outcome
+    the caller is reporting. No-ops on None and on objects whose ``close`` is
+    missing or not callable.
+    """
     closer = getattr(obj, "close", None)
     if not callable(closer):
         return
@@ -366,8 +302,8 @@ def _close_quietly(obj: Any) -> None:
 def _iter_link_nodes(session: Any) -> Iterator[Any]:
     """Yield *session* and every node reachable through the adapter chain.
 
-    The chain is ``AdaptedWinRMSession`` -> ``PypsrpClientAdapter`` -> pypsrp
-    ``Client`` -> ``WSMan`` -> HTTP transport; nodes that do not expose a link
+    The chain is ``AdaptedWinRMSession`` -> pypsrp ``Client`` -> ``WSMan`` ->
+    HTTP transport; nodes that do not expose a link
     attribute are skipped, so test doubles and non-pypsrp sessions simply
     match nothing. The node budget bounds a self-referential double.
     """
@@ -497,9 +433,10 @@ def resync_winrm_session(session: Any) -> bool:
     instead of staying "connected" but permanently unusable.
 
     Walks ``session.raw`` -> ``_client`` -> ``wsman`` -> ``transport`` (an
-    :class:`AdaptedWinRMSession` wraps a :class:`PypsrpClientAdapter`, which
-    wraps a pypsrp ``Client``); nodes that do not expose the cached state are
-    skipped, so test doubles and non-pypsrp sessions simply match nothing.
+    :class:`AdaptedWinRMSession` wraps the pypsrp ``Client``, which holds the
+    ``WSMan`` object and its HTTP transport); nodes that do not expose the
+    cached state are skipped, so test doubles and non-pypsrp sessions simply
+    match nothing.
     The stale session's socket pool is closed before it is dropped rather than
     left for the garbage collector.
 
@@ -530,7 +467,10 @@ def resync_winrm_session(session: Any) -> bool:
 
 
 def default_winrm_connector(**kwargs: Any) -> Any:
-    """Construct a real pypsrp ``Client`` wrapped in :class:`PypsrpClientAdapter`.
+    """Construct a real pypsrp ``Client`` for the transport to adapt.
+
+    The returned ``Client`` already accepts the fixed call shape production
+    uses (``environment=`` keyword; no per-call timeout kwarg).
 
     Expected kwargs match :func:`assemble_pypsrp_kwargs` / transport connect:
     host, port, username, password, auth, ssl, cert_validation, encryption,
@@ -601,8 +541,8 @@ def default_winrm_connector(**kwargs: Any) -> Any:
 
     client = Client(str(host), **client_kwargs)
     # Client is live (and may already hold a server shell) before the
-    # adapter wraps it. Note it so a later hang in this factory still
+    # transport adapts it. Note it so a later hang in this factory still
     # lets connect() close the handle on wall-clock timeout.
     note_winrm_connect_handle(client)
-    return PypsrpClientAdapter(client)
+    return client
 

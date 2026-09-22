@@ -12,7 +12,6 @@ import time
 import uuid
 import weakref
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,8 @@ from pypsrp.messages import Message, MessageType, PipelineState
 from pypsrp.powershell import Fragment, PSInvocationState, RunspacePool, RunspacePoolState
 from pypsrp.shell import SignalCode
 
-from mcp_remote_control.endpoint import reset_registry
+from _winrm_fakes import _ErrorStreams
+
 from mcp_remote_control.transport import TransportError
 from mcp_remote_control.transport.base import ExecResult, SerialZoneHooks
 from mcp_remote_control.transport.winrm import (
@@ -42,14 +42,6 @@ except ImportError:  # pragma: no cover - exercised only without pypsrp
     pypsrp_exceptions = None  # type: ignore[assignment]
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def test_winrm_open_runspace_pool_open_fail_closes_pool(
@@ -144,13 +136,6 @@ def test_winrm_format_ps_errors_streams() -> None:
     assert _format_ps_errors(_PsNoneError()) == ""
 
 
-class _ErrStreams:
-    """Minimal stand-in for pypsrp PSDataStreams with a populated error list."""
-
-    def __init__(self, errors: list[object] | None) -> None:
-        self.error = errors
-
-
 class _ErrPowerShell:
     """Fake pypsrp PowerShell for the runspace_invoke error-formatting path.
 
@@ -168,7 +153,7 @@ class _ErrPowerShell:
     def __init__(self, pool: object) -> None:
         self.pool = pool
         self.script: str | None = None
-        self.streams = _ErrStreams(list(_ErrPowerShell.errors or []))
+        self.streams = _ErrorStreams(list(_ErrPowerShell.errors or []))
         self.had_errors = _ErrPowerShell.had_errors
         self.stopped = False
         self.closed = False

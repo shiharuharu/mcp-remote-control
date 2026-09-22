@@ -45,9 +45,6 @@ from mcp_remote_control.shell.dialect import (
     resolve_dialect,
 )
 
-_truthy = action_truthy
-_actions_include_submit = actions_include_submit
-
 # Named probe-command aliases. Source of truth: shell.dialect.
 _PROBE_CMD_POSIX = probe_cmd_for_dialect(POSIX_ZSH) or ""
 _PROBE_CMD_BASH = probe_cmd_for_dialect(POSIX_BASH) or ""
@@ -212,11 +209,8 @@ def _session_dialect(session: ScreenSession) -> str:
         return d.strip().lower()
     meta = getattr(session, "meta", None) or {}
     caps = getattr(session, "shell_caps", None)
-    busybox = None
-    if isinstance(caps, dict):
-        busybox = caps.get("busybox")
-    elif caps is not None:
-        busybox = getattr(caps, "busybox", None)
+    # Caps are a plain mapping on every session the open path builds.
+    busybox = caps.get("busybox") if isinstance(caps, dict) else None
     shell_path = str(
         meta.get("shell_path")
         or getattr(session, "shell_path", None)

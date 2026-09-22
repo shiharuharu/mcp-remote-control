@@ -25,13 +25,13 @@ from typing import Any
 
 from mcp_remote_control.codec import decode_auto
 from mcp_remote_control.codec.text_codec import (
-    DecodeResult,
     charmap_to_codec,
     codepage_to_codec,
 )
 from mcp_remote_control.identity.ssh_keys import key_load_failure_message
 from mcp_remote_control.transport.async_bridge import AsyncLoopBridge, run_coro
 from mcp_remote_control.transport.base import BaseTransport, ExecResult, TransportError
+from mcp_remote_control.transport.decode_note import note_decode
 from mcp_remote_control.transport.shell_wrap import (
     POSIX_PROBE_SCRIPT,
     POWERSHELL_PROBE_SCRIPT,
@@ -110,88 +110,6 @@ def _run_maybe_async(
     return run_coro(result, timeout_s=timeout_s, bridge=bridge)
 
 
-def _reset_decode_record(transport: Any) -> None:
-    """Start a new command's decode record, dropping the previous one.
-
-    ``last_decode`` describes the streams of *one* command. A command that
-    decodes no bytes at all - empty output, or a failure before it ran - must
-    not leave the previous command's codec in place: a reader (or a debug dump)
-    would otherwise attribute that codec to text this command never produced.
-    """
-    if transport is not None:
-        transport.last_decode = None
-
-
-def _note_decode(
-    transport: Any,
-    result: DecodeResult,
-    preferred: str | None,
-    value: Any,
-) -> None:
-    """Record a stream's decode decision on *transport*, and warn once per kind.
-
-    A fallback decode is not an error - a host that really speaks gb18030 is
-    decoded correctly through its leg - but the reader can no longer assume the
-    text is right, and nothing else in the exec path says which codec produced
-    it. The same goes for an ambiguous one (both the configured codec and
-    UTF-8 accept the bytes): the text may be a plausible reading of the wrong
-    codec. The WARNING is emitted once per (transport, codec, preferred) so a
-    legacy host does not log a line per command; later occurrences stay at
-    DEBUG and remain visible in ``transport.last_decode``.
-    """
-    if transport is None:
-        return
-    # A stream with no bytes carries no encoding evidence. Keep the previous
-    # decision (normally the stdout read) instead of overwriting it with the
-    # empty stderr read that runs last.
-    if value is None or value == b"" or value == "":
-        return
-    transport.last_decode = {
-        "encoding": result.encoding_used,
-        "preferred": preferred,
-        "replaced": result.replaced,
-        "errors": result.errors,
-        "fallback": result.fallback,
-        "ambiguous": result.ambiguous,
-    }
-    if not (result.fallback or result.ambiguous):
-        return
-    size = len(value) if isinstance(value, (bytes, bytearray, memoryview)) else 0
-    kind = "fallback" if result.fallback else "ambiguous"
-    key = f"{result.encoding_used}|{preferred or ''}|{result.replaced}|{kind}"
-    if key in transport._decode_warned:
-        _log.debug(
-            "text decode %s to %s (%d bytes, preferred=%s, replaced=%s, errors=%d)",
-            kind,
-            result.encoding_used,
-            size,
-            preferred,
-            result.replaced,
-            result.errors,
-        )
-        return
-    transport._decode_warned.add(key)
-    if result.fallback:
-        _log.warning(
-            "text decode fell back to %s (%d bytes, preferred=%s, replaced=%s, errors=%d): "
-            "the bytes were not valid UTF-8, so the text may be mis-decoded",
-            result.encoding_used,
-            size,
-            preferred,
-            result.replaced,
-            result.errors,
-        )
-        return
-    _log.warning(
-        "text decode is ambiguous: %s accepted the %d bytes as well as utf-8 "
-        "(preferred=%s): the text was read as utf-8 but the configured codec "
-        "would read it differently",
-        result.encoding_used,
-        size,
-        preferred,
-    )
-
-
 def _decode_stream(
     value: Any,
     preferred: str | None = None,
@@ -200,7 +118,7 @@ def _decode_stream(
 ) -> str:
     """Decode a remote stream, noting a non-UTF-8 read on *transport*."""
     result = decode_auto(value, preferred=preferred)
-    _note_decode(transport, result, preferred, value)
+    note_decode(_log, transport, result, preferred, value)
     return result.text
 
 
@@ -366,13 +284,8 @@ class SSHTransport(BaseTransport):
         self.passphrase = passphrase
         self.keepalive_interval_s = keepalive_interval_s
         self.text_encoding = text_encoding
-        # Decode bookkeeping for the current command's streams: which codec
-        # produced the text, whether bytes had to be replaced, and which
-        # decisions already logged a warning (one line per codec, not one per
-        # command). Reset at the start of every command
-        # (_reset_decode_record), so a command that decoded no bytes leaves no
-        # stale codec behind.
-        self.last_decode: dict[str, Any] | None = None
+        # Which decode decisions already logged a warning (one line per codec,
+        # not one per command).
         self._decode_warned: set[str] = set()
         self.remote_shell_family = normalize_shell_family(remote_shell_family)
         self.force_utf8_remote = bool(force_utf8_remote)
@@ -713,7 +626,6 @@ class SSHTransport(BaseTransport):
         timeout_s: float | None = None,
         env: dict[str, str] | None = None,
     ) -> ExecResult:
-        _reset_decode_record(self)
         conn = self._require_conn()
         work = coerce_cwd_path(cwd if cwd is not None else self.cwd)
 
@@ -823,16 +735,6 @@ class SSHTransport(BaseTransport):
                         parsed = parsed_w
                     elif not _has_trusted_probe_identity(parsed):
                         out["status"] = "partial"
-            elif parsed.get("os") != "windows" and not credible_posix:
-                parsed_ps = _try_script(POWERSHELL_PROBE_SCRIPT)
-                if _looks_credibly_windows(parsed_ps):
-                    parsed = parsed_ps
-                else:
-                    parsed_w = _try_script(WINDOWS_PROBE_SCRIPT)
-                    if _looks_credibly_windows(parsed_w):
-                        parsed = parsed_w
-                    elif not _has_trusted_probe_identity(parsed):
-                        out["status"] = "partial"
 
             out.update({k: v for k, v in parsed.items() if v is not None})
             # Enrich always writes dialect/caps/shell_family; those are wrap
@@ -886,8 +788,6 @@ class SSHTransport(BaseTransport):
             except Exception as exc:  # noqa: BLE001
                 out["status"] = "partial"
                 out.setdefault("error", _safe_connect_msg(exc))
-        if not _has_trusted_probe_identity(out) and out.get("status") == "ok":
-            out["status"] = "partial"
         return out
 
     def run_argv(
@@ -900,7 +800,6 @@ class SSHTransport(BaseTransport):
     ) -> ExecResult:
         if not argv:
             raise TransportError("INVALID_ARG", "argv is empty")
-        _reset_decode_record(self)
         conn = self._require_conn()
         work = coerce_cwd_path(cwd if cwd is not None else self.cwd)
 
@@ -1391,8 +1290,8 @@ def _coerce_exec_result(
 ) -> ExecResult:
     """Normalize connection-layer results into ExecResult.
 
-    *transport*, when given, receives the decode decision for byte streams
-    (``last_decode`` plus a warning on the first non-UTF-8 read).
+    *transport*, when given, is where a non-UTF-8 decode is reported as a
+    warning (once per codec).
     """
     if isinstance(raw, ExecResult):
         # A connector may hand back an ExecResult whose streams are still raw

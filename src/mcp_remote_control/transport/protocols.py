@@ -17,9 +17,12 @@ from typing import Any, Protocol, runtime_checkable
 class WinRMFileClient(Protocol):
     """Stable file-client surface used by ``WinrmFs`` (aligned with ``PypsrpFileClient``).
 
-    Optional extras (``list_with_attrs``, ``rmtree``, ``copy``, ``fetch``,
-    ``open``) are separate optional Protocols; backends probe those once via
-    ``isinstance`` / attribute presence, not multi-name method soup.
+    Optional extras (``list_with_attrs``, ``rmtree``, ``open``) are separate
+    optional Protocols; backends probe those once via ``isinstance`` /
+    attribute presence, not multi-name method soup. A native ``copy`` /
+    ``fetch`` transfer is gated by the client's own ``has_native_copy`` /
+    ``has_native_fetch`` flags, not by a Protocol: the same methods also exist
+    as scripted fallbacks, which are not native.
     """
 
     def stat(self, path: str) -> Any:
@@ -53,15 +56,6 @@ class SupportsListWithAttrs(Protocol):
 @runtime_checkable
 class SupportsRmtree(Protocol):
     def rmtree(self, path: str) -> None:
-        ...
-
-
-@runtime_checkable
-class SupportsCopyFetch(Protocol):
-    def copy(self, local: str, remote: str) -> None:
-        ...
-
-    def fetch(self, remote: str, local: str) -> None:
         ...
 
 

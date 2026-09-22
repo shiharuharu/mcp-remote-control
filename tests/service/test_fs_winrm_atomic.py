@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -13,19 +12,10 @@ from _winrm_fakes import HOME, TEMP
 from test_fs_winrm import MockWinrmFileClient, _MockAttrs, _backend
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.fs.backends.winrm import WinrmFs
 from mcp_remote_control.fs.types import FsError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 def test_winrm_fs_partial_upload_cleans_up_remote(tmp_path: Path) -> None:

@@ -12,7 +12,6 @@ from mcp_remote_control.codec.text_codec import (
     charmap_to_codec,
     codepage_to_codec,
     decode_auto,
-    decode_to_str,
     encode_for_remote,
 )
 
@@ -21,6 +20,5 @@ __all__ = [
     "charmap_to_codec",
     "codepage_to_codec",
     "decode_auto",
-    "decode_to_str",
     "encode_for_remote",
 ]

@@ -526,7 +526,7 @@ def test_open_screen_concurrent_close_no_zombie_session() -> None:
     assert open_result, "open_screen did not return"
     opened = open_result[0]
     # Primary invariant: no live registry session on the closed endpoint.
-    assert get_screen_registry().list_for_endpoint("local") == []
+    assert get_screen_registry().ids_for_endpoint("local") == []
     status = getattr(opened, "status", None)
     if status == "ok":
         sid = getattr(opened, "fields", {}).get("id")

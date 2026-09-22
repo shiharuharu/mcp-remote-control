@@ -443,7 +443,7 @@ class _FakeClient:
 
 
 class _FakeClientAdapter:
-    """``PypsrpClientAdapter`` shape: wraps a client as ``_client``."""
+    """Session wrapper holding its Client on ``_client``, a link the walk follows."""
 
     def __init__(self) -> None:
         self._client = _FakeClient()
@@ -481,17 +481,15 @@ def test_resync_walks_the_installed_pypsrp_layout() -> None:
     pytest.importorskip("pypsrp")
     from pypsrp.client import Client
 
-    from mcp_remote_control.transport.winrm_session import PypsrpClientAdapter
-
     client = Client("127.0.0.1", username="u", password="p", ssl=False, auth="ntlm")
     transport = client.wsman.transport
     transport.encryption = object()
     transport.session = requests.Session()
 
-    assert resync_winrm_session(PypsrpClientAdapter(client)) is True
+    assert resync_winrm_session(AdaptedWinRMSession(client)) is True
     assert transport.encryption is None
     assert transport.session is None
-    assert resync_winrm_session(PypsrpClientAdapter(client)) is False
+    assert resync_winrm_session(AdaptedWinRMSession(client)) is False
 
 
 def test_resync_second_call_is_a_no_op() -> None:

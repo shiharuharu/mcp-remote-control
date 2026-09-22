@@ -28,8 +28,11 @@ from mcp_remote_control.config import (
     load_profile,
     resolve_home,
 )
-from mcp_remote_control.endpoint.caps import coerce_toml_bool
-from mcp_remote_control.transport import WINRM_AUTH_PROTOCOLS
+from mcp_remote_control.endpoint.connect import (
+    _resolve_winrm_auth_protocol,
+    _resolve_winrm_encryption,
+    _resolve_winrm_ssl,
+)
 from mcp_remote_control.transport.winrm_probe import (
     MRC_WINRM_PROBE_TIMEOUT_S,
     resolve_winrm_open_probe_mode,
@@ -95,42 +98,6 @@ def _try_import(modname: str) -> tuple[bool, str]:
     return True, "importable"
 
 
-def _winrm_effective_scheme(winrm: Mapping[str, Any]) -> str:
-    """Effective ``http`` / ``https`` for a ``[winrm]`` table.
-
-    Mirrors the transport's derivation: ``scheme`` decides, and a bare
-    ``ssl`` flag switches to TLS with string-safe truthiness (``"false"`` /
-    ``"0"`` / ``"no"`` must not enable it).
-    """
-    scheme = str(winrm.get("scheme") or "http").strip().lower()
-    if scheme in ("https", "ssl", "true", "1"):
-        return "https"
-    return "https" if coerce_toml_bool(winrm.get("ssl", False)) else "http"
-
-
-def _winrm_effective_auth(profile: Profile, winrm: Mapping[str, Any]) -> str:
-    """pypsrp auth protocol this profile will use on the wire.
-
-    ``[winrm].auth`` / ``auth_method`` wins; otherwise ``password`` maps to
-    NTLM and any method the client does not implement falls back to NTLM
-    (same mapping the transport applies when building the client).
-    """
-    explicit = winrm.get("auth") or winrm.get("auth_method")
-    if explicit is not None and str(explicit).strip():
-        return str(explicit).strip().lower()
-    method = profile.auth.method.lower() if profile.auth is not None else ""
-    if method in ("", "password"):
-        return "ntlm"
-    return method if method in WINRM_AUTH_PROTOCOLS else "ntlm"
-
-
-def _winrm_effective_encryption(winrm: Mapping[str, Any]) -> str:
-    """Effective message-encryption mode (``auto`` when unset)."""
-    return str(
-        winrm.get("message_encryption") or winrm.get("encryption") or "auto"
-    ).strip().lower()
-
-
 def _winrm_reconnect_policy(winrm: Mapping[str, Any]) -> tuple[int, float] | None:
     """Effective ``(reconnection_retries, backoff_s)``, or ``None`` if opted out.
 
@@ -162,8 +129,10 @@ def _winrm_self_checks(
     and the exit code is unchanged.
     """
     winrm = profile.winrm or {}
-    scheme = _winrm_effective_scheme(winrm)
-    encryption = _winrm_effective_encryption(winrm)
+    # Scheme / auth / encryption tokens come from the endpoint resolvers, so
+    # the reported values are the ones the transport is built with.
+    scheme = "https" if _resolve_winrm_ssl(winrm) else "http"
+    encryption = _resolve_winrm_encryption(winrm)
     reconnect = _winrm_reconnect_policy(winrm)
     reconnect_token = (
         "reconnection_retries=disabled(library default)"
@@ -184,7 +153,7 @@ def _winrm_self_checks(
         CheckResult(
             f"winrm {profile.name}",
             True,
-            f"scheme={scheme} auth={_winrm_effective_auth(profile, winrm)} "
+            f"scheme={scheme} auth={_resolve_winrm_auth_protocol(profile, winrm)} "
             f"encryption={encryption} {reconnect_token} probe={probe_mode} "
             f"probe_timeout_s={budget:g}",
         )

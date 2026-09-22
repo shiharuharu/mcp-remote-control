@@ -207,16 +207,14 @@ class TransferResult:
     path: str  # remote path (absolute preferred)
     local: str
     bytes_transferred: int
-    direction: str  # put | get
 
 
 @dataclass
 class ListResult:
-    """Directory listing with optional truncation flag."""
+    """Directory listing."""
 
     path: str
     entries: list[ListEntry] = field(default_factory=list)
-    truncated: bool = False
 
 
 @runtime_checkable

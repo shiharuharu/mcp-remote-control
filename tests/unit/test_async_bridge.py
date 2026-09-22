@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from collections.abc import Iterator
 
 import pytest
@@ -97,11 +96,17 @@ def test_run_coro_timeout_propagates() -> None:
 def test_start_is_idempotent() -> None:
     bridge = AsyncLoopBridge()
     try:
+        loops: list[asyncio.AbstractEventLoop] = []
+
+        async def _capture() -> None:
+            loops.append(asyncio.get_running_loop())
+
+        bridge.run(_capture())
+        # A second start must not replace the loop already serving coroutines.
         bridge.start()
-        loop1 = bridge.loop
-        bridge.start()
-        assert bridge.loop is loop1
-        assert bridge.is_running
+        bridge.run(_capture())
+        assert len(loops) == 2
+        assert loops[0] is loops[1]
     finally:
         bridge.stop()
 
@@ -120,7 +125,6 @@ def test_same_loop_across_multiple_runs() -> None:
         assert a == b
         assert len(loops) == 2
         assert loops[0] is loops[1]
-        assert loops[0] is bridge.loop
     finally:
         bridge.stop()
 
@@ -128,25 +132,21 @@ def test_same_loop_across_multiple_runs() -> None:
 def test_run_from_bridge_thread_raises() -> None:
     bridge = AsyncLoopBridge()
     try:
-        bridge.start()
         err: list[BaseException] = []
-        done = threading.Event()
 
-        def _on_loop_thread() -> None:
+        async def _reenter() -> None:
             try:
 
                 async def _noop() -> None:
                     return None
 
+                # Already on the bridge loop thread: sync run() cannot await
+                # and must refuse instead of parking the loop forever.
                 bridge.run(_noop())
             except BaseException as exc:  # noqa: BLE001
                 err.append(exc)
-            finally:
-                done.set()
 
-        assert bridge.loop is not None
-        bridge.loop.call_soon_threadsafe(_on_loop_thread)
-        assert done.wait(timeout=2.0), "bridge thread callback did not run"
+        bridge.run(_reenter())
         assert err
         assert isinstance(err[0], RuntimeError)
         assert "bridge" in str(err[0]).lower() or "deadlock" in str(err[0]).lower()
@@ -176,11 +176,11 @@ def test_shared_bridge_singleton() -> None:
     a = get_shared_bridge()
     b = get_shared_bridge()
     assert a is b
-    assert a.is_running
 
     async def _id() -> int:
         return id(asyncio.get_running_loop())
 
+    # Same loop across calls: the shared bridge is started and stable.
     assert run_coro(_id()) == run_coro(_id())
     reset_shared_bridge()
     c = get_shared_bridge()

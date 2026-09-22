@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -12,23 +11,13 @@ import pytest
 from _sftp_fakes import MockSftp
 
 from mcp_remote_control.core import fs_ops
-from mcp_remote_control.endpoint import reset_registry
 from mcp_remote_control.fs.backends.sftp import (
-    DEFAULT_SFTP_OP_TIMEOUT_S,
     DEFAULT_SFTP_TIMEOUT_S,
     SftpFs,
 )
 from mcp_remote_control.fs.types import DEFAULT_TRANSFER_CHUNK, FsError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "config"
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv("MRC_HOME", str(FIXTURES))
-    reset_registry()
-    yield
-    reset_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +60,6 @@ def test_sftp_default_timeout_budget() -> None:
     assert DEFAULT_SFTP_TIMEOUT_S == 60.0
     # Whole-op budget defaults to the same ceiling (configurable).
     assert backend._op_timeout_s == DEFAULT_SFTP_TIMEOUT_S
-    assert DEFAULT_SFTP_OP_TIMEOUT_S == DEFAULT_SFTP_TIMEOUT_S
 
 
 def test_sftp_stat_hang_returns_timeout_within_budget() -> None:
